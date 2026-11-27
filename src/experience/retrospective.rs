@@ -1,6 +1,6 @@
-use serde::{Deserialize, Serialize};
-use crate::error::PricingError;
 use super::table_m::TableMEngine;
+use crate::error::PricingError;
+use serde::{Deserialize, Serialize};
 
 /// Parameters defining a Commercial Incurred Loss Retrospective Rating Plan.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -55,13 +55,19 @@ pub fn solve_balanced_retro_plan(
     tol: f64,
 ) -> Result<RetroPlanResult, PricingError> {
     if spec.standard_premium <= 0.0 || spec.expected_loss_ratio <= 0.0 {
-        return Err(PricingError::NonPositiveValue("standard premium and ELR must be positive"));
+        return Err(PricingError::NonPositiveValue(
+            "standard premium and ELR must be positive",
+        ));
     }
     if spec.max_retro_ratio <= spec.min_retro_ratio {
-        return Err(PricingError::InvalidParameter("max retro ratio must be > min retro ratio"));
+        return Err(PricingError::InvalidParameter(
+            "max retro ratio must be > min retro ratio",
+        ));
     }
     if spec.tax_multiplier <= 0.0 || spec.lcf <= 0.0 {
-        return Err(PricingError::NonPositiveValue("tax multiplier and LCF must be positive"));
+        return Err(PricingError::NonPositiveValue(
+            "tax multiplier and LCF must be positive",
+        ));
     }
 
     let e_lcf = spec.lcf * spec.expected_loss_ratio;
@@ -95,7 +101,9 @@ pub fn solve_balanced_retro_plan(
     }
 
     if diff > tol && iter >= max_iter {
-        return Err(PricingError::NonConvergence("retro plan basic premium solver failed to converge"));
+        return Err(PricingError::NonConvergence(
+            "retro plan basic premium solver failed to converge",
+        ));
     }
 
     Ok(RetroPlanResult {

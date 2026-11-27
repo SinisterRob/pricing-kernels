@@ -9,7 +9,7 @@ fn test_bailey_simon_two_by_two() {
     let losses = vec![100.0, 120.0, 150.0, 180.0];
 
     let res = bailey_simon_multiplicative(2, 2, &exposures, &losses, 100, 1e-7).unwrap();
-    
+
     assert!((res.base_rate - 100.0).abs() < 1e-3);
     assert!((res.relativities_dim1[0] - 1.0).abs() < 1e-4);
     assert!((res.relativities_dim1[1] - 1.5).abs() < 1e-4);
@@ -23,16 +23,8 @@ fn test_bailey_simon_canadian_automobile_benchmark() {
     // Bailey & Simon (1960) Table 1 Canadian Merit Rating Data
     // 5 Merit Classes x 2 Territories (or representative structure)
     // Testing convergence and balance property
-    let exposures = vec![
-        1235.0, 582.0,
-        2845.0, 1204.0,
-        890.0, 410.0,
-    ];
-    let losses = vec![
-        105.4, 132.8,
-        92.1, 116.5,
-        81.0, 102.3,
-    ];
+    let exposures = vec![1235.0, 582.0, 2845.0, 1204.0, 890.0, 410.0];
+    let losses = vec![105.4, 132.8, 92.1, 116.5, 81.0, 102.3];
 
     let res = bailey_simon_multiplicative(3, 2, &exposures, &losses, 200, 1e-6).unwrap();
     assert!(res.iterations < 50);
@@ -46,18 +38,24 @@ fn test_glm_irls_poisson() {
     // log(mu) = 1.0 + 0.5 * x
     let n_samples = 4;
     let n_features = 2;
-    let design = vec![
-        1.0, 0.0,
-        1.0, 0.0,
-        1.0, 1.0,
-        1.0, 1.0,
-    ];
+    let design = vec![1.0, 0.0, 1.0, 0.0, 1.0, 1.0, 1.0, 1.0];
     // Expected mu = [exp(1.0), exp(1.0), exp(1.5), exp(1.5)] ~= [2.718, 2.718, 4.482, 4.482]
     let y = vec![2.7, 2.8, 4.5, 4.4];
     let weights = vec![1.0, 1.0, 1.0, 1.0];
     let offsets = vec![0.0, 0.0, 0.0, 0.0];
 
-    let res = fit_glm_irls(GlmFamily::Poisson, &design, n_samples, n_features, &y, &weights, &offsets, 50, 1e-6).unwrap();
+    let res = fit_glm_irls(
+        GlmFamily::Poisson,
+        &design,
+        n_samples,
+        n_features,
+        &y,
+        &weights,
+        &offsets,
+        50,
+        1e-6,
+    )
+    .unwrap();
     assert!((res.coefficients[0] - 1.0).abs() < 0.1);
     assert!((res.coefficients[1] - 0.5).abs() < 0.1);
     assert!(res.deviance < 0.1);
@@ -68,18 +66,24 @@ fn test_glm_irls_gamma() {
     // Gamma severity model: y ~ Gamma with log link
     let n_samples = 4;
     let n_features = 2;
-    let design = vec![
-        1.0, 0.0,
-        1.0, 0.0,
-        1.0, 1.0,
-        1.0, 1.0,
-    ];
+    let design = vec![1.0, 0.0, 1.0, 0.0, 1.0, 1.0, 1.0, 1.0];
     // mu = [500, 500, 1000, 1000]
     let y = vec![505.0, 495.0, 1010.0, 990.0];
     let weights = vec![10.0, 12.0, 8.0, 9.0]; // claim counts
     let offsets = vec![0.0, 0.0, 0.0, 0.0];
 
-    let res = fit_glm_irls(GlmFamily::Gamma, &design, n_samples, n_features, &y, &weights, &offsets, 50, 1e-6).unwrap();
+    let res = fit_glm_irls(
+        GlmFamily::Gamma,
+        &design,
+        n_samples,
+        n_features,
+        &y,
+        &weights,
+        &offsets,
+        50,
+        1e-6,
+    )
+    .unwrap();
     // Intercept should be ln(500) ~= 6.2146
     assert!((res.coefficients[0] - (500.0_f64).ln()).abs() < 0.05);
     // Slope should be ln(1000) - ln(500) = ln(2) ~= 0.6931
@@ -108,7 +112,7 @@ fn test_classical_credibility() {
     assert_eq!(cred.credibility(1082.41), 1.0);
     assert_eq!(cred.credibility(2000.0), 1.0);
     assert_eq!(cred.credibility(0.0), 0.0);
-    
+
     // Half standard: 541.2 claims -> sqrt(0.5) ~= 0.7071
     let z = cred.credibility(1082.41 * 0.5);
     assert!((z - 0.5_f64.sqrt()).abs() < 1e-4);
@@ -155,9 +159,18 @@ fn test_ncci_experience_mod_exact_calculation() {
     };
 
     let claims = vec![
-        ExperienceClaim { incurred: 50_000.0, is_medical_only: false }, // 18.5k primary, 31.5k excess
-        ExperienceClaim { incurred: 5_000.0, is_medical_only: false },  // 5k primary, 0 excess
-        ExperienceClaim { incurred: 10_000.0, is_medical_only: true },  // ERA -> 3k primary, 0 excess
+        ExperienceClaim {
+            incurred: 50_000.0,
+            is_medical_only: false,
+        }, // 18.5k primary, 31.5k excess
+        ExperienceClaim {
+            incurred: 5_000.0,
+            is_medical_only: false,
+        }, // 5k primary, 0 excess
+        ExperienceClaim {
+            incurred: 10_000.0,
+            is_medical_only: true,
+        }, // ERA -> 3k primary, 0 excess
     ];
 
     let res = calculate_ncci_experience_mod(&spec, &claims).unwrap();
@@ -210,8 +223,11 @@ fn test_table_m_and_retro_plan_solver() {
 
 #[test]
 fn test_severity_ilf_and_layer_expected_loss() {
-    let lomax = SeverityDistribution::Lomax { alpha: 2.0, theta: 100_000.0 };
-    
+    let lomax = SeverityDistribution::Lomax {
+        alpha: 2.0,
+        theta: 100_000.0,
+    };
+
     // E[X ^ L] for Lomax with alpha = 2 is theta * (1 - (1 + L / theta)^-1)
     let lev_100k = lomax.limited_expected_value(100_000.0).unwrap();
     let expected_lev = 100_000.0 * (1.0 - 0.5);
@@ -240,9 +256,10 @@ fn test_severity_ilf_and_layer_expected_loss() {
 #[test]
 fn test_parallelogram_and_trending() {
     // Rate change of +10% on July 1, 2022 (2022.5)
-    let changes = vec![
-        RateChange { effective_date: 2022.5, rate_factor: 1.10 },
-    ];
+    let changes = vec![RateChange {
+        effective_date: 2022.5,
+        rate_factor: 1.10,
+    }];
 
     // For policy year 2022 (written 2022.0 to 2023.0):
     // Half written at 1.0, half written at 1.10 -> average historical rate = 1.05

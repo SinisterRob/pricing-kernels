@@ -1,6 +1,6 @@
-use serde::{Deserialize, Serialize};
 use crate::error::PricingError;
-use crate::linalg::{cholesky_solve, cholesky_invert};
+use crate::linalg::{cholesky_invert, cholesky_solve};
+use serde::{Deserialize, Serialize};
 
 /// GLM error family for pricing kernels.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -48,16 +48,24 @@ pub fn fit_glm_irls(
     tol: f64,
 ) -> Result<GlmResult, PricingError> {
     if n_samples == 0 || n_features == 0 {
-        return Err(PricingError::EmptyInput("samples and features must be non-zero"));
+        return Err(PricingError::EmptyInput(
+            "samples and features must be non-zero",
+        ));
     }
     if n_samples < n_features {
-        return Err(PricingError::DimensionMismatch("number of samples must be >= features"));
+        return Err(PricingError::DimensionMismatch(
+            "number of samples must be >= features",
+        ));
     }
     if design_matrix.len() != n_samples * n_features {
-        return Err(PricingError::DimensionMismatch("design matrix length != n_samples * n_features"));
+        return Err(PricingError::DimensionMismatch(
+            "design matrix length != n_samples * n_features",
+        ));
     }
     if y.len() != n_samples || weights.len() != n_samples || offsets.len() != n_samples {
-        return Err(PricingError::DimensionMismatch("vector dimensions do not match n_samples"));
+        return Err(PricingError::DimensionMismatch(
+            "vector dimensions do not match n_samples",
+        ));
     }
 
     // Initialize beta = 0.0 or intercept-based
@@ -72,7 +80,11 @@ pub fn fit_glm_irls(
             sum_w += weights[i];
         }
     }
-    let mean_y = if sum_w > 0.0 { (sum_y / sum_w).max(1e-4) } else { 1.0 };
+    let mean_y = if sum_w > 0.0 {
+        (sum_y / sum_w).max(1e-4)
+    } else {
+        1.0
+    };
     beta[0] = mean_y.ln();
 
     let mut eta = vec![0.0; n_samples];
@@ -97,7 +109,7 @@ pub fn fit_glm_irls(
                 line += row[j] * beta[j];
             }
             eta[i] = line;
-            
+
             // Link function: log link -> mu = exp(eta), clamped to avoid float overflow
             let mu_i = line.clamp(-700.0, 700.0).exp();
             mu[i] = mu_i.max(1e-12);
@@ -170,7 +182,9 @@ pub fn fit_glm_irls(
     }
 
     if !converged && iter >= max_iter {
-        return Err(PricingError::NonConvergence("GLM IRLS did not converge within max iterations"));
+        return Err(PricingError::NonConvergence(
+            "GLM IRLS did not converge within max iterations",
+        ));
     }
 
     // Compute deviance

@@ -57,7 +57,12 @@ impl MultiplicativeRater {
     }
 
     /// Batch score a slice of exposure-factor tuples into an output slice `results`.
-    pub fn batch_score_into(&self, exposures: &[f64], factor_matrix: &[&[f64]], results: &mut [f64]) {
+    pub fn batch_score_into(
+        &self,
+        exposures: &[f64],
+        factor_matrix: &[&[f64]],
+        results: &mut [f64],
+    ) {
         for (i, (&exp, &factors)) in exposures.iter().zip(factor_matrix.iter()).enumerate() {
             results[i] = self.score(exp, factors);
         }

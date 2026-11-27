@@ -1,7 +1,10 @@
 pub mod ncci_erp;
-pub mod table_m;
 pub mod retrospective;
+pub mod table_m;
 
-pub use ncci_erp::{calculate_ncci_experience_mod, calculate_off_balance, ExperienceClaim, NcciErpSpecification, NcciErpResult};
+pub use ncci_erp::{
+    ExperienceClaim, NcciErpResult, NcciErpSpecification, calculate_ncci_experience_mod,
+    calculate_off_balance,
+};
+pub use retrospective::{RetroPlanResult, RetroPlanSpec, solve_balanced_retro_plan};
 pub use table_m::{TableMEngine, TableMRow};
-pub use retrospective::{solve_balanced_retro_plan, RetroPlanSpec, RetroPlanResult};

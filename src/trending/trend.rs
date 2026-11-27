@@ -1,5 +1,5 @@
-use serde::{Deserialize, Serialize};
 use crate::error::PricingError;
+use serde::{Deserialize, Serialize};
 
 /// Exponential or linear loss & exposure trending kernels.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
@@ -39,7 +39,9 @@ impl TrendModel {
     pub fn fit_exponential(time_points: &[f64], values: &[f64]) -> Result<Self, PricingError> {
         let n = time_points.len();
         if n < 2 || n != values.len() {
-            return Err(PricingError::InvalidParameter("at least 2 matching points required"));
+            return Err(PricingError::InvalidParameter(
+                "at least 2 matching points required",
+            ));
         }
         let mut sum_t = 0.0;
         let mut sum_lny = 0.0;
@@ -48,7 +50,9 @@ impl TrendModel {
 
         for (&t, &y) in time_points.iter().zip(values.iter()) {
             if y <= 0.0 {
-                return Err(PricingError::NonPositiveValue("values must be positive for log trend"));
+                return Err(PricingError::NonPositiveValue(
+                    "values must be positive for log trend",
+                ));
             }
             let lny = y.ln();
             sum_t += t;
@@ -60,7 +64,9 @@ impl TrendModel {
         let n_f = n as f64;
         let denom = n_f * sum_tt - sum_t * sum_t;
         if denom.abs() < 1e-12 {
-            return Err(PricingError::SingularMatrix("time points are collinear or identical"));
+            return Err(PricingError::SingularMatrix(
+                "time points are collinear or identical",
+            ));
         }
 
         let slope = (n_f * sum_t_lny - sum_t * sum_lny) / denom;

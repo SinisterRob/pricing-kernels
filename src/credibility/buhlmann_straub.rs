@@ -1,5 +1,5 @@
-use serde::{Deserialize, Serialize};
 use crate::error::PricingError;
+use serde::{Deserialize, Serialize};
 
 /// Result of non-parametric Bühlmann-Straub credibility estimation.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -31,10 +31,14 @@ pub fn buhlmann_straub(
 ) -> Result<BuhlmannStraubResult, PricingError> {
     let n_groups = groups_losses.len();
     if n_groups < 2 {
-        return Err(PricingError::InvalidParameter("at least 2 groups required for Bühlmann-Straub"));
+        return Err(PricingError::InvalidParameter(
+            "at least 2 groups required for Bühlmann-Straub",
+        ));
     }
     if groups_weights.len() != n_groups {
-        return Err(PricingError::DimensionMismatch("weights slice length != groups length"));
+        return Err(PricingError::DimensionMismatch(
+            "weights slice length != groups length",
+        ));
     }
 
     let mut total_periods = 0;
@@ -45,14 +49,18 @@ pub fn buhlmann_straub(
         let losses = groups_losses[i];
         let weights = groups_weights[i];
         if losses.len() != weights.len() || losses.is_empty() {
-            return Err(PricingError::DimensionMismatch("each group must have non-empty matching losses and weights"));
+            return Err(PricingError::DimensionMismatch(
+                "each group must have non-empty matching losses and weights",
+            ));
         }
         total_periods += losses.len();
         let mut sum_p = 0.0;
         let mut sum_px = 0.0;
         for (&x, &p) in losses.iter().zip(weights.iter()) {
             if p <= 0.0 {
-                return Err(PricingError::NonPositiveValue("weights must be strictly positive"));
+                return Err(PricingError::NonPositiveValue(
+                    "weights must be strictly positive",
+                ));
             }
             sum_p += p;
             sum_px += p * x;
@@ -62,7 +70,9 @@ pub fn buhlmann_straub(
     }
 
     if total_periods <= n_groups {
-        return Err(PricingError::InvalidParameter("total observations must exceed number of groups"));
+        return Err(PricingError::InvalidParameter(
+            "total observations must exceed number of groups",
+        ));
     }
 
     // 1. Calculate Expected Process Variance (s^2):
@@ -82,9 +92,12 @@ pub fn buhlmann_straub(
 
     // 2. Calculate Grand Mean (mu) and Variance of Hypothetical Means (a / VHM):
     let total_weight: f64 = group_total_weights.iter().sum();
-    let mu_unweighted: f64 = group_weighted_means.iter().zip(group_total_weights.iter())
+    let mu_unweighted: f64 = group_weighted_means
+        .iter()
+        .zip(group_total_weights.iter())
         .map(|(&m, &w)| m * w)
-        .sum::<f64>() / total_weight;
+        .sum::<f64>()
+        / total_weight;
 
     // m* calculation:
     // c = total_weight - (sum_i P_i^2) / total_weight
@@ -119,7 +132,11 @@ pub fn buhlmann_straub(
             sum_z += z_i;
             sum_zx += z_i * group_weighted_means[i];
         }
-        if sum_z > 0.0 { sum_zx / sum_z } else { mu_unweighted }
+        if sum_z > 0.0 {
+            sum_zx / sum_z
+        } else {
+            mu_unweighted
+        }
     } else {
         mu_unweighted
     };

@@ -1,5 +1,5 @@
-use serde::{Deserialize, Serialize};
 use crate::error::PricingError;
+use serde::{Deserialize, Serialize};
 
 /// Bailey-Simon Multiplicative Minimum Bias Model result.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -37,17 +37,23 @@ pub fn bailey_simon_multiplicative(
     tol: f64,
 ) -> Result<MinimumBiasResult, PricingError> {
     if n_rows == 0 || n_cols == 0 {
-        return Err(PricingError::EmptyInput("rows and columns must be non-zero"));
+        return Err(PricingError::EmptyInput(
+            "rows and columns must be non-zero",
+        ));
     }
     let total_cells = n_rows * n_cols;
     if exposures.len() != total_cells || losses.len() != total_cells {
-        return Err(PricingError::DimensionMismatch("slice length does not match n_rows * n_cols"));
+        return Err(PricingError::DimensionMismatch(
+            "slice length does not match n_rows * n_cols",
+        ));
     }
 
     // Check for negative exposures or losses
     for (&p, &a) in exposures.iter().zip(losses.iter()) {
         if p < 0.0 || a < 0.0 {
-            return Err(PricingError::InvalidParameter("exposures and losses must be non-negative"));
+            return Err(PricingError::InvalidParameter(
+                "exposures and losses must be non-negative",
+            ));
         }
     }
 
@@ -115,7 +121,9 @@ pub fn bailey_simon_multiplicative(
     }
 
     if max_diff > tol && iter >= max_iter {
-        return Err(PricingError::NonConvergence("Bailey-Simon failed to converge within max_iter"));
+        return Err(PricingError::NonConvergence(
+            "Bailey-Simon failed to converge within max_iter",
+        ));
     }
 
     // Set base rate as r[0], and normalize r so r[0] = 1.0, base_rate = r[0]

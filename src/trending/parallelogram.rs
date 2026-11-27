@@ -1,5 +1,5 @@
-use serde::{Deserialize, Serialize};
 use crate::error::PricingError;
+use serde::{Deserialize, Serialize};
 
 /// Historic rate change event.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
@@ -29,7 +29,9 @@ pub fn parallelogram_on_level_factor(
     let mut current_rate_level = 1.0;
     for chg in rate_changes {
         if chg.rate_factor <= 0.0 {
-            return Err(PricingError::NonPositiveValue("rate factor must be positive"));
+            return Err(PricingError::NonPositiveValue(
+                "rate factor must be positive",
+            ));
         }
         current_rate_level *= chg.rate_factor;
     }
@@ -44,7 +46,7 @@ pub fn parallelogram_on_level_factor(
     // For earned premium in calendar year Y:
     // If rate change happens at date d in [year_start, year_end]:
     // Portion of earned premium in year Y affected by new rate is: 0.5 * (year_end - d)^2.
-    
+
     // For policy year Y (written in year Y):
     // If rate change occurs at date d in [year_start, year_end]:
     // Area written at new rate = (year_end - d).
@@ -73,7 +75,9 @@ pub fn parallelogram_on_level_factor(
     }
 
     if historical_rate_level <= 0.0 {
-        return Err(PricingError::SingularMatrix("historical rate level is non-positive"));
+        return Err(PricingError::SingularMatrix(
+            "historical rate level is non-positive",
+        ));
     }
 
     // On-level factor = Current Rate Level / Historical Average Rate Level

@@ -1,5 +1,5 @@
-use serde::{Deserialize, Serialize};
 use crate::error::PricingError;
+use serde::{Deserialize, Serialize};
 
 /// Individual claim record in the experience period.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
@@ -60,19 +60,29 @@ pub fn calculate_ncci_experience_mod(
     claims: &[ExperienceClaim],
 ) -> Result<NcciErpResult, PricingError> {
     if spec.expected_losses <= 0.0 {
-        return Err(PricingError::NonPositiveValue("expected losses must be positive"));
+        return Err(PricingError::NonPositiveValue(
+            "expected losses must be positive",
+        ));
     }
     if spec.split_point <= 0.0 {
-        return Err(PricingError::NonPositiveValue("split point must be positive"));
+        return Err(PricingError::NonPositiveValue(
+            "split point must be positive",
+        ));
     }
     if spec.d_ratio <= 0.0 || spec.d_ratio >= 1.0 {
-        return Err(PricingError::InvalidParameter("d_ratio must be between 0.0 and 1.0"));
+        return Err(PricingError::InvalidParameter(
+            "d_ratio must be between 0.0 and 1.0",
+        ));
     }
     if spec.weight_w < 0.0 || spec.weight_w > 1.0 {
-        return Err(PricingError::InvalidParameter("weight_w must be between 0.0 and 1.0"));
+        return Err(PricingError::InvalidParameter(
+            "weight_w must be between 0.0 and 1.0",
+        ));
     }
     if spec.ballast_b < 0.0 {
-        return Err(PricingError::InvalidParameter("ballast_b must be non-negative"));
+        return Err(PricingError::InvalidParameter(
+            "ballast_b must be non-negative",
+        ));
     }
 
     let mut actual_primary = 0.0;
@@ -81,7 +91,9 @@ pub fn calculate_ncci_experience_mod(
     for claim in claims {
         let mut loss = claim.incurred;
         if loss < 0.0 {
-            return Err(PricingError::InvalidParameter("claim incurred cannot be negative"));
+            return Err(PricingError::InvalidParameter(
+                "claim incurred cannot be negative",
+            ));
         }
         if spec.apply_era && claim.is_medical_only {
             loss *= 0.30; // 70% reduction under ERA
@@ -98,7 +110,8 @@ pub fn calculate_ncci_experience_mod(
     let ratable_excess_actual = spec.weight_w * actual_excess;
     let ratable_excess_expected = (1.0 - spec.weight_w) * expected_excess;
 
-    let numerator = actual_primary + ratable_excess_actual + ratable_excess_expected + spec.ballast_b;
+    let numerator =
+        actual_primary + ratable_excess_actual + ratable_excess_expected + spec.ballast_b;
     let denominator = spec.expected_losses + spec.ballast_b;
 
     let mod_factor = (numerator / denominator * 1000.0).round() / 1000.0;
@@ -120,19 +133,25 @@ pub fn calculate_ncci_experience_mod(
 /// Applied to manual rates to maintain overall premium adequacy.
 pub fn calculate_off_balance(expected_losses: &[f64], mods: &[f64]) -> Result<f64, PricingError> {
     if expected_losses.is_empty() || expected_losses.len() != mods.len() {
-        return Err(PricingError::DimensionMismatch("expected_losses and mods must have identical non-zero lengths"));
+        return Err(PricingError::DimensionMismatch(
+            "expected_losses and mods must have identical non-zero lengths",
+        ));
     }
     let mut sum_e = 0.0;
     let mut sum_e_mod = 0.0;
     for (&e, &m) in expected_losses.iter().zip(mods.iter()) {
         if e <= 0.0 || m <= 0.0 {
-            return Err(PricingError::NonPositiveValue("expected losses and mods must be positive"));
+            return Err(PricingError::NonPositiveValue(
+                "expected losses and mods must be positive",
+            ));
         }
         sum_e += e;
         sum_e_mod += e * m;
     }
     if sum_e_mod <= 0.0 {
-        return Err(PricingError::SingularMatrix("sum of modified losses is non-positive"));
+        return Err(PricingError::SingularMatrix(
+            "sum of modified losses is non-positive",
+        ));
     }
     Ok(sum_e / sum_e_mod)
 }

@@ -1,5 +1,5 @@
-use serde::{Deserialize, Serialize};
 use crate::error::PricingError;
+use serde::{Deserialize, Serialize};
 
 /// Discrete Table M aggregate distribution row.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -23,22 +23,33 @@ impl TableMEngine {
     /// Build Table M directly from a discrete probability distribution of entry ratios (y_k, p_k).
     /// Enforces Lee's fundamental relations:
     /// d(phi)/dr = -(1 - F(r)) <= 0 (monotonically non-increasing and convex).
-    pub fn from_discrete_pdf(entry_ratios: &[f64], probabilities: &[f64]) -> Result<Self, PricingError> {
+    pub fn from_discrete_pdf(
+        entry_ratios: &[f64],
+        probabilities: &[f64],
+    ) -> Result<Self, PricingError> {
         if entry_ratios.len() != probabilities.len() || entry_ratios.is_empty() {
-            return Err(PricingError::DimensionMismatch("entry ratios and probabilities must have matching length"));
+            return Err(PricingError::DimensionMismatch(
+                "entry ratios and probabilities must have matching length",
+            ));
         }
 
         // Verify probabilities sum to ~1.0 and expected entry ratio is ~1.0
         let sum_p: f64 = probabilities.iter().sum();
         if (sum_p - 1.0).abs() > 1e-4 {
-            return Err(PricingError::InvalidParameter("probabilities must sum to 1.0"));
+            return Err(PricingError::InvalidParameter(
+                "probabilities must sum to 1.0",
+            ));
         }
 
-        let mean_r: f64 = entry_ratios.iter().zip(probabilities.iter())
+        let mean_r: f64 = entry_ratios
+            .iter()
+            .zip(probabilities.iter())
             .map(|(&r, &p)| r * p)
             .sum();
         if (mean_r - 1.0).abs() > 0.05 {
-            return Err(PricingError::InvalidParameter("mean entry ratio must be approximately 1.0"));
+            return Err(PricingError::InvalidParameter(
+                "mean entry ratio must be approximately 1.0",
+            ));
         }
 
         let mut rows = Vec::with_capacity(entry_ratios.len());
@@ -79,7 +90,11 @@ impl TableMEngine {
         }
 
         // Binary search for bracket
-        let pos = match self.rows.binary_search_by(|row| row.entry_ratio.partial_cmp(&r).unwrap()) {
+        let pos = match self.rows.binary_search_by(|row| {
+            row.entry_ratio
+                .partial_cmp(&r)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        }) {
             Ok(idx) => return self.rows[idx].charge,
             Err(idx) => idx,
         };

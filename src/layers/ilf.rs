@@ -1,5 +1,5 @@
-use serde::{Deserialize, Serialize};
 use crate::error::PricingError;
+use serde::{Deserialize, Serialize};
 
 /// Continuous parametric severity distribution for commercial liability and property pricing.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -27,7 +27,9 @@ impl SeverityDistribution {
         match *self {
             Self::Lomax { alpha, theta } => {
                 if alpha <= 0.0 || theta <= 0.0 {
-                    return Err(PricingError::InvalidParameter("alpha and theta must be positive"));
+                    return Err(PricingError::InvalidParameter(
+                        "alpha and theta must be positive",
+                    ));
                 }
                 if (alpha - 1.0).abs() < 1e-9 {
                     // alpha == 1 case: E[X ^ L] = theta * ln(1 + L / theta)
@@ -40,7 +42,9 @@ impl SeverityDistribution {
             }
             Self::SingleParameterPareto { alpha, x_m } => {
                 if alpha <= 0.0 || x_m <= 0.0 {
-                    return Err(PricingError::InvalidParameter("alpha and x_m must be positive"));
+                    return Err(PricingError::InvalidParameter(
+                        "alpha and x_m must be positive",
+                    ));
                 }
                 if limit <= x_m {
                     Ok(limit)
@@ -63,9 +67,15 @@ impl SeverityDistribution {
 
     /// Calculate Increased Limits Factor (ILF) relative to a base limit:
     /// ILF(L) = E[X ^ L] / E[X ^ B]
-    pub fn increased_limits_factor(&self, limit: f64, base_limit: f64) -> Result<f64, PricingError> {
+    pub fn increased_limits_factor(
+        &self,
+        limit: f64,
+        base_limit: f64,
+    ) -> Result<f64, PricingError> {
         if base_limit <= 0.0 {
-            return Err(PricingError::NonPositiveValue("base limit must be positive"));
+            return Err(PricingError::NonPositiveValue(
+                "base limit must be positive",
+            ));
         }
         let lev_limit = self.limited_expected_value(limit)?;
         let lev_base = self.limited_expected_value(base_limit)?;
@@ -77,9 +87,15 @@ impl SeverityDistribution {
 
     /// Calculate Loss Elimination Ratio (LER) for a deductible d relative to full expected loss (or policy limit L):
     /// LER(d) = E[X ^ d] / E[X ^ L]
-    pub fn loss_elimination_ratio(&self, deductible: f64, policy_limit: f64) -> Result<f64, PricingError> {
+    pub fn loss_elimination_ratio(
+        &self,
+        deductible: f64,
+        policy_limit: f64,
+    ) -> Result<f64, PricingError> {
         if deductible < 0.0 || policy_limit <= 0.0 {
-            return Err(PricingError::InvalidParameter("deductible must be non-negative and policy limit positive"));
+            return Err(PricingError::InvalidParameter(
+                "deductible must be non-negative and policy limit positive",
+            ));
         }
         let lev_d = self.limited_expected_value(deductible)?;
         let lev_l = self.limited_expected_value(policy_limit)?;
@@ -104,17 +120,28 @@ pub struct CommercialLayer {
 impl CommercialLayer {
     pub fn new(attachment: f64, limit: f64, participation: f64) -> Result<Self, PricingError> {
         if attachment < 0.0 || limit <= 0.0 {
-            return Err(PricingError::InvalidParameter("attachment must be >= 0 and limit > 0"));
+            return Err(PricingError::InvalidParameter(
+                "attachment must be >= 0 and limit > 0",
+            ));
         }
         if participation <= 0.0 || participation > 1.0 {
-            return Err(PricingError::InvalidParameter("participation must be between 0.0 and 1.0"));
+            return Err(PricingError::InvalidParameter(
+                "participation must be between 0.0 and 1.0",
+            ));
         }
-        Ok(Self { attachment, limit, participation })
+        Ok(Self {
+            attachment,
+            limit,
+            participation,
+        })
     }
 
     /// Evaluates expected loss cost in this specific layer:
     /// LayerLoss = Participation * ( E[X ^ (A + L)] - E[X ^ A] )
-    pub fn layer_expected_loss(&self, severity: &SeverityDistribution) -> Result<f64, PricingError> {
+    pub fn layer_expected_loss(
+        &self,
+        severity: &SeverityDistribution,
+    ) -> Result<f64, PricingError> {
         let lev_top = severity.limited_expected_value(self.attachment + self.limit)?;
         let lev_bot = severity.limited_expected_value(self.attachment)?;
         Ok(self.participation * (lev_top - lev_bot).max(0.0))

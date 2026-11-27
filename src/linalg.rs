@@ -4,12 +4,16 @@ use crate::error::PricingError;
 /// `dim × dim` matrix `a` in row-major layout (`A = L L^T`).
 pub fn cholesky_lower(a: &[f64], dim: usize) -> Result<Vec<f64>, PricingError> {
     if a.len() != dim * dim || dim == 0 {
-        return Err(PricingError::DimensionMismatch("matrix slice size does not match dim * dim"));
+        return Err(PricingError::DimensionMismatch(
+            "matrix slice size does not match dim * dim",
+        ));
     }
     for i in 0..dim {
         let d = a[i * dim + i];
         if !d.is_finite() || d <= 0.0 {
-            return Err(PricingError::SingularMatrix("matrix is not positive definite: diagonal non-positive"));
+            return Err(PricingError::SingularMatrix(
+                "matrix is not positive definite: diagonal non-positive",
+            ));
         }
     }
     let mut l = vec![0.0; dim * dim];
@@ -22,7 +26,9 @@ pub fn cholesky_lower(a: &[f64], dim: usize) -> Result<Vec<f64>, PricingError> {
             }
             if i == j {
                 if !sum.is_finite() || sum <= row_tol {
-                    return Err(PricingError::SingularMatrix("matrix is not positive definite: breakdown in diagonal"));
+                    return Err(PricingError::SingularMatrix(
+                        "matrix is not positive definite: breakdown in diagonal",
+                    ));
                 }
                 l[i * dim + j] = sum.sqrt();
             } else {
@@ -59,7 +65,9 @@ pub fn solve_upper_transpose_into(l: &[f64], dim: usize, y: &[f64], x: &mut [f64
 /// Solve symmetric positive-definite system `A x = b` using Cholesky factorization.
 pub fn cholesky_solve(a: &[f64], dim: usize, b: &[f64]) -> Result<Vec<f64>, PricingError> {
     if b.len() != dim {
-        return Err(PricingError::DimensionMismatch("vector b length does not match dim"));
+        return Err(PricingError::DimensionMismatch(
+            "vector b length does not match dim",
+        ));
     }
     let l = cholesky_lower(a, dim)?;
     let mut y = vec![0.0; dim];
@@ -108,7 +116,9 @@ pub fn mat_mul(a: &[f64], b: &[f64], rows_a: usize, cols_a: usize, cols_b: usize
 /// Compute weighted dot product: sum_i w_i * x_i * y_i.
 #[inline]
 pub fn weighted_dot(x: &[f64], y: &[f64], w: &[f64]) -> f64 {
-    x.iter().zip(y.iter()).zip(w.iter())
+    x.iter()
+        .zip(y.iter())
+        .zip(w.iter())
         .map(|((&xi, &yi), &wi)| wi * xi * yi)
         .sum()
 }
