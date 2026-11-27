@@ -19,8 +19,8 @@ pub use capital::{
     euler_tvar_allocation, myers_read_allocation, sample_rvar, sample_tvar, sample_var,
 };
 pub use catastrophe::{
-    EltSummary, EventLossEntry, elt_aggregate_distribution, elt_occurrence_layer_expected_loss,
-    elt_oep, elt_oep_pml, elt_summary,
+    EltSummary, EventLossEntry, EventLossTable, elt_aggregate_distribution,
+    elt_occurrence_layer_expected_loss, elt_oep, elt_oep_pml, elt_summary,
 };
 pub use risk_load::{
     DistortionOperator, DistortionPricingResult, KrepsRiskLoadResult, RmkPricingResult,

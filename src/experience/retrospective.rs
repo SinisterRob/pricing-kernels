@@ -1,5 +1,6 @@
+use super::table_l::{TableLEngine, solve_balanced_retro_plan_table_l};
 use super::table_m::TableMEngine;
-use crate::error::PricingError;
+use crate::error::{PricingError, SolverOptions};
 use serde::{Deserialize, Serialize};
 
 /// Parameters defining a Commercial Incurred Loss Retrospective Rating Plan.
@@ -19,6 +20,27 @@ pub struct RetroPlanSpec {
     pub min_retro_ratio: f64,
     /// Expense loading ratio (excluding taxes and ULAE).
     pub expense_ratio: f64,
+}
+
+impl RetroPlanSpec {
+    /// Solve for the balanced retrospective plan using a [`TableMEngine`] and [`SolverOptions`].
+    pub fn solve_table_m(
+        &self,
+        table_m: &TableMEngine,
+        options: &SolverOptions,
+    ) -> Result<RetroPlanResult, PricingError> {
+        solve_balanced_retro_plan(self, table_m, options.max_iter, options.tol)
+    }
+
+    /// Solve for the balanced retrospective plan with per-occurrence loss limit using a
+    /// [`TableLEngine`] and [`SolverOptions`].
+    pub fn solve_table_l(
+        &self,
+        table_l: &TableLEngine,
+        options: &SolverOptions,
+    ) -> Result<RetroPlanResult, PricingError> {
+        solve_balanced_retro_plan_table_l(self, table_l, options.max_iter, options.tol)
+    }
 }
 
 /// Solved retrospective rating plan parameters and financial breakdown.

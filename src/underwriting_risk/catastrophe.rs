@@ -12,6 +12,79 @@ use crate::error::PricingError;
 use crate::layers::CommercialLayer;
 use serde::{Deserialize, Serialize};
 
+/// Validated catastrophe Event Loss Table (ELT) container anchoring OEP, PML,
+/// occurrence layer pricing, and FFT aggregate exceedance probability methods.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct EventLossTable {
+    entries: Vec<EventLossEntry>,
+}
+
+impl EventLossTable {
+    /// Construct and validate an Event Loss Table from event records.
+    pub fn try_new(entries: Vec<EventLossEntry>) -> Result<Self, PricingError> {
+        if entries.is_empty() {
+            return Err(PricingError::EmptyInput(
+                "ELT must contain at least one event entry",
+            ));
+        }
+        for entry in &entries {
+            entry.validate()?;
+        }
+        Ok(Self { entries })
+    }
+
+    /// Underlying slice of validated [`EventLossEntry`] records.
+    #[inline]
+    pub fn entries(&self) -> &[EventLossEntry] {
+        &self.entries
+    }
+
+    /// Number of events in the table.
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// Returns `true` if the table has no events.
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    /// Analytical ELT summary (total arrival rate, AAL, occurrence SD).
+    pub fn summary(&self) -> Result<EltSummary, PricingError> {
+        elt_summary(&self.entries)
+    }
+
+    /// Occurrence Exceedance Probability `OEP(x) = P(max_k X_k > x)`.
+    pub fn oep(&self, loss_threshold: f64) -> Result<f64, PricingError> {
+        elt_oep(&self.entries, loss_threshold)
+    }
+
+    /// Occurrence Probable Maximum Loss at `return_period` years (e.g., `100.0` for 1-in-100).
+    pub fn oep_pml(&self, return_period: f64) -> Result<f64, PricingError> {
+        elt_oep_pml(&self.entries, return_period)
+    }
+
+    /// Expected annual occurrence ceded loss for a catastrophe XL `layer`.
+    pub fn occurrence_layer_expected_loss(
+        &self,
+        layer: &CommercialLayer,
+    ) -> Result<f64, PricingError> {
+        elt_occurrence_layer_expected_loss(&self.entries, layer)
+    }
+
+    /// Compound Poisson annual aggregate loss distribution via tilted radix-2 FFT.
+    pub fn aggregate_distribution(
+        &self,
+        step: f64,
+        fft_size: usize,
+        tilt_theta: Option<f64>,
+    ) -> Result<AggregateLossDistribution, PricingError> {
+        elt_aggregate_distribution(&self.entries, step, fft_size, tilt_theta)
+    }
+}
+
 /// Single catastrophe event record in an Event Loss Table (ELT).
 ///
 /// Follows the standard RMS / AIR ELT convention: annual Poisson event rate `lambda_i`,

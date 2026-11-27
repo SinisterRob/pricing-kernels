@@ -104,6 +104,7 @@ pub fn solve_upper_transpose_into(
 }
 
 /// Solve symmetric positive-definite system `A x = b` using Cholesky factorization.
+#[allow(dead_code)]
 pub fn cholesky_solve(a: &[f64], dim: usize, b: &[f64]) -> Result<Vec<f64>, PricingError> {
     if b.len() != dim {
         return Err(PricingError::DimensionMismatch(
@@ -182,6 +183,328 @@ pub fn weighted_dot(x: &[f64], y: &[f64], w: &[f64]) -> f64 {
         .zip(w.iter())
         .map(|((&xi, &yi), &wi)| wi * xi * yi)
         .sum()
+}
+
+/// Reusable workspace for allocation-free column-major Householder QR WLS solves
+/// (unpenalized or L2 Ridge-augmented) inside iterative loops such as GLM IRLS.
+#[derive(Debug, Default)]
+pub(crate) struct QrWorkspace {
+    /// Column-major `m × p` weighted/augmented matrix (`col j` at `j * m .. (j + 1) * m`).
+    a_cm: Vec<f64>,
+    b: Vec<f64>,
+    sqrt_w: Vec<f64>,
+    v: Vec<f64>,
+    /// Row-major `p × p` copy of upper-triangular `R` for contiguous back-sub / `R^{-1}`.
+    r_rm: Vec<f64>,
+    /// Column-major `p × p` inverse `R^{-1}`.
+    r_inv_cm: Vec<f64>,
+}
+
+impl QrWorkspace {
+    pub(crate) fn with_capacity(m: usize, p: usize) -> Self {
+        Self {
+            a_cm: vec![0.0; m * p],
+            b: vec![0.0; m],
+            sqrt_w: vec![0.0; m],
+            v: vec![0.0; m],
+            r_rm: vec![0.0; p * p],
+            r_inv_cm: vec![0.0; p * p],
+        }
+    }
+
+    #[inline]
+    fn ensure_dims(&mut self, m: usize, n: usize, p: usize) {
+        if self.a_cm.len() != m * p {
+            self.a_cm.resize(m * p, 0.0);
+        }
+        if self.b.len() != m {
+            self.b.resize(m, 0.0);
+        }
+        if self.sqrt_w.len() != n {
+            self.sqrt_w.resize(n, 0.0);
+        }
+        if self.v.len() != m {
+            self.v.resize(m, 0.0);
+        }
+    }
+}
+
+fn qr_factorize_a_cm_in_place(
+    m: usize,
+    p: usize,
+    ws: &mut QrWorkspace,
+    apply_rhs: bool,
+) -> Result<(), PricingError> {
+    for k in 0..p {
+        let len = m - k;
+        let col_k_start = k * m + k;
+        let col_k = &ws.a_cm[col_k_start..col_k_start + len];
+
+        let mut norm_sq = 0.0;
+        for &val in col_k {
+            norm_sq += val * val;
+        }
+        let norm = norm_sq.sqrt();
+        if !norm.is_finite() || norm <= 0.0 {
+            return Err(PricingError::SingularMatrix(
+                "design matrix is rank-deficient or collinear",
+            ));
+        }
+        let x0 = col_k[0];
+        let sign = if x0 >= 0.0 { 1.0 } else { -1.0 };
+        let alpha = -sign * norm;
+
+        let v_slice = &mut ws.v[..len];
+        v_slice[0] = x0 - alpha;
+        let mut v_norm_sq = v_slice[0] * v_slice[0];
+        for (dst, &src) in v_slice[1..].iter_mut().zip(col_k[1..].iter()) {
+            *dst = src;
+            v_norm_sq += src * src;
+        }
+        if v_norm_sq <= 1e-30 * norm_sq {
+            continue;
+        }
+        let tau = 2.0 / v_norm_sq;
+
+        ws.a_cm[col_k_start] = alpha;
+        ws.a_cm[col_k_start + 1..col_k_start + len].fill(0.0);
+
+        let v_ref = &ws.v[..len];
+        for j in (k + 1)..p {
+            let col_j_start = j * m + k;
+            let col_j = &mut ws.a_cm[col_j_start..col_j_start + len];
+            let mut dot = 0.0;
+            for (&vi, &aij) in v_ref.iter().zip(col_j.iter()) {
+                dot += vi * aij;
+            }
+            let scale = tau * dot;
+            for (aij, &vi) in col_j.iter_mut().zip(v_ref.iter()) {
+                *aij -= scale * vi;
+            }
+        }
+
+        if apply_rhs {
+            let b_slice = &mut ws.b[k..m];
+            let mut dot_b = 0.0;
+            for (&vi, &bi) in v_ref.iter().zip(b_slice.iter()) {
+                dot_b += vi * bi;
+            }
+            let scale_b = tau * dot_b;
+            for (bi, &vi) in b_slice.iter_mut().zip(v_ref.iter()) {
+                *bi -= scale_b * vi;
+            }
+        }
+    }
+
+    let mut max_diag = 0.0_f64;
+    let mut min_diag = f64::INFINITY;
+    for k in 0..p {
+        let d = ws.a_cm[k * m + k].abs();
+        if !d.is_finite() {
+            return Err(PricingError::InvalidParameter(
+                "QR diagonal overflowed to non-finite",
+            ));
+        }
+        max_diag = max_diag.max(d);
+        min_diag = min_diag.min(d);
+    }
+    if max_diag <= 0.0 || min_diag <= 1e-12 * max_diag {
+        return Err(PricingError::SingularMatrix(
+            "design matrix is rank-deficient or collinear",
+        ));
+    }
+
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn qr_factorize_weighted_ridge_cm_into(
+    x_cm: &[f64],
+    y: Option<&[f64]>,
+    weights: &[f64],
+    n: usize,
+    p: usize,
+    ridge_lambda: f64,
+    penalize_intercept: bool,
+    ws: &mut QrWorkspace,
+) -> Result<usize, PricingError> {
+    let start = usize::from(!penalize_intercept);
+    let n_pen = if ridge_lambda > 0.0 && start < p {
+        p - start
+    } else {
+        0
+    };
+    let m = n + n_pen;
+    if n == 0 || p == 0 || p > m || x_cm.len() != n * p || weights.len() != n {
+        return Err(PricingError::DimensionMismatch(
+            "invalid dimensions for QR weighted least squares",
+        ));
+    }
+    if let Some(yv) = y
+        && yv.len() != n
+    {
+        return Err(PricingError::DimensionMismatch(
+            "response vector length does not match n",
+        ));
+    }
+
+    ws.ensure_dims(m, n, p);
+
+    if let Some(yv) = y {
+        for i in 0..n {
+            let w = weights[i];
+            let yi = yv[i];
+            if !w.is_finite() || w < 0.0 || !yi.is_finite() {
+                return Err(PricingError::InvalidParameter(
+                    "WLS requires finite non-negative weights and finite responses",
+                ));
+            }
+            let sw = w.sqrt();
+            ws.sqrt_w[i] = sw;
+            ws.b[i] = sw * yi;
+        }
+        if n_pen > 0 {
+            ws.b[n..m].fill(0.0);
+        }
+    } else {
+        for i in 0..n {
+            let w = weights[i];
+            if !w.is_finite() || w < 0.0 {
+                return Err(PricingError::InvalidParameter(
+                    "WLS requires finite non-negative weights",
+                ));
+            }
+            ws.sqrt_w[i] = w.sqrt();
+        }
+    }
+
+    let sqrt_lam = if n_pen > 0 { ridge_lambda.sqrt() } else { 0.0 };
+    let sw = &ws.sqrt_w[..n];
+    for j in 0..p {
+        let src = &x_cm[j * n..(j + 1) * n];
+        let dst = &mut ws.a_cm[j * m..(j + 1) * m];
+        for ((d, &s), &w) in dst[..n].iter_mut().zip(src.iter()).zip(sw.iter()) {
+            *d = w * s;
+        }
+        if n_pen > 0 {
+            dst[n..m].fill(0.0);
+            if j >= start {
+                dst[n + (j - start)] = sqrt_lam;
+            }
+        }
+    }
+
+    qr_factorize_a_cm_in_place(m, p, ws, y.is_some())?;
+    Ok(m)
+}
+
+/// Zero-allocation Householder QR weighted least squares (with optional L2 Ridge augmentation)
+/// from pre-validated column-major `x_cm`, writing `beta` into `beta_out`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn weighted_least_squares_qr_ridge_cm_beta_into(
+    x_cm: &[f64],
+    y: &[f64],
+    weights: &[f64],
+    n: usize,
+    p: usize,
+    ridge_lambda: f64,
+    penalize_intercept: bool,
+    ws: &mut QrWorkspace,
+    beta_out: &mut [f64],
+) -> Result<(), PricingError> {
+    if beta_out.len() != p {
+        return Err(PricingError::DimensionMismatch(
+            "beta_out length does not match p",
+        ));
+    }
+    let m = qr_factorize_weighted_ridge_cm_into(
+        x_cm,
+        Some(y),
+        weights,
+        n,
+        p,
+        ridge_lambda,
+        penalize_intercept,
+        ws,
+    )?;
+    for i in (0..p).rev() {
+        let mut sum = ws.b[i];
+        for j in (i + 1)..p {
+            sum -= ws.a_cm[j * m + i] * beta_out[j];
+        }
+        beta_out[i] = sum / ws.a_cm[i * m + i];
+    }
+    Ok(())
+}
+
+/// Factorize `[W^{1/2} X; sqrt(lambda) D]` and return `(X^T W X + Lambda)^{-1} = R^{-1} R^{-T}`
+/// in row-major `p × p` layout.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn weighted_least_squares_qr_ridge_cm_cov(
+    x_cm: &[f64],
+    weights: &[f64],
+    n: usize,
+    p: usize,
+    ridge_lambda: f64,
+    penalize_intercept: bool,
+    ws: &mut QrWorkspace,
+) -> Result<Vec<f64>, PricingError> {
+    let m = qr_factorize_weighted_ridge_cm_into(
+        x_cm,
+        None,
+        weights,
+        n,
+        p,
+        ridge_lambda,
+        penalize_intercept,
+        ws,
+    )?;
+
+    if ws.r_rm.len() != p * p {
+        ws.r_rm.resize(p * p, 0.0);
+    }
+    if ws.r_inv_cm.len() != p * p {
+        ws.r_inv_cm.resize(p * p, 0.0);
+    }
+    for row in 0..p {
+        let r_dst = &mut ws.r_rm[row * p..row * p + p];
+        for col in row..p {
+            r_dst[col] = ws.a_cm[col * m + row];
+        }
+    }
+
+    ws.r_inv_cm.fill(0.0);
+    for col in 0..p {
+        let inv_col_base = col * p;
+        ws.r_inv_cm[inv_col_base + col] = 1.0 / ws.r_rm[col * p + col];
+        for row in (0..col).rev() {
+            let r_row = &ws.r_rm[(row * p + row + 1)..=(row * p + col)];
+            let inv_col = &ws.r_inv_cm[(inv_col_base + row + 1)..=(inv_col_base + col)];
+            let mut sum = 0.0;
+            for (&rik, &yk) in r_row.iter().zip(inv_col.iter()) {
+                sum -= rik * yk;
+            }
+            ws.r_inv_cm[inv_col_base + row] = sum / ws.r_rm[row * p + row];
+        }
+    }
+
+    let mut xtwx_inv = vec![0.0; p * p];
+    for k in 0..p {
+        let c_k = &ws.r_inv_cm[(k * p)..=(k * p + k)];
+        for i in 0..=k {
+            let ci = c_k[i];
+            let dst = &mut xtwx_inv[(i * p + i)..=(i * p + k)];
+            for (d, &cj) in dst.iter_mut().zip(c_k[i..].iter()) {
+                *d += ci * cj;
+            }
+        }
+    }
+    for i in 0..p {
+        for j in (i + 1)..p {
+            xtwx_inv[j * p + i] = xtwx_inv[i * p + j];
+        }
+    }
+    Ok(xtwx_inv)
 }
 
 #[cfg(test)]

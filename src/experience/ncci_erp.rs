@@ -27,6 +27,9 @@ pub struct NcciErpSpecification {
     pub apply_era: bool,
 }
 
+/// Concise alias for [`NcciErpSpecification`] matching [`super::IsoErpSpec`] and [`super::RetroPlanSpec`].
+pub type NcciErpSpec = NcciErpSpecification;
+
 /// Detailed result of NCCI Experience Modification calculation.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct NcciErpResult {

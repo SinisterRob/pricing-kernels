@@ -754,3 +754,72 @@ impl CommercialLayer {
         }
     }
 }
+
+/// Ordered tower of commercial excess insurance layers (`Vec<CommercialLayer>`).
+///
+/// Useful for pricing multi-layer excess towers and treaty programs against a common
+/// [`SeverityDistribution`] or occurrence loss.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LayerTower {
+    layers: Vec<CommercialLayer>,
+}
+
+impl LayerTower {
+    /// Construct a tower from pre-validated [`CommercialLayer`] entries.
+    pub fn try_new(layers: Vec<CommercialLayer>) -> Result<Self, PricingError> {
+        if layers.is_empty() {
+            return Err(PricingError::EmptyInput(
+                "layer tower must contain at least one layer",
+            ));
+        }
+        Ok(Self { layers })
+    }
+
+    /// Underlying slice of [`CommercialLayer`] entries.
+    #[inline]
+    pub fn layers(&self) -> &[CommercialLayer] {
+        &self.layers
+    }
+
+    /// Number of layers in the tower.
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.layers.len()
+    }
+
+    /// Returns `true` if the tower has no layers.
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.layers.is_empty()
+    }
+
+    /// Evaluate expected loss cost for each layer in the tower.
+    pub fn expected_losses(
+        &self,
+        severity: &SeverityDistribution,
+    ) -> Result<Vec<f64>, PricingError> {
+        let mut out = Vec::with_capacity(self.layers.len());
+        for layer in &self.layers {
+            out.push(layer.layer_expected_loss(severity)?);
+        }
+        Ok(out)
+    }
+
+    /// Evaluate total expected loss across all layers in the tower.
+    pub fn total_expected_loss(
+        &self,
+        severity: &SeverityDistribution,
+    ) -> Result<f64, PricingError> {
+        let mut total = 0.0;
+        for layer in &self.layers {
+            total += layer.layer_expected_loss(severity)?;
+        }
+        Ok(total)
+    }
+
+    /// Evaluate total tower payout for a single gross occurrence loss `X`.
+    #[inline]
+    pub fn total_payout(&self, gross_loss: f64) -> f64 {
+        self.layers.iter().map(|l| l.payout(gross_loss)).sum()
+    }
+}

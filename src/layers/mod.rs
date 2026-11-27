@@ -8,7 +8,7 @@ pub mod mbbefd;
 /// Treaty reinsurance pricing (burning cost, reinstatements, sliding scale, corridors, profit commission).
 pub mod reinsurance;
 
-pub use ilf::{CommercialLayer, SeverityDistribution};
+pub use ilf::{CommercialLayer, LayerTower, SeverityDistribution};
 pub use mbbefd::{MbbefdCurve, SwissReCurve};
 pub use reinsurance::{
     BurningCostResult, BurningCostYearResult, HistoricalTreatyClaim, HistoricalTreatyYear,

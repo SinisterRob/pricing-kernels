@@ -1387,3 +1387,133 @@ fn test_subannual_parallelogram_two_step_trend_and_hachemeister() {
     assert!(cred_dist < raw_dist);
     assert!(hach.groups[0].predict(6.0) > hach.groups[0].predict(5.0));
 }
+
+#[test]
+fn test_phase1_anchor_types_builders_and_declarative_macros() {
+    use pricing_kernels::{rate_changes, tower};
+
+    // 1. DesignMatrix + GlmFit fluent builder (unpenalized & ridge QR parity)
+    let design = DesignMatrix::try_from_rows(&[
+        &[1.0, 0.0, 0.0, 0.0],
+        &[1.0, 0.0, 0.0, 1.0],
+        &[1.0, 1.0, 0.0, 0.0],
+        &[1.0, 1.0, 0.0, 1.0],
+        &[1.0, 0.0, 1.0, 0.0],
+        &[1.0, 0.0, 1.0, 1.0],
+    ])
+    .expect("design matrix");
+    let exposures = [1235.0, 582.0, 2845.0, 1204.0, 890.0, 410.0];
+    let loss_costs = [105.4, 132.8, 92.1, 116.5, 81.0, 102.3];
+    let total_losses: Vec<f64> = exposures
+        .iter()
+        .zip(loss_costs.iter())
+        .map(|(&p, &a)| p * a)
+        .collect();
+    let offsets: Vec<f64> = exposures.iter().map(|&p| p.ln()).collect();
+
+    let fit = GlmFit::new(GlmFamily::Poisson, &design, &total_losses)
+        .offsets(&offsets)
+        .tol(1e-12)
+        .fit()
+        .expect("GlmFit Poisson");
+    let preds = design
+        .predict(GlmFamily::Poisson, &fit.coefficients, Some(&offsets))
+        .expect("predict");
+    let obs_sum: f64 = total_losses.iter().sum();
+    let pred_sum: f64 = preds.iter().sum();
+    assert!(close_rel(pred_sum, obs_sum, 1e-9));
+
+    // Ridge-penalized QR GLM shrinks non-intercept coefficients toward 0
+    let fit_ridge = GlmFit::new(GlmFamily::Poisson, &design, &total_losses)
+        .offsets(&offsets)
+        .ridge_lambda(50.0)
+        .fit()
+        .expect("GlmFit Ridge");
+    let unpen_norm: f64 = fit.coefficients[1..].iter().map(|b| b * b).sum();
+    let ridge_norm: f64 = fit_ridge.coefficients[1..].iter().map(|b| b * b).sum();
+    assert!(ridge_norm < unpen_norm);
+
+    // 2. RatingTable + SolverOptions
+    let table =
+        RatingTable::try_new(3, 2, exposures.to_vec(), loss_costs.to_vec()).expect("rating table");
+    let mb = table
+        .bailey_simon_multiplicative(&SolverOptions::default().with_tol(1e-12))
+        .expect("mb");
+    assert!(close_rel(fit.coefficients[0].exp(), mb.base_rate, 1e-8));
+
+    // 3. LayerTower + tower! macro
+    let sev = SeverityDistribution::lognormal_from_mean_cv(100_000.0, 1.5).unwrap();
+    let t = tower![
+        100_000.0 xs 0.0,
+        150_000.0 xs 100_000.0 @ 1.0,
+    ]
+    .expect("tower");
+    assert_eq!(t.len(), 2);
+    let total_el = t.total_expected_loss(&sev).unwrap();
+    let lev_250k = sev.limited_expected_value(250_000.0).unwrap();
+    assert!(close_rel(total_el, lev_250k, 1e-12));
+    assert!(close_rel(t.total_payout(180_000.0), 180_000.0, 1e-12));
+
+    // 4. rate_changes! macro
+    let changes = rate_changes![2021.5 => 1.10];
+    let olf = parallelogram_on_level_factor(2022.0, &changes).unwrap();
+    assert!(close_rel(olf, 1.10 / 1.0875, 1e-12));
+
+    // 5. EventLossTable anchor
+    let elt = EventLossTable::try_new(vec![
+        EventLossEntry {
+            event_id: 1,
+            annual_rate: 0.05,
+            mean_loss: 1_000_000.0,
+            std_dev_indep: 200_000.0,
+            std_dev_corr: 100_000.0,
+            max_loss: 5_000_000.0,
+        },
+        EventLossEntry {
+            event_id: 2,
+            annual_rate: 0.02,
+            mean_loss: 3_000_000.0,
+            std_dev_indep: 500_000.0,
+            std_dev_corr: 300_000.0,
+            max_loss: 12_000_000.0,
+        },
+    ])
+    .expect("elt");
+    assert_eq!(elt.len(), 2);
+    let summary = elt.summary().unwrap();
+    assert!(close_rel(
+        summary.average_annual_loss,
+        0.05 * 1e6 + 0.02 * 3e6,
+        1e-9
+    ));
+    assert!(elt.oep_pml(100.0).unwrap() > 0.0);
+
+    // 6. RetroPlanSpec::solve_table_m + NcciErpSpec alias
+    let table_m =
+        TableMEngine::from_discrete_pdf(&[0.2, 0.6, 1.0, 1.4, 1.8], &[0.1, 0.2, 0.4, 0.2, 0.1])
+            .unwrap();
+    let retro_spec = RetroPlanSpec {
+        standard_premium: 500_000.0,
+        expected_loss_ratio: 0.60,
+        lcf: 1.12,
+        tax_multiplier: 1.04,
+        max_retro_ratio: 1.40,
+        min_retro_ratio: 0.50,
+        expense_ratio: 0.20,
+    };
+    let retro = retro_spec
+        .solve_table_m(&table_m, &SolverOptions::default())
+        .unwrap();
+    assert!(retro.basic_premium_factor > 0.0);
+
+    let ncci_alias: NcciErpSpec = NcciErpSpec {
+        split_point: 18_500.0,
+        expected_losses: 100_000.0,
+        d_ratio: 0.40,
+        weight_w: 0.15,
+        ballast_b: 25_000.0,
+        apply_era: true,
+    };
+    let ncci_res = calculate_ncci_experience_mod(&ncci_alias, &[]).unwrap();
+    assert!(ncci_res.mod_factor < 1.0);
+}

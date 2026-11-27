@@ -37,3 +37,36 @@ impl fmt::Display for PricingError {
 }
 
 impl std::error::Error for PricingError {}
+
+/// Common iterative solver convergence options (`max_iter`, `tol`) shared across
+/// minimum-bias and retrospective rating plan solvers.
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct SolverOptions {
+    /// Maximum number of solver iterations (default `200`).
+    pub max_iter: usize,
+    /// Absolute convergence tolerance (default `1e-9`).
+    pub tol: f64,
+}
+
+impl Default for SolverOptions {
+    fn default() -> Self {
+        Self {
+            max_iter: 200,
+            tol: 1e-9,
+        }
+    }
+}
+
+impl SolverOptions {
+    /// Set maximum solver iterations.
+    pub const fn with_max_iter(mut self, max_iter: usize) -> Self {
+        self.max_iter = max_iter;
+        self
+    }
+
+    /// Set absolute convergence tolerance.
+    pub const fn with_tol(mut self, tol: f64) -> Self {
+        self.tol = tol;
+        self
+    }
+}

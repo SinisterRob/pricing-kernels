@@ -1,5 +1,87 @@
-use crate::error::PricingError;
+use crate::error::{PricingError, SolverOptions};
 use serde::{Deserialize, Serialize};
+
+/// Validated two-dimensional classification rating table (`n_rows × n_cols`) of
+/// exposures and observed average loss costs.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RatingTable {
+    n_rows: usize,
+    n_cols: usize,
+    exposures: Vec<f64>,
+    losses: Vec<f64>,
+}
+
+impl RatingTable {
+    /// Construct and validate a row-major `n_rows × n_cols` rating table.
+    pub fn try_new(
+        n_rows: usize,
+        n_cols: usize,
+        exposures: Vec<f64>,
+        losses: Vec<f64>,
+    ) -> Result<Self, PricingError> {
+        validate_grid(n_rows, n_cols, &exposures, &losses, 1, 1e-6)?;
+        Ok(Self {
+            n_rows,
+            n_cols,
+            exposures,
+            losses,
+        })
+    }
+
+    /// Number of dimension-1 levels (rows).
+    #[inline]
+    pub const fn n_rows(&self) -> usize {
+        self.n_rows
+    }
+
+    /// Number of dimension-2 levels (columns).
+    #[inline]
+    pub const fn n_cols(&self) -> usize {
+        self.n_cols
+    }
+
+    /// Flat row-major exposure slice.
+    #[inline]
+    pub fn exposures(&self) -> &[f64] {
+        &self.exposures
+    }
+
+    /// Flat row-major average loss-cost slice.
+    #[inline]
+    pub fn losses(&self) -> &[f64] {
+        &self.losses
+    }
+
+    /// Fit Bailey (1963) multiplicative balance-principle relativities.
+    pub fn bailey_simon_multiplicative(
+        &self,
+        options: &SolverOptions,
+    ) -> Result<MinimumBiasResult, PricingError> {
+        bailey_simon_multiplicative(
+            self.n_rows,
+            self.n_cols,
+            &self.exposures,
+            &self.losses,
+            options.max_iter,
+            options.tol,
+        )
+    }
+
+    /// Fit Bailey & Simon (1960) chi-squared minimum bias relativities.
+    pub fn bailey_simon_chi_squared(
+        &self,
+        options: &SolverOptions,
+    ) -> Result<MinimumBiasResult, PricingError> {
+        bailey_simon_chi_squared(
+            self.n_rows,
+            self.n_cols,
+            &self.exposures,
+            &self.losses,
+            options.max_iter,
+            options.tol,
+        )
+    }
+}
 
 /// Multiplicative Minimum Bias Model result.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

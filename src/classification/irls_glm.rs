@@ -1,5 +1,8 @@
 use crate::error::PricingError;
-use crate::linalg::{cholesky_invert, cholesky_solve};
+use crate::linalg::{
+    QrWorkspace, weighted_least_squares_qr_ridge_cm_beta_into,
+    weighted_least_squares_qr_ridge_cm_cov,
+};
 use serde::{Deserialize, Serialize};
 
 /// GLM error family for commercial actuarial pricing kernels.
@@ -182,6 +185,32 @@ impl Default for GlmOptions {
     }
 }
 
+impl GlmOptions {
+    /// Set maximum IRLS iterations.
+    pub const fn with_max_iter(mut self, max_iter: usize) -> Self {
+        self.max_iter = max_iter;
+        self
+    }
+
+    /// Set absolute convergence tolerance on coefficients.
+    pub const fn with_tol(mut self, tol: f64) -> Self {
+        self.tol = tol;
+        self
+    }
+
+    /// Set L2 (Ridge) penalty `lambda >= 0`.
+    pub const fn with_ridge_lambda(mut self, ridge_lambda: f64) -> Self {
+        self.ridge_lambda = ridge_lambda;
+        self
+    }
+
+    /// Set whether to penalize column `0` (intercept).
+    pub const fn with_penalize_intercept(mut self, penalize_intercept: bool) -> Self {
+        self.penalize_intercept = penalize_intercept;
+        self
+    }
+}
+
 /// Fitted GLM result with coefficients, standard errors, dispersion, and deviance.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct GlmResult {
@@ -198,6 +227,236 @@ pub struct GlmResult {
     pub df_residual: usize,
     /// Number of IRLS iterations until convergence.
     pub iterations: usize,
+}
+
+/// Validated row-major `n_samples × n_features` design matrix for GLM fitting and prediction.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DesignMatrix {
+    n_samples: usize,
+    n_features: usize,
+    data: Vec<f64>,
+}
+
+impl DesignMatrix {
+    /// Construct and validate a row-major `n_samples × n_features` design matrix.
+    pub fn try_new(
+        n_samples: usize,
+        n_features: usize,
+        data: Vec<f64>,
+    ) -> Result<Self, PricingError> {
+        if n_samples == 0 || n_features == 0 {
+            return Err(PricingError::EmptyInput(
+                "samples and features must be non-zero",
+            ));
+        }
+        let expected = n_samples
+            .checked_mul(n_features)
+            .ok_or(PricingError::DimensionMismatch(
+                "n_samples * n_features overflowed",
+            ))?;
+        if data.len() != expected {
+            return Err(PricingError::DimensionMismatch(
+                "design matrix length != n_samples * n_features",
+            ));
+        }
+        if data.iter().any(|v| !v.is_finite()) {
+            return Err(PricingError::InvalidParameter(
+                "design matrix contains non-finite value",
+            ));
+        }
+        Ok(Self {
+            n_samples,
+            n_features,
+            data,
+        })
+    }
+
+    /// Construct and validate a design matrix from rectangular row slices.
+    pub fn try_from_rows<R: AsRef<[f64]>>(rows: &[R]) -> Result<Self, PricingError> {
+        let n_samples = rows.len();
+        if n_samples == 0 {
+            return Err(PricingError::EmptyInput("rows must be non-empty"));
+        }
+        let n_features = rows[0].as_ref().len();
+        if n_features == 0 {
+            return Err(PricingError::EmptyInput("columns must be non-zero"));
+        }
+        let mut data = Vec::with_capacity(n_samples * n_features);
+        for row in rows {
+            let slice = row.as_ref();
+            if slice.len() != n_features {
+                return Err(PricingError::DimensionMismatch(
+                    "all design matrix rows must have identical length",
+                ));
+            }
+            if slice.iter().any(|v| !v.is_finite()) {
+                return Err(PricingError::InvalidParameter(
+                    "design matrix contains non-finite value",
+                ));
+            }
+            data.extend_from_slice(slice);
+        }
+        Ok(Self {
+            n_samples,
+            n_features,
+            data,
+        })
+    }
+
+    /// Number of observations (rows).
+    #[inline]
+    pub const fn n_samples(&self) -> usize {
+        self.n_samples
+    }
+
+    /// Number of model features (columns).
+    #[inline]
+    pub const fn n_features(&self) -> usize {
+        self.n_features
+    }
+
+    /// Flat row-major backing slice of length `n_samples * n_features`.
+    #[inline]
+    pub fn data(&self) -> &[f64] {
+        &self.data
+    }
+
+    /// Row slice for observation `i`, or `None` if out of bounds.
+    #[inline]
+    pub fn row(&self, i: usize) -> Option<&[f64]> {
+        if i >= self.n_samples {
+            return None;
+        }
+        let start = i * self.n_features;
+        Some(&self.data[start..start + self.n_features])
+    }
+
+    /// Predict expected responses `mu_i = g^-1(X_i beta + offset_i)`.
+    pub fn predict(
+        &self,
+        family: GlmFamily,
+        coefficients: &[f64],
+        offsets: Option<&[f64]>,
+    ) -> Result<Vec<f64>, PricingError> {
+        if let Some(off) = offsets {
+            predict_glm(
+                family,
+                &self.data,
+                self.n_samples,
+                self.n_features,
+                coefficients,
+                off,
+            )
+        } else {
+            let zeros = vec![0.0; self.n_samples];
+            predict_glm(
+                family,
+                &self.data,
+                self.n_samples,
+                self.n_features,
+                coefficients,
+                &zeros,
+            )
+        }
+    }
+}
+
+/// Fluent builder for fitting an unpenalized or L2-penalized GLM via Householder QR IRLS.
+///
+/// Defaults to unit prior weights (`1.0`), zero offsets (`0.0`), and [`GlmOptions::default()`].
+#[derive(Debug, Clone)]
+pub struct GlmFit<'a> {
+    family: GlmFamily,
+    design: &'a DesignMatrix,
+    y: &'a [f64],
+    weights: Option<&'a [f64]>,
+    offsets: Option<&'a [f64]>,
+    options: GlmOptions,
+}
+
+impl<'a> GlmFit<'a> {
+    /// Start a GLM fit for `family` on validated `design` and observed responses `y`.
+    pub fn new(family: GlmFamily, design: &'a DesignMatrix, y: &'a [f64]) -> Self {
+        Self {
+            family,
+            design,
+            y,
+            weights: None,
+            offsets: None,
+            options: GlmOptions::default(),
+        }
+    }
+
+    /// Set non-negative prior observation weights (default: all `1.0`).
+    pub const fn weights(mut self, weights: &'a [f64]) -> Self {
+        self.weights = Some(weights);
+        self
+    }
+
+    /// Set linear-predictor exposure offsets `ln(E)` (default: all `0.0`).
+    pub const fn offsets(mut self, offsets: &'a [f64]) -> Self {
+        self.offsets = Some(offsets);
+        self
+    }
+
+    /// Override the full [`GlmOptions`] configuration.
+    pub const fn options(mut self, options: GlmOptions) -> Self {
+        self.options = options;
+        self
+    }
+
+    /// Set L2 (Ridge) penalty `lambda >= 0`.
+    pub const fn ridge_lambda(mut self, lambda: f64) -> Self {
+        self.options.ridge_lambda = lambda;
+        self
+    }
+
+    /// Set whether to penalize column `0` (intercept).
+    pub const fn penalize_intercept(mut self, penalize: bool) -> Self {
+        self.options.penalize_intercept = penalize;
+        self
+    }
+
+    /// Set maximum IRLS iterations.
+    pub const fn max_iter(mut self, max_iter: usize) -> Self {
+        self.options.max_iter = max_iter;
+        self
+    }
+
+    /// Set absolute coefficient convergence tolerance.
+    pub const fn tol(mut self, tol: f64) -> Self {
+        self.options.tol = tol;
+        self
+    }
+
+    /// Execute IRLS fitting and return [`GlmResult`].
+    pub fn fit(&self) -> Result<GlmResult, PricingError> {
+        let n = self.design.n_samples();
+        let default_w;
+        let w = if let Some(slice) = self.weights {
+            slice
+        } else {
+            default_w = vec![1.0; n];
+            &default_w
+        };
+        let default_off;
+        let off = if let Some(slice) = self.offsets {
+            slice
+        } else {
+            default_off = vec![0.0; n];
+            &default_off
+        };
+        fit_glm_irls_with_options(
+            self.family,
+            self.design.data(),
+            n,
+            self.design.n_features(),
+            self.y,
+            w,
+            off,
+            &self.options,
+        )
+    }
 }
 
 /// Fit a Generalized Linear Model (GLM) via Iteratively Reweighted Least Squares (IRLS).
@@ -362,11 +621,27 @@ pub fn fit_glm_irls_with_options(
         };
     }
 
+    // Pre-transpose design matrix into column-major layout once so every Householder QR
+    // step operates on contiguous column slices without squaring the condition number.
+    let mut x_cm = vec![0.0; n_samples * n_features];
+    for i in 0..n_samples {
+        let row = &design_matrix[i * n_features..(i + 1) * n_features];
+        for j in 0..n_features {
+            x_cm[j * n_samples + i] = row[j];
+        }
+    }
+
+    let n_aug = n_samples
+        + if options.ridge_lambda > 0.0 {
+            n_features
+        } else {
+            0
+        };
     let mut beta = vec![0.0; n_features];
+    let mut beta_new = vec![0.0; n_features];
     let mut w_irls = vec![0.0; n_samples];
     let mut z = vec![0.0; n_samples];
-    let mut xtwx = vec![0.0; n_features * n_features];
-    let mut xtwz = vec![0.0; n_features];
+    let mut qr_ws = QrWorkspace::with_capacity(n_aug, n_features);
 
     let mut iter = 0;
     let mut converged = false;
@@ -386,37 +661,17 @@ pub fn fit_glm_irls_with_options(
             z[i] = family.working_response(eta[i], offsets[i], y[i], mui);
         }
 
-        // Form normal equations: (X^T W X + Lambda) beta_new = X^T W z
-        xtwx.fill(0.0);
-        xtwz.fill(0.0);
-        for i in 0..n_samples {
-            let wi = w_irls[i];
-            if wi <= 0.0 {
-                continue;
-            }
-            let zi = z[i];
-            let row = &design_matrix[i * n_features..(i + 1) * n_features];
-            for j in 0..n_features {
-                let x_ij = row[j];
-                xtwz[j] += wi * x_ij * zi;
-                for k in 0..=j {
-                    let val = wi * x_ij * row[k];
-                    xtwx[j * n_features + k] += val;
-                    if k != j {
-                        xtwx[k * n_features + j] += val;
-                    }
-                }
-            }
-        }
-
-        if options.ridge_lambda > 0.0 {
-            let start = usize::from(!options.penalize_intercept);
-            for j in start..n_features {
-                xtwx[j * n_features + j] += options.ridge_lambda;
-            }
-        }
-
-        let beta_new = cholesky_solve(&xtwx, n_features, &xtwz)?;
+        weighted_least_squares_qr_ridge_cm_beta_into(
+            &x_cm,
+            &z,
+            &w_irls,
+            n_samples,
+            n_features,
+            options.ridge_lambda,
+            options.penalize_intercept,
+            &mut qr_ws,
+            &mut beta_new,
+        )?;
 
         let mut max_change = 0.0;
         for j in 0..n_features {
@@ -424,9 +679,8 @@ pub fn fit_glm_irls_with_options(
             if change > max_change {
                 max_change = change;
             }
+            beta[j] = beta_new[j];
         }
-
-        beta = beta_new;
 
         for i in 0..n_samples {
             let mut line = offsets[i];
@@ -450,40 +704,22 @@ pub fn fit_glm_irls_with_options(
         ));
     }
 
-    // Recompute final Fisher information X^T W X + Lambda, deviance, and Pearson chi-squared.
-    xtwx.fill(0.0);
+    // Recompute final IRLS weights, deviance, and Pearson chi-squared at converged beta.
     let mut deviance = 0.0;
     let mut pearson_chi2 = 0.0;
 
     for i in 0..n_samples {
         let wi = weights[i];
         if wi <= 0.0 {
+            w_irls[i] = 0.0;
             continue;
         }
         let yi = y[i];
         let mui = mu[i];
-        let w_final = family.irls_weight(wi, mui);
-        let row = &design_matrix[i * n_features..(i + 1) * n_features];
-        for j in 0..n_features {
-            let x_ij = row[j];
-            for k in 0..=j {
-                let val = w_final * x_ij * row[k];
-                xtwx[j * n_features + k] += val;
-                if k != j {
-                    xtwx[k * n_features + j] += val;
-                }
-            }
-        }
+        w_irls[i] = family.irls_weight(wi, mui);
         deviance += wi * family.unit_deviance(yi, mui);
         let diff = yi - mui;
         pearson_chi2 += wi * (diff * diff) / family.variance_fn(mui);
-    }
-
-    if options.ridge_lambda > 0.0 {
-        let start = usize::from(!options.penalize_intercept);
-        for j in start..n_features {
-            xtwx[j * n_features + j] += options.ridge_lambda;
-        }
     }
 
     let df_residual = active_samples.saturating_sub(n_features);
@@ -501,7 +737,15 @@ pub fn fit_glm_irls_with_options(
         }
     };
 
-    let inv_xtwx = cholesky_invert(&xtwx, n_features)?;
+    let inv_xtwx = weighted_least_squares_qr_ridge_cm_cov(
+        &x_cm,
+        &w_irls,
+        n_samples,
+        n_features,
+        options.ridge_lambda,
+        options.penalize_intercept,
+        &mut qr_ws,
+    )?;
     let mut standard_errors = vec![0.0; n_features];
     for j in 0..n_features {
         let var = dispersion * inv_xtwx[j * n_features + j];
