@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="assets/banner.png" alt="pricing-kernels — Actuarial ratemaking in Rust" width="100%" />
+  <img src="https://raw.githubusercontent.com/SinisterRob/pricing-kernels/main/assets/banner.png" alt="pricing-kernels — Actuarial ratemaking in Rust" width="100%" />
 </p>
 
 <p align="center">
@@ -7,6 +7,8 @@
 </p>
 
 <p align="center">
+  <a href="https://crates.io/crates/pricing-kernels"><img src="https://img.shields.io/crates/v/pricing-kernels?style=flat" alt="Crates.io" /></a>
+  <a href="https://docs.rs/pricing-kernels"><img src="https://img.shields.io/docsrs/pricing-kernels?style=flat" alt="docs.rs" /></a>
   <a href="https://github.com/SinisterRob/pricing-kernels/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/SinisterRob/pricing-kernels/ci.yml?branch=main&label=CI&style=flat" alt="CI" /></a>
   <a href="Cargo.toml"><img src="https://img.shields.io/badge/Rust-1.97%2B-f97316?style=flat" alt="Rust 1.97+" /></a>
   <a href="#license"><img src="https://img.shields.io/badge/license-MIT%20%2F%20Apache--2.0-30363d?style=flat" alt="License: MIT or Apache-2.0" /></a>
