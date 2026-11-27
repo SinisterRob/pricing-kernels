@@ -21,8 +21,6 @@ exclude = [
 keywords = ["actuarial", "pricing", "reinsurance", "experience-rating", "glm"]
 categories = ["mathematics", "science", "simulation"]
 
-publish = false
-
 [package.metadata.docs.rs]
 rustdoc-args = ["--cfg", "docsrs"]
 
