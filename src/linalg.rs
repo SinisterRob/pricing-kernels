@@ -144,6 +144,7 @@ pub fn cholesky_invert(a: &[f64], dim: usize) -> Result<Vec<f64>, PricingError> 
 }
 
 /// Multiply matrix `A` (`rows_a × cols_a`) by matrix `B` (`cols_a × cols_b`) into `C` (`rows_a × cols_b`).
+#[allow(dead_code)]
 pub fn mat_mul(
     a: &[f64],
     b: &[f64],
@@ -173,6 +174,7 @@ pub fn mat_mul(
 }
 
 /// Compute weighted dot product: `sum_i w_i * x_i * y_i`.
+#[allow(dead_code)]
 #[inline]
 pub fn weighted_dot(x: &[f64], y: &[f64], w: &[f64]) -> f64 {
     x.iter()
@@ -180,4 +182,18 @@ pub fn weighted_dot(x: &[f64], y: &[f64], w: &[f64]) -> f64 {
         .zip(w.iter())
         .map(|((&xi, &yi), &wi)| wi * xi * yi)
         .sum()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn linalg_rejects_mismatched_and_non_finite_inputs() {
+        let mut y = [0.0; 1];
+        assert!(solve_lower_into(&[1.0, 0.0, 0.0, 1.0], 2, &[1.0, 2.0], &mut y).is_err());
+        let mut c = [0.0; 1];
+        assert!(mat_mul(&[1.0, 2.0], &[3.0, 4.0], 1, 2, 2, &mut c).is_err());
+        assert!(cholesky_solve(&[1.0, 0.0, 0.0, 1.0], 2, &[1.0, f64::NAN]).is_err());
+    }
 }

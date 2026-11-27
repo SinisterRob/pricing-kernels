@@ -1,17 +1,28 @@
 [package]
 name = "pricing-kernels"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.97"
 authors = ["Robert Jurgens, FCAS <robertdjurgens@gmail.com>"]
 description = "Pure Rust numeric kernels for P&C actuarial pricing and underwriting-risk capital modeling."
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/SinisterRob/pricing-kernels"
+homepage = "https://sinisterrob.github.io"
+documentation = "https://docs.rs/pricing-kernels"
 readme = "README.md"
-keywords = ["actuarial", "pricing", "commercial-lines", "experience-rating", "glm"]
+exclude = [
+    ".github/",
+    ".githooks/",
+    ".gitignore",
+    ".gitattributes",
+]
+keywords = ["actuarial", "pricing", "reinsurance", "experience-rating", "glm"]
 categories = ["mathematics", "science", "simulation"]
 
 publish = false
+
+[package.metadata.docs.rs]
+rustdoc-args = ["--cfg", "docsrs"]
 
 [lib]
 name = "pricing_kernels"
@@ -20,14 +31,15 @@ crate-type = ["cdylib", "rlib"]
 
 [features]
 default = []
+# Single-threaded C-ABI exports for wasm32 browser builds (not for concurrent native use).
 wasm = []
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
+serde_json = "1"
 
 [[bench]]
 name = "pricing_bench"

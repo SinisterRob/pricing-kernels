@@ -1,4 +1,5 @@
 use criterion::{Criterion, black_box, criterion_group, criterion_main};
+use pricing_kernels::datasets;
 use pricing_kernels::prelude::*;
 
 fn bench_classification(c: &mut Criterion) {
@@ -29,6 +30,36 @@ fn bench_classification(c: &mut Criterion) {
         });
     });
 
+    let grid = datasets::commercial_classification_grid();
+    let design = [
+        1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 1.0, 1.0, 1.0, 0.0, 0.0, 1.0, 1.0, 0.0, 1.0, 1.0, 0.0,
+        1.0, 0.0, 1.0, 0.0, 1.0, 1.0,
+    ];
+    let total_losses: Vec<f64> = grid
+        .exposures
+        .iter()
+        .zip(grid.loss_costs.iter())
+        .map(|(&p, &a)| p * a)
+        .collect();
+    let weights = [1.0; 6];
+    let offsets: Vec<f64> = grid.exposures.iter().map(|&p| p.ln()).collect();
+
+    group.bench_function("glm_irls_poisson_3x2", |b| {
+        b.iter(|| {
+            fit_glm_irls(
+                GlmFamily::Poisson,
+                black_box(&design),
+                6,
+                4,
+                black_box(&total_losses),
+                black_box(&weights),
+                black_box(&offsets),
+                50,
+                1e-9,
+            )
+        });
+    });
+
     let rater = MultiplicativeRater::new(850.0)
         .with_minimum_premium(250.0)
         .with_maximum_premium(10_000.0);
@@ -41,65 +72,104 @@ fn bench_classification(c: &mut Criterion) {
     group.finish();
 }
 
-fn bench_experience_and_retro(c: &mut Criterion) {
-    let mut group = c.benchmark_group("experience_and_retro");
+fn bench_credibility_and_trending(c: &mut Criterion) {
+    let mut group = c.benchmark_group("credibility_and_trending");
 
-    let spec = NcciErpSpecification {
-        split_point: 18_500.0,
-        expected_losses: 150_000.0,
-        d_ratio: 0.35,
-        weight_w: 0.22,
-        ballast_b: 22_500.0,
-        apply_era: true,
-    };
+    let bs = datasets::buhlmann_straub_example();
+    let loss_slices: Vec<&[f64]> = bs.group_losses.iter().map(Vec::as_slice).collect();
+    let weight_slices: Vec<&[f64]> = bs.group_weights.iter().map(Vec::as_slice).collect();
 
-    let claims = vec![
-        ExperienceClaim {
-            incurred: 45_000.0,
-            is_medical_only: false,
-        },
-        ExperienceClaim {
-            incurred: 8_200.0,
-            is_medical_only: false,
-        },
-        ExperienceClaim {
-            incurred: 12_500.0,
-            is_medical_only: true,
-        },
-        ExperienceClaim {
-            incurred: 3_100.0,
-            is_medical_only: true,
-        },
-        ExperienceClaim {
-            incurred: 65_000.0,
-            is_medical_only: false,
-        },
-    ];
-
-    group.bench_function("ncci_experience_mod", |b| {
-        b.iter(|| calculate_ncci_experience_mod(black_box(&spec), black_box(&claims)));
+    group.bench_function("buhlmann_straub_3x3", |b| {
+        b.iter(|| buhlmann_straub(black_box(&loss_slices), black_box(&weight_slices)));
     });
 
-    let entry_ratios = vec![0.2, 0.6, 1.0, 1.4, 1.8];
-    let probs = vec![0.10, 0.20, 0.40, 0.20, 0.10];
-    let table_m = TableMEngine::from_discrete_pdf(&entry_ratios, &probs).unwrap();
-
-    let retro_spec = RetroPlanSpec {
-        standard_premium: 800_000.0,
-        expected_loss_ratio: 0.62,
-        lcf: 1.12,
-        tax_multiplier: 1.035,
-        max_retro_ratio: 1.40,
-        min_retro_ratio: 0.50,
-        expense_ratio: 0.18,
-    };
-
-    group.bench_function("solve_balanced_retro_plan", |b| {
-        b.iter(|| solve_balanced_retro_plan(black_box(&retro_spec), black_box(&table_m), 50, 1e-5));
+    let changes = [
+        RateChange {
+            effective_date: 2021.5,
+            rate_factor: 1.05,
+        },
+        RateChange {
+            effective_date: 2022.25,
+            rate_factor: 1.08,
+        },
+        RateChange {
+            effective_date: 2022.75,
+            rate_factor: 1.04,
+        },
+    ];
+    group.bench_function("parallelogram_on_level_3_changes", |b| {
+        b.iter(|| parallelogram_on_level_factor(black_box(2022.0), black_box(&changes)));
     });
 
     group.finish();
 }
 
-criterion_group!(benches, bench_classification, bench_experience_and_retro);
+fn bench_experience_and_retro(c: &mut Criterion) {
+    let mut group = c.benchmark_group("experience_and_retro");
+
+    let ncci = datasets::ncci_erp_worksheet();
+    group.bench_function("ncci_experience_mod", |b| {
+        b.iter(|| calculate_ncci_experience_mod(black_box(&ncci.spec), black_box(&ncci.claims)));
+    });
+
+    let retro = datasets::retro_plan_benchmark();
+    let table_m =
+        TableMEngine::from_discrete_pdf(&retro.entry_ratios, &retro.probabilities).unwrap();
+
+    group.bench_function("solve_balanced_retro_plan", |b| {
+        b.iter(|| solve_balanced_retro_plan(black_box(&retro.spec), black_box(&table_m), 50, 1e-5));
+    });
+
+    let limited_ratios = [0.18, 0.54, 0.90, 1.26, 1.62];
+    let table_l =
+        TableLEngine::from_limited_discrete_pdf(&limited_ratios, &retro.probabilities).unwrap();
+    group.bench_function("solve_balanced_retro_plan_table_l", |b| {
+        b.iter(|| {
+            solve_balanced_retro_plan_table_l(black_box(&retro.spec), black_box(&table_l), 50, 1e-5)
+        });
+    });
+
+    group.finish();
+}
+
+fn bench_layers_and_reinsurance(c: &mut Criterion) {
+    let mut group = c.benchmark_group("layers_and_reinsurance");
+
+    let lognormal = SeverityDistribution::Lognormal {
+        mu: 10.5,
+        sigma: 1.35,
+    };
+    group.bench_function("ilf_lognormal", |b| {
+        b.iter(|| lognormal.increased_limits_factor(black_box(1_000_000.0), black_box(100_000.0)));
+    });
+
+    let mixed_exp = SeverityDistribution::MixedExponential {
+        weights: vec![0.6, 0.3, 0.1],
+        means: vec![25_000.0, 150_000.0, 1_200_000.0],
+    };
+    group.bench_function("ilf_mixed_exponential", |b| {
+        b.iter(|| mixed_exp.increased_limits_factor(black_box(2_000_000.0), black_box(250_000.0)));
+    });
+
+    let y3 = MbbefdCurve::from_preset(SwissReCurve::Y3);
+    group.bench_function("mbbefd_layer_exposure_factor", |b| {
+        b.iter(|| {
+            y3.layer_exposure_factor(
+                black_box(1_000_000.0),
+                black_box(4_000_000.0),
+                black_box(10_000_000.0),
+            )
+        });
+    });
+
+    group.finish();
+}
+
+criterion_group!(
+    benches,
+    bench_classification,
+    bench_credibility_and_trending,
+    bench_experience_and_retro,
+    bench_layers_and_reinsurance
+);
 criterion_main!(benches);

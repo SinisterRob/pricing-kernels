@@ -1,6 +1,6 @@
 //! Source-document benchmark, exact actuarial identity, and adversarial validation suite.
 
-use pricing_kernels::linalg::{cholesky_solve, mat_mul, solve_lower_into};
+use pricing_kernels::datasets;
 use pricing_kernels::prelude::*;
 
 fn close_rel(actual: f64, expected: f64, tol: f64) -> bool {
@@ -532,10 +532,375 @@ fn test_adversarial_nan_inf_and_dimension_guards() {
     assert!(lomax.limited_expected_value(f64::NAN).is_err());
     assert!(CommercialLayer::new(0.0, f64::INFINITY, 1.0).is_err());
 
-    // Public linalg functions reject mismatched slices instead of panicking
-    let mut y = [0.0; 1];
-    assert!(solve_lower_into(&[1.0, 0.0, 0.0, 1.0], 2, &[1.0, 2.0], &mut y).is_err());
-    let mut c = [0.0; 1];
-    assert!(mat_mul(&[1.0, 2.0], &[3.0, 4.0], 1, 2, 2, &mut c).is_err());
-    assert!(cholesky_solve(&[1.0, 0.0, 0.0, 1.0], 2, &[1.0, f64::NAN]).is_err());
+    // Phase 2 adversarial guards
+    assert!(MbbefdCurve::new(-0.1, 2.0).is_err());
+    assert!(MbbefdCurve::new(1.0, 0.5).is_err());
+    assert!(MbbefdCurve::from_swiss_re_c(-1.0).is_err());
+    assert!(
+        MbbefdCurve::from_preset(SwissReCurve::Y2)
+            .exposure_curve(f64::NAN)
+            .is_err()
+    );
+    assert!(burning_cost_xl(&[], &[], &CommercialLayer::new(0.0, 100.0, 1.0).unwrap()).is_err());
+    assert!(
+        price_reinstatements(
+            100.0,
+            &[10.0, 5.0],
+            &[],
+            0.1,
+            ReinstatementBasis::ProRataAmount
+        )
+        .is_err()
+    );
+    assert!(TableLEngine::from_limited_discrete_pdf(&[0.5, 1.5], &[0.5, 0.5]).is_ok());
+    assert!(TableLEngine::from_limited_discrete_pdf(&[1.2, 1.4], &[0.5, 0.5]).is_err());
+    assert!(calculate_schedule_mod(&[], -1.5, 0.25).is_err());
+}
+
+#[test]
+fn test_bernegger_1997_mbbefd_swiss_re_curves_and_survival_integral() {
+    // Verify G(d) = (integral_0^d S(x) dx) / E[X] across all 5 Swiss Re presets + all 3 limiting cases.
+    let curves = [
+        MbbefdCurve::from_preset(SwissReCurve::Y1),
+        MbbefdCurve::from_preset(SwissReCurve::Y2),
+        MbbefdCurve::from_preset(SwissReCurve::Y3),
+        MbbefdCurve::from_preset(SwissReCurve::Y4),
+        MbbefdCurve::from_preset(SwissReCurve::Lloyds),
+        MbbefdCurve::new(0.5, 1.0).unwrap(), // g = 1 limiting case (linear)
+        MbbefdCurve::new(1.0, 5.0).unwrap(), // b = 1 limiting case
+        MbbefdCurve::new(0.25, 4.0).unwrap(), // b * g = 1 limiting case
+    ];
+
+    for curve in &curves {
+        assert_eq!(curve.exposure_curve(0.0).unwrap(), 0.0);
+        assert_eq!(curve.exposure_curve(1.0).unwrap(), 1.0);
+        let mean = curve.mean_loss_ratio().unwrap();
+        assert!(mean > 0.0 && mean <= 1.0 + 1e-12);
+
+        // Numerical midpoint integration of S(x) on [0, d] for d = 0.25 and d = 0.70
+        for &d in &[0.25, 0.70] {
+            let n = 40_000_i32;
+            let h = d / f64::from(n);
+            let mut integral = 0.0;
+            for i in 0..n {
+                let x = (f64::from(i) + 0.5) * h;
+                integral += curve.survival(x).unwrap() * h;
+            }
+            let g_numeric = integral / mean;
+            let g_exact = curve.exposure_curve(d).unwrap();
+            assert!(
+                close_rel(g_exact, g_numeric, 1e-5),
+                "MBBEFD ({}, {}) at d={d}: exact={g_exact} vs numeric={g_numeric}",
+                curve.b,
+                curve.g
+            );
+        }
+
+        // Layer factor additivity: [0, 0.2M] + [0.2M, 0.5M] + [0.5M, M] == 1.0
+        let f1 = curve
+            .layer_exposure_factor(0.0, 200_000.0, 1_000_000.0)
+            .unwrap();
+        let f2 = curve
+            .layer_exposure_factor(200_000.0, 300_000.0, 1_000_000.0)
+            .unwrap();
+        let f3 = curve
+            .layer_exposure_factor(500_000.0, 500_000.0, 1_000_000.0)
+            .unwrap();
+        assert!(close_rel(f1 + f2 + f3, 1.0, 1e-12));
+    }
+
+    // Ordering: higher Swiss Re c-curve is more concave (c = 0 is linear G(d) = d;
+    // higher c concentrates more expected loss in lower layers -> higher G(d) for 0 < d < 1).
+    let g_y1 = MbbefdCurve::from_preset(SwissReCurve::Y1)
+        .exposure_curve(0.2)
+        .unwrap();
+    let g_y2 = MbbefdCurve::from_preset(SwissReCurve::Y2)
+        .exposure_curve(0.2)
+        .unwrap();
+    let g_y3 = MbbefdCurve::from_preset(SwissReCurve::Y3)
+        .exposure_curve(0.2)
+        .unwrap();
+    let g_y4 = MbbefdCurve::from_preset(SwissReCurve::Y4)
+        .exposure_curve(0.2)
+        .unwrap();
+    let g_ll = MbbefdCurve::from_preset(SwissReCurve::Lloyds)
+        .exposure_curve(0.2)
+        .unwrap();
+    assert!(g_y1 < g_y2 && g_y2 < g_y3 && g_y3 < g_y4 && g_y4 < g_ll);
+}
+
+#[test]
+fn test_clark_2014_reinsurance_burning_cost_reinstatements_and_proportional_terms() {
+    // 1. Experience-rated burning cost for $500k xs $500k treaty
+    let layer = CommercialLayer::new(500_000.0, 500_000.0, 1.0).unwrap();
+    let years = [
+        HistoricalTreatyYear {
+            year: 2023,
+            subject_premium: 10_000_000.0,
+            on_level_factor: 1.10,
+            exposure_trend_factor: 1.05,
+        },
+        HistoricalTreatyYear {
+            year: 2024,
+            subject_premium: 12_000_000.0,
+            on_level_factor: 1.05,
+            exposure_trend_factor: 1.02,
+        },
+    ];
+    let claims = [
+        HistoricalTreatyClaim {
+            year: 2023,
+            incurred: 600_000.0,
+            severity_trend_factor: 1.10,
+            development_factor: 1.0,
+        }, // adj = 660k -> payout = 160k
+        HistoricalTreatyClaim {
+            year: 2024,
+            incurred: 1_200_000.0,
+            severity_trend_factor: 1.05,
+            development_factor: 1.0,
+        }, // adj = 1.26M -> capped payout = 500k
+        HistoricalTreatyClaim {
+            year: 2024,
+            incurred: 200_000.0,
+            severity_trend_factor: 1.05,
+            development_factor: 1.0,
+        }, // below attachment -> 0
+    ];
+    let bc = burning_cost_xl(&years, &claims, &layer).unwrap();
+    assert_eq!(bc.total_layer_claims, 2);
+    assert!(close_rel(bc.total_layer_ceded_loss, 660_000.0, 1e-12));
+    let expected_prem = 10_000_000.0 * 1.10 * 1.05 + 12_000_000.0 * 1.05 * 1.02;
+    assert!(close_rel(
+        bc.total_adjusted_subject_premium,
+        expected_prem,
+        1e-12
+    ));
+    assert!(close_rel(
+        bc.overall_burning_cost_rate,
+        660_000.0 / expected_prem,
+        1e-12
+    ));
+
+    // 2. Sundt (1991) reinstatement pricing: 1 reinstatement at 100% pro-rata by amount
+    let reinst = price_reinstatements(
+        1_000_000.0,
+        &[200_000.0, 50_000.0],
+        &[1.0],
+        0.10,
+        ReinstatementBasis::ProRataAmount,
+    )
+    .unwrap();
+    // Exact Sundt formula: P0 = 250_000 / (0.9 * (1 + 0.2)) = 250_000 / 1.08
+    let expected_p0 = 250_000.0 / 1.08;
+    assert!(close_rel(reinst.initial_premium, expected_p0, 1e-12));
+    assert!(close_rel(
+        reinst.total_expected_premium * 0.90,
+        250_000.0,
+        1e-12
+    ));
+
+    // Pro-rata by time reduces reinstatement premium collection -> higher initial premium P0
+    let reinst_time = price_reinstatements(
+        1_000_000.0,
+        &[200_000.0, 50_000.0],
+        &[1.0],
+        0.10,
+        ReinstatementBasis::ProRataAmountAndTime,
+    )
+    .unwrap();
+    assert!(reinst_time.initial_premium > reinst.initial_premium);
+    assert!(close_rel(
+        reinst_time.total_expected_premium * 0.90,
+        250_000.0,
+        1e-12
+    ));
+
+    // 3. Sliding-scale commission, loss corridor, and profit commission:
+    // Verify Table M closed-form formulas match exact discrete expectation over (r_k, p_k).
+    let retro = datasets::retro_plan_benchmark();
+    let tm = TableMEngine::from_discrete_pdf(&retro.entry_ratios, &retro.probabilities).unwrap();
+    let elr = 0.65;
+
+    let slide = SlidingScaleSpec {
+        min_commission: 0.20,
+        max_commission: 0.35,
+        min_lr: 0.50,
+        slide_ratio: 0.50,
+    };
+    let expected_comm_formula = slide.expected_commission(elr, &tm).unwrap();
+    let expected_comm_direct: f64 = retro
+        .entry_ratios
+        .iter()
+        .zip(retro.probabilities.iter())
+        .map(|(&r, &p)| p * slide.commission_at(r * elr).unwrap())
+        .sum();
+    assert!(close_rel(
+        expected_comm_formula,
+        expected_comm_direct,
+        1e-12
+    ));
+
+    let corridor_formula = expected_loss_corridor_retention(0.60, 0.85, 0.50, elr, &tm).unwrap();
+    let corridor_direct: f64 = retro
+        .entry_ratios
+        .iter()
+        .zip(retro.probabilities.iter())
+        .map(|(&r, &p)| {
+            let lr = r * elr;
+            let ret = 0.50 * (lr.min(0.85) - 0.60).max(0.0);
+            p * ret
+        })
+        .sum();
+    assert!(close_rel(corridor_formula, corridor_direct, 1e-12));
+
+    let pc_formula = expected_profit_commission(0.25, 0.05, 0.20, elr, &tm).unwrap();
+    let pc_direct: f64 = retro
+        .entry_ratios
+        .iter()
+        .zip(retro.probabilities.iter())
+        .map(|(&r, &p)| {
+            let profit = (1.0 - 0.25 - 0.05 - r * elr).max(0.0);
+            p * 0.20 * profit
+        })
+        .sum();
+    assert!(close_rel(pc_formula, pc_direct, 1e-12));
+}
+
+#[test]
+fn test_skurnick_1974_table_l_balance_and_retro_solver() {
+    // 1. Reduction to Table M when k = 0 (E[Y*] = 1.0)
+    let retro = datasets::retro_plan_benchmark();
+    let tm = TableMEngine::from_discrete_pdf(&retro.entry_ratios, &retro.probabilities).unwrap();
+    let tl_zero_k =
+        TableLEngine::from_limited_discrete_pdf(&retro.entry_ratios, &retro.probabilities).unwrap();
+    assert!(tl_zero_k.loss_elimination_ratio < 1e-12);
+    for &r in &[0.0, 0.35, 0.80, 1.15, 2.0] {
+        assert!(close_rel(tl_zero_k.charge_at(r), tm.charge_at(r), 1e-12));
+        assert!(close_rel(tl_zero_k.savings_at(r), tm.savings_at(r), 1e-12));
+    }
+
+    // 2. Non-zero per-occurrence LER k = 0.10 (E[Y*] = 0.90)
+    let limited_ratios = [0.18, 0.54, 0.90, 1.26, 1.62];
+    let tl =
+        TableLEngine::from_limited_discrete_pdf(&limited_ratios, &retro.probabilities).unwrap();
+    assert!(close_rel(tl.loss_elimination_ratio, 0.10, 1e-12));
+
+    // Skurnick fundamental identity: phi*(r) - psi*(r) == 1 - r for all r >= 0
+    for &r in &[0.0, 0.10, 0.45, 0.90, 1.40, 2.50] {
+        let lhs = tl.charge_at(r) - tl.savings_at(r);
+        assert!(
+            close_rel(lhs, 1.0 - r, 1e-12),
+            "Skurnick identity at r={r}: {lhs} vs {}",
+            1.0 - r
+        );
+    }
+    assert!(close_rel(tl.charge_at(0.0), 1.0, 1e-12));
+    assert!(close_rel(tl.charge_at(5.0), 0.10, 1e-12));
+
+    // 3. Balanced Table L retro plan satisfies exact actuarial balance equation
+    let plan = solve_balanced_retro_plan_table_l(&retro.spec, &tl, 200, 1e-12).unwrap();
+    let e_lcf = retro.spec.lcf * retro.spec.expected_loss_ratio;
+    let expected_bpf = retro.spec.expense_ratio
+        - (retro.spec.lcf - 1.0) * retro.spec.expected_loss_ratio
+        + plan.net_insurance_charge * e_lcf;
+    assert!(close_rel(plan.basic_premium_factor, expected_bpf, 1e-9));
+
+    // Adding a per-occurrence limit (k > 0) raises the basic premium factor relative to unlimited Table M
+    let plan_unlimited = solve_balanced_retro_plan(&retro.spec, &tm, 200, 1e-12).unwrap();
+    assert!(plan.basic_premium_factor > plan_unlimited.basic_premium_factor);
+}
+
+#[test]
+fn test_large_deductible_alae_treatments_and_iso_erp() {
+    let sev = SeverityDistribution::Lomax {
+        alpha: 2.5,
+        theta: 100_000.0,
+    };
+    let retro = datasets::retro_plan_benchmark();
+    let tm = TableMEngine::from_discrete_pdf(&retro.entry_ratios, &retro.probabilities).unwrap();
+
+    let base_spec = LargeDeductibleSpec {
+        expected_indemnity: 1_000_000.0,
+        expected_alae: 150_000.0,
+        deductible: 100_000.0,
+        policy_limit: 1_000_000.0,
+        alae_treatment: AlaeTreatment::ProRata,
+        fixed_expenses: 50_000.0,
+        variable_expense_ratio: 0.20,
+        aggregate_cap_entry_ratio: None,
+    };
+
+    let res_prorata = price_large_deductible(&base_spec, &sev, None).unwrap();
+    assert!(close_rel(
+        res_prorata.loss_elimination_ratio + res_prorata.excess_loss_factor,
+        1.0,
+        1e-12
+    ));
+    assert!(close_rel(
+        res_prorata.retained_indemnity + res_prorata.excess_indemnity,
+        1_000_000.0,
+        1e-12
+    ));
+
+    // OutsideLimit means insurer pays all ALAE -> higher premium and lower credit than ProRata
+    let outside_spec = LargeDeductibleSpec {
+        alae_treatment: AlaeTreatment::OutsideLimit,
+        ..base_spec
+    };
+    let res_outside = price_large_deductible(&outside_spec, &sev, None).unwrap();
+    assert_eq!(res_outside.retained_alae, 0.0);
+    assert!(close_rel(res_outside.insurer_alae, 150_000.0, 1e-12));
+    assert!(res_outside.indicated_premium > res_prorata.indicated_premium);
+
+    // Adding an aggregate deductible cap adds a positive charge and raises indicated premium
+    let capped_spec = LargeDeductibleSpec {
+        aggregate_cap_entry_ratio: Some(1.20),
+        ..base_spec
+    };
+    let res_capped = price_large_deductible(&capped_spec, &sev, Some(&tm)).unwrap();
+    assert!(res_capped.aggregate_cap_charge > 0.0);
+    assert!(res_capped.indicated_premium > res_prorata.indicated_premium);
+
+    // ISO Commercial ERP with MSL capping
+    let iso_spec = IsoErpSpec {
+        expected_basic_limits_loss: 200_000.0,
+        max_single_limit: 50_000.0,
+        credibility_k: 50_000.0, // Z = 200k / 250k = 0.80
+        balance_factor: 1.0,
+    };
+    // Claims: 120k (capped at 50k) + 30k + 20k = 100k ratable -> A/E = 0.50 -> Mod = 1 + 0.8*(0.5 - 1) = 0.60
+    let iso_res =
+        calculate_iso_experience_mod(&iso_spec, &[120_000.0, 30_000.0, 20_000.0]).unwrap();
+    assert!(close_rel(iso_res.credibility_z, 0.80, 1e-12));
+    assert!(close_rel(iso_res.actual_ratable_loss, 100_000.0, 1e-12));
+    assert!(close_rel(iso_res.mod_factor_unrounded, 0.60, 1e-12));
+
+    // Schedule rating / IRPM clamping to [-0.25, +0.25]
+    let items = [
+        ScheduleRatingItem {
+            adjustment: -0.15,
+            min_adjustment: -0.15,
+            max_adjustment: 0.15,
+        },
+        ScheduleRatingItem {
+            adjustment: -0.15,
+            min_adjustment: -0.15,
+            max_adjustment: 0.15,
+        },
+    ];
+    let sched = calculate_schedule_mod(&items, -0.25, 0.25).unwrap();
+    assert!(close_rel(sched.raw_total_adjustment, -0.30, 1e-12));
+    assert!(close_rel(sched.applied_adjustment, -0.25, 1e-12));
+    assert!(close_rel(sched.schedule_mod_factor, 0.75, 1e-12));
+
+    // Zero-I/O datasets fixture parity check
+    let ncci = datasets::ncci_erp_worksheet();
+    let ncci_res = calculate_ncci_experience_mod(&ncci.spec, &ncci.claims).unwrap();
+    assert!(close_rel(
+        ncci_res.mod_factor_unrounded,
+        ncci.expected_mod_unrounded,
+        1e-12
+    ));
+    assert_eq!(ncci_res.mod_factor, ncci.expected_mod_rounded);
 }

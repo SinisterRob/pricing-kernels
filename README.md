@@ -24,7 +24,18 @@
 
 ---
 
-`pricing-kernels` covers prospective ratemaking (classification, credibility, experience rating, ILFs, retrospective plans) and the **underwriting risk** module of capital modeling. Every method is implemented from peer-reviewed actuarial literature ([`docs/SOURCES.md`](docs/SOURCES.md)) and verified against published benchmark problems ([`tests/source_benchmarks.rs`](tests/source_benchmarks.rs)). For retrospective loss development and reserve risk, see [`reserving-kernels`](https://github.com/SinisterRob/reserving-kernels).
+`pricing-kernels` covers prospective commercial-lines ratemaking (classification, credibility, experience rating, ILFs, retrospective plans, large deductibles), treaty reinsurance pricing (MBBEFD exposure curves, burning cost, reinstatements, sliding-scale & profit commissions), and the **underwriting risk** module of capital modeling. Every method is implemented from peer-reviewed actuarial literature ([`docs/SOURCES.md`](docs/SOURCES.md)) and verified against published benchmark problems ([`tests/source_benchmarks.rs`](tests/source_benchmarks.rs)). Standalone sister crate to [`reserving-kernels`](https://github.com/SinisterRob/reserving-kernels) (retrospective loss development and reserve risk).
+
+## Implemented Modules
+
+| Area | Modules | Capabilities |
+| --- | --- | --- |
+| **Classification & Scoring** | `classification::{minimum_bias, irls_glm, scoring}` | Bailey (1963) balance & Bailey–Simon (1960) $\chi^2$ minimum bias, Poisson / Quasi-Poisson / Gamma log-link IRLS GLMs, zero-alloc `MultiplicativeRater` |
+| **Credibility** | `credibility::{classical, buhlmann_straub}` | Longley-Cook limited-fluctuation credibility, non-parametric Bühlmann–Straub credibility for heterogeneous exposures |
+| **Experience, Retro & Deductibles** | `experience::{ncci_erp, iso_erp, table_m, table_l, retrospective, deductible}` | NCCI WC ERP & off-balance, ISO Commercial ERP & bounded IRPM schedule rating, Lee (1988) Table M, Skurnick (1974) Table L, balanced retro solvers, large deductibles (ALAE inside/pro-rata/outside + aggregate caps) |
+| **Severity, ILFs & Reinsurance** | `layers::{ilf, mbbefd, reinsurance}` | 6 parametric severity families (LEV/ILF/LER/excess), `CommercialLayer`, Bernegger (1997) MBBEFD / Swiss Re `Y1`–`Lloyds` exposure curves, Clark (2014) burning cost, Sundt (1991) reinstatements, sliding-scale / corridor / profit commissions |
+| **Trending & On-Leveling** | `trending::{parallelogram, trend}` | Exact multi-change Calendar-Year earned parallelogram & Policy-Year written on-leveling, exponential trend fitting |
+| **Fixtures & WASM** | `datasets`, `wasm_exports` (`--features wasm`) | Zero-I/O CAS Exam 5/8 benchmark fixtures, single-threaded `wasm32` C-ABI exports |
 
 ## Why `pricing-kernels`?
 

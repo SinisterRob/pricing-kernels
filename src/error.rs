@@ -3,7 +3,8 @@
 use std::fmt;
 
 /// Standard error type for pricing numerical kernels and validations.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[non_exhaustive]
 pub enum PricingError {
     /// Provided slice or vector input was empty.
     EmptyInput(&'static str),

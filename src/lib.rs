@@ -6,11 +6,16 @@
 
 pub mod classification;
 pub mod credibility;
+pub mod datasets;
 pub mod error;
 pub mod experience;
 pub mod layers;
-pub mod linalg;
+pub(crate) mod linalg;
 pub mod trending;
+
+#[cfg(feature = "wasm")]
+#[doc(hidden)]
+pub mod wasm_exports;
 
 /// Standard prelude re-exporting common pricing kernels and structs.
 pub mod prelude {
@@ -21,11 +26,19 @@ pub mod prelude {
     pub use crate::credibility::{BuhlmannStraubResult, ClassicalCredibility, buhlmann_straub};
     pub use crate::error::PricingError;
     pub use crate::experience::{
-        ExperienceClaim, NcciErpResult, NcciErpSpecification, RetroPlanResult, RetroPlanSpec,
-        TableMEngine, TableMRow, calculate_ncci_experience_mod, calculate_off_balance,
-        solve_balanced_retro_plan,
+        AlaeTreatment, ExperienceClaim, IsoErpResult, IsoErpSpec, LargeDeductibleResult,
+        LargeDeductibleSpec, NcciErpResult, NcciErpSpecification, RetroPlanResult, RetroPlanSpec,
+        ScheduleRatingItem, ScheduleRatingResult, TableLEngine, TableLRow, TableMEngine, TableMRow,
+        calculate_iso_experience_mod, calculate_ncci_experience_mod, calculate_off_balance,
+        calculate_schedule_mod, price_large_deductible, solve_balanced_retro_plan,
+        solve_balanced_retro_plan_table_l,
     };
-    pub use crate::layers::{CommercialLayer, SeverityDistribution};
+    pub use crate::layers::{
+        BurningCostResult, BurningCostYearResult, CommercialLayer, HistoricalTreatyClaim,
+        HistoricalTreatyYear, MbbefdCurve, ReinstatementBasis, ReinstatementPricingResult,
+        SeverityDistribution, SlidingScaleSpec, SwissReCurve, burning_cost_xl,
+        expected_loss_corridor_retention, expected_profit_commission, price_reinstatements,
+    };
     pub use crate::trending::{
         RateChange, TrendModel, parallelogram_on_level_factor, policy_year_on_level_factor,
     };
