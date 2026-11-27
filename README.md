@@ -18,6 +18,7 @@
 </p>
 
 <p align="center">
+  <a href="#performance">Performance</a> &nbsp;·&nbsp;
   <a href="#quick-start">Quick Start</a> &nbsp;·&nbsp;
   <a href="#building-and-testing">Build &amp; Test</a> &nbsp;·&nbsp;
   <a href="docs/SOURCES.md">Literature</a> &nbsp;·&nbsp;
@@ -46,6 +47,39 @@
 - **Deterministic by design:** Numerical algorithms converge deterministically across native and browser targets.
 - **Microsecond execution:** High-performance classification and commercial rating routines designed for real-time quotation engines, large-account underwriting workflows, and batch raters.
 - **Actuarial verification:** Standard models verified against CAS Exam 5 and Exam 8 literature — Bailey & Simon (1960), Brown (1988), Bühlmann & Straub (1970), NCCI Experience Rating Plan, and Lee (1988) Table M.
+
+## Performance
+
+Single-threaded `--release` Criterion medians on Intel Core i9-14900K (`rustc 1.97`, pure Rust, zero BLAS/LAPACK, `#![forbid(unsafe_code)]`). Reproduce locally with `cargo bench --bench pricing_bench`.
+
+<p align="center">
+  <img src="https://raw.githubusercontent.com/SinisterRob/pricing-kernels/main/assets/benchmarks.svg" alt="pricing-kernels steady-state benchmark latency" width="100%" />
+</p>
+
+<details>
+<summary><strong>Full benchmark table (17 kernels across all 6 pricing domains)</strong></summary>
+
+| Kernel | Median (`i9-14900K`) | Domain |
+| --- | :---: | :---: |
+| Multiplicative Rater (single policy) | `1.55 ns` | Classification |
+| Parallelogram On-Level (3 rate changes) | `11.1 ns` | Trending |
+| NCCI Experience Mod (ERP) | `11.1 ns` | Experience |
+| ILF Mixed Exponential | `37.9 ns` | Layers |
+| MBBEFD Layer Exposure Factor | `43.2 ns` | Layers |
+| ILF Lognormal | `43.8 ns` | Layers |
+| Bühlmann–Straub Credibility (`3×3`) | `45.6 ns` | Credibility |
+| Balanced Retro Plan (Table L) | `0.49 µs` | Experience |
+| Bailey–Simon Minimum Bias (`10×10`) | `0.60 µs` | Classification |
+| Balanced Retro Plan (Table M) | `0.64 µs` | Experience |
+| Poisson IRLS GLM (`3×2`) | `0.73 µs` | Classification |
+| Weighted Gini Index (200 obs) | `0.86 µs` | Classification |
+| Panjer Recursion (Poisson, 256 pts) | `1.77 µs` | Capital |
+| Tweedie Ridge IRLS GLM (`3×2`) | `3.59 µs` | Classification |
+| Cat ELT OEP / PML (100 events) | `11.9 µs` | Capital |
+| Euler TVaR Allocation (500 scenarios) | `13.0 µs` | Capital |
+| Tilted FFT Aggregate (1,024 pts) | `30.7 µs` | Capital |
+
+</details>
 
 ## Quick Start
 
