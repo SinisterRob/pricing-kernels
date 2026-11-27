@@ -1,9 +1,15 @@
 # pricing-kernels
 
-Pure Rust numeric kernels for P&C commercial actuarial pricing, classification, experience rating, and retrospective plans.
+Pure Rust numeric kernels for P&C actuarial pricing and underwriting-risk capital modeling.
 
-[![CI](https://github.com/SinisterRob/pricing-kernels/actions/workflows/ci.yml/badge.svg)](https://github.com/SinisterRob/pricing-kernels/actions/workflows/ci.yml)
-· Rust 1.97+ · MIT OR Apache-2.0 · no unsafe · serde only · wasm32 ready
+[![CI](https://img.shields.io/github/actions/workflow/status/SinisterRob/pricing-kernels/ci.yml?branch=main&label=CI&style=flat)](https://github.com/SinisterRob/pricing-kernels/actions/workflows/ci.yml)
+![Rust 1.97+](https://img.shields.io/badge/Rust-1.97%2B-f97316?style=flat)
+![License](https://img.shields.io/badge/license-MIT%20%2F%20Apache--2.0-30363d?style=flat)
+![No Unsafe](https://img.shields.io/badge/unsafe-forbidden-30363d?style=flat)
+![Deps](https://img.shields.io/badge/deps-serde%20only-30363d?style=flat)
+![WASM](https://img.shields.io/badge/target-wasm32-30363d?style=flat)
+
+Covers prospective ratemaking (classification, credibility, experience rating, ILFs, retrospective plans) and the **underwriting risk** module of capital modeling. For retrospective loss development and reserve risk, see [`reserving-kernels`](https://github.com/SinisterRob/reserving-kernels).
 
 Every method is implemented from peer-reviewed actuarial literature and verified against published benchmark problems in [`tests/source_benchmarks.rs`](tests/source_benchmarks.rs). See [`docs/SOURCES.md`](docs/SOURCES.md) for full citations and equation mappings.
 
