@@ -1,3 +1,5 @@
+//! NCCI Workers' Compensation Experience Rating Plan (ERP) and off-balance kernels.
+
 use crate::error::PricingError;
 use serde::{Deserialize, Serialize};
 
@@ -11,7 +13,7 @@ pub struct ExperienceClaim {
 }
 
 /// NCCI Experience Rating Plan calculation inputs and parameters.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct NcciErpSpecification {
     /// State split point between primary and excess loss (e.g. $18,500).
     pub split_point: f64,
@@ -31,7 +33,7 @@ pub struct NcciErpSpecification {
 pub type NcciErpSpec = NcciErpSpecification;
 
 /// Detailed result of NCCI Experience Modification calculation.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct NcciErpResult {
     /// Final Experience Modification Factor rounded to 3 decimal places (e.g., `0.925` or `1.150`).
     pub mod_factor: f64,
@@ -152,9 +154,9 @@ pub fn calculate_off_balance(expected_losses: &[f64], mods: &[f64]) -> Result<f6
         sum_e += e;
         sum_e_mod += e * m;
     }
-    if !(sum_e_mod > 0.0) {
+    if !sum_e.is_finite() || !sum_e_mod.is_finite() || !(sum_e_mod > 0.0) {
         return Err(PricingError::SingularMatrix(
-            "sum of modified losses is non-positive",
+            "sum of modified losses is non-positive or non-finite",
         ));
     }
     Ok(sum_e / sum_e_mod)

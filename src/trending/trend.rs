@@ -1,3 +1,6 @@
+//! Single-step and two-step exponential loss-cost and exposure trending kernels
+//! (Werner & Modlin *Basic Ratemaking*, Ch. 6).
+
 use crate::error::PricingError;
 use serde::{Deserialize, Serialize};
 
@@ -9,8 +12,8 @@ pub struct TrendModel {
 }
 
 impl TrendModel {
-    /// Construct a trend model with specified annual percentage rate.
-    pub fn new(annual_rate: f64) -> Self {
+    /// Construct a trend model with specified annual decimal rate (e.g., `0.045` for `+4.5%`).
+    pub const fn new(annual_rate: f64) -> Self {
         Self { annual_rate }
     }
 
@@ -46,9 +49,6 @@ impl TrendModel {
         }
         let mut sum_t = 0.0;
         let mut sum_lny = 0.0;
-        let mut sum_tt = 0.0;
-        let mut sum_t_lny = 0.0;
-
         for (&t, &y) in time_points.iter().zip(values.iter()) {
             if !t.is_finite() || !y.is_finite() {
                 return Err(PricingError::InvalidParameter(
@@ -60,23 +60,36 @@ impl TrendModel {
                     "values must be strictly positive for log trend",
                 ));
             }
-            let lny = y.ln();
             sum_t += t;
-            sum_lny += lny;
-            sum_tt += t * t;
-            sum_t_lny += t * lny;
+            sum_lny += y.ln();
         }
 
         let n_f = n as f64;
-        let denom = n_f * sum_tt - sum_t * sum_t;
-        if !denom.is_finite() || denom.abs() < 1e-12 {
+        let mean_t = sum_t / n_f;
+        let mean_lny = sum_lny / n_f;
+
+        // Center coordinates around mean_t to avoid catastrophic cancellation on calendar years.
+        let mut s_tt = 0.0;
+        let mut s_ty = 0.0;
+        for (&t, &y) in time_points.iter().zip(values.iter()) {
+            let dt = t - mean_t;
+            s_tt += dt * dt;
+            s_ty += dt * (y.ln() - mean_lny);
+        }
+
+        if !s_tt.is_finite() || s_tt <= 1e-12 * mean_t.abs().max(1.0) {
             return Err(PricingError::SingularMatrix(
                 "time points are collinear or identical",
             ));
         }
 
-        let slope = (n_f * sum_t_lny - sum_t * sum_lny) / denom;
+        let slope = s_ty / s_tt;
         let annual_rate = slope.exp_m1();
+        if !annual_rate.is_finite() {
+            return Err(PricingError::OutOfBounds(
+                "fitted annual trend rate overflowed floating-point range",
+            ));
+        }
 
         Ok(Self { annual_rate })
     }

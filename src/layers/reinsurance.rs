@@ -78,11 +78,17 @@ pub fn burning_cost_xl(
             "at least one historical treaty year is required",
         ));
     }
+    layer.validate()?;
 
-    let mut by_year = Vec::with_capacity(years.len());
+    let mut by_year: Vec<BurningCostYearResult> = Vec::with_capacity(years.len());
     let mut total_adj_prem = 0.0;
 
     for y in years {
+        if by_year.iter().any(|entry| entry.year == y.year) {
+            return Err(PricingError::InvalidParameter(
+                "duplicate year encountered in historical treaty years",
+            ));
+        }
         if !y.subject_premium.is_finite()
             || !y.on_level_factor.is_finite()
             || !y.exposure_trend_factor.is_finite()
@@ -285,9 +291,12 @@ impl SlidingScaleSpec {
                 "sliding scale parameters must be finite",
             ));
         }
-        if !(self.min_commission >= 0.0) || !(self.max_commission >= self.min_commission) {
+        if !(self.min_commission >= 0.0)
+            || !(self.max_commission >= self.min_commission)
+            || !(self.max_commission <= 1.0)
+        {
             return Err(PricingError::InvalidParameter(
-                "must satisfy 0 <= min_commission <= max_commission",
+                "must satisfy 0 <= min_commission <= max_commission <= 1",
             ));
         }
         if !(self.min_lr >= 0.0) || !(self.slide_ratio > 0.0) {
@@ -295,7 +304,13 @@ impl SlidingScaleSpec {
                 "min_lr must be >= 0 and slide_ratio must be > 0",
             ));
         }
-        Ok(self.min_lr + (self.max_commission - self.min_commission) / self.slide_ratio)
+        let max_lr = self.min_lr + (self.max_commission - self.min_commission) / self.slide_ratio;
+        if !max_lr.is_finite() {
+            return Err(PricingError::OutOfBounds(
+                "sliding scale max_lr overflowed floating-point range",
+            ));
+        }
+        Ok(max_lr)
     }
 
     /// Deterministic ceding commission rate at realized loss ratio `lr`.
@@ -332,6 +347,11 @@ impl SlidingScaleSpec {
         }
         let r_min = self.min_lr / expected_lr;
         let r_max = max_lr / expected_lr;
+        if !r_min.is_finite() || !r_max.is_finite() {
+            return Err(PricingError::OutOfBounds(
+                "sliding scale entry ratios overflowed floating-point range",
+            ));
+        }
         let phi_min = table_m.charge_at(r_min);
         let phi_max = table_m.charge_at(r_max);
         Ok(self.max_commission - self.slide_ratio * expected_lr * (phi_min - phi_max))
@@ -374,8 +394,15 @@ pub fn expected_loss_corridor_retention(
             "expected_lr must be positive",
         ));
     }
-    let phi_a = table_m.charge_at(attach_lr / expected_lr);
-    let phi_d = table_m.charge_at(detach_lr / expected_lr);
+    let r_a = attach_lr / expected_lr;
+    let r_d = detach_lr / expected_lr;
+    if !r_a.is_finite() || !r_d.is_finite() {
+        return Err(PricingError::OutOfBounds(
+            "corridor entry ratios overflowed floating-point range",
+        ));
+    }
+    let phi_a = table_m.charge_at(r_a);
+    let phi_d = table_m.charge_at(r_d);
     Ok(cedent_share * expected_lr * (phi_a - phi_d))
 }
 
@@ -414,6 +441,12 @@ pub fn expected_profit_commission(
     if break_even_lr <= 0.0 {
         return Ok(0.0);
     }
-    let psi = table_m.savings_at(break_even_lr / expected_lr);
+    let r_be = break_even_lr / expected_lr;
+    if !r_be.is_finite() {
+        return Err(PricingError::OutOfBounds(
+            "profit commission break-even entry ratio overflowed floating-point range",
+        ));
+    }
+    let psi = table_m.savings_at(r_be);
     Ok(profit_commission_rate * expected_lr * psi)
 }

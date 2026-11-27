@@ -1,10 +1,12 @@
+//! Classical (limited-fluctuation) credibility standards (Longley-Cook 1962 / CAS Exam 5).
+
 use serde::{Deserialize, Serialize};
 
 /// Classical / Limited Fluctuation Credibility standard (CAS Exam 5 / Longley-Cook).
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct ClassicalCredibility {
     /// Number of claims required for full credibility (e.g., `1,082.41` for +/- 5% with 90% confidence,
-    /// or `683` for +/- 10% with 95% confidence).
+    /// or `682.95` for +/- 7.5% with 95% confidence; `384.16` for +/- 10% with 95% confidence).
     pub full_credibility_standard: f64,
 }
 
@@ -19,7 +21,7 @@ impl ClassicalCredibility {
     }
 
     /// Default 1,082.41 claim standard (90% probability within +/- 5% error under Poisson).
-    pub fn standard_90_5() -> Self {
+    pub const fn standard_90_5() -> Self {
         Self {
             full_credibility_standard: 1082.41,
         }

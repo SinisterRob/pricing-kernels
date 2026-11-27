@@ -13,7 +13,7 @@
 
 use super::aggregate::AggregateLossDistribution;
 use crate::error::PricingError;
-use crate::layers::ilf::normal_cdf_exact;
+use crate::special::{normal_cdf_exact, normal_inv_cdf};
 use serde::{Deserialize, Serialize};
 
 /// Concave distortion operator `g: [0, 1] -> [0, 1]` with `g(0) = 0, g(1) = 1`
@@ -148,23 +148,25 @@ pub fn distortion_price_discrete(
 
     pairs.sort_by(|a, b| a.0.total_cmp(&b.0));
 
+    // Accumulate survival probabilities from the upper tail downward so far-tail
+    // probabilities retain full 53-bit precision under Wang's inverse-normal transform.
     let mut expected_loss = 0.0;
     let mut price = 0.0;
-    let mut surv_prev = 1.0;
-    let mut g_prev = 1.0;
+    let mut surv_after = 0.0;
+    let mut g_after = 0.0;
 
-    for &(x, p) in &pairs {
+    for &(x, p) in pairs.iter().rev() {
         expected_loss += p * x;
-        let surv_next = (surv_prev - p).max(0.0);
-        let g_next = distortion.evaluate(surv_next)?;
-        let weight = (g_prev - g_next).max(0.0);
+        let surv_before = (surv_after + p).min(1.0);
+        let g_before = distortion.evaluate(surv_before)?;
+        let weight = (g_before - g_after).max(0.0);
         price += weight * x;
-        surv_prev = surv_next;
-        g_prev = g_next;
+        surv_after = surv_before;
+        g_after = g_before;
     }
 
     let risk_load = price - expected_loss;
-    let risk_load_ratio = if expected_loss.abs() > 0.0 {
+    let risk_load_ratio = if expected_loss.abs() > 1e-15 {
         risk_load / expected_loss
     } else {
         0.0
@@ -202,7 +204,7 @@ pub struct KrepsRiskLoadResult {
     pub risk_load: f64,
     /// Linearized covariance approximation: `(y / (1 + y)) * z * (Var(X) + 2 Cov(X, S)) / (2 sigma_old)`.
     pub linearized_risk_load: f64,
-    /// Total risk-adjusted premium (`marginal_mean + risk_load`).
+    /// Total risk-adjusted premium (`contract_mean + risk_load`).
     pub risk_adjusted_price: f64,
 }
 
@@ -401,65 +403,4 @@ pub fn rmk_risk_adjusted_pricing(
         line_risk_loads,
         risk_load_shares,
     })
-}
-
-/// High-accuracy inverse standard normal CDF `Phi^-1(p)` for `p in (0, 1)`
-/// via Acklam rational approximation refined with one Newton-Raphson step (`< 1e-15`).
-pub(crate) fn normal_inv_cdf(p: f64) -> f64 {
-    const A: [f64; 6] = [
-        -3.969_683_028_665_376e1,
-        2.209_460_984_245_205e2,
-        -2.759_285_104_469_687e2,
-        1.383_577_518_672_69e2,
-        -3.066_479_806_614_716e1,
-        2.506_628_277_459_239,
-    ];
-    const B: [f64; 5] = [
-        -5.447_609_879_822_406e1,
-        1.615_858_368_580_409e2,
-        -1.556_989_798_598_866e2,
-        6.680_131_188_771_972e1,
-        -1.328_068_155_288_572e1,
-    ];
-    const C: [f64; 6] = [
-        -7.784_894_002_430_293e-3,
-        -3.223_964_580_411_365e-1,
-        -2.400_758_277_161_838,
-        -2.549_732_539_343_734,
-        4.374_664_141_464_968,
-        2.938_163_982_698_783,
-    ];
-    const D: [f64; 4] = [
-        7.784_695_709_041_462e-3,
-        3.224_671_290_700_398e-1,
-        2.445_134_137_142_996,
-        3.754_408_661_907_416,
-    ];
-
-    let p = p.clamp(1e-300, 1.0 - 1e-16);
-    let p_low = 0.02425;
-    let p_high = 1.0 - p_low;
-
-    let mut x = if p < p_low {
-        let q = (-2.0 * p.ln()).sqrt();
-        (((((C[0] * q + C[1]) * q + C[2]) * q + C[3]) * q + C[4]) * q + C[5])
-            / ((((D[0] * q + D[1]) * q + D[2]) * q + D[3]) * q + 1.0)
-    } else if p <= p_high {
-        let q = p - 0.5;
-        let r = q * q;
-        (((((A[0] * r + A[1]) * r + A[2]) * r + A[3]) * r + A[4]) * r + A[5]) * q
-            / (((((B[0] * r + B[1]) * r + B[2]) * r + B[3]) * r + B[4]) * r + 1.0)
-    } else {
-        let q = (-2.0 * (1.0 - p).ln()).sqrt();
-        -(((((C[0] * q + C[1]) * q + C[2]) * q + C[3]) * q + C[4]) * q + C[5])
-            / ((((D[0] * q + D[1]) * q + D[2]) * q + D[3]) * q + 1.0)
-    };
-
-    // One Newton-Raphson refinement step using exact Cody normal CDF
-    let err = normal_cdf_exact(x) - p;
-    let pdf = (-0.5 * x * x).exp() / std::f64::consts::TAU.sqrt();
-    if pdf > 1e-300 {
-        x -= err / pdf;
-    }
-    x
 }

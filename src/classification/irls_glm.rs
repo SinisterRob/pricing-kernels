@@ -1,3 +1,6 @@
+//! Iteratively Reweighted Least Squares (IRLS) GLM solver with Householder QR WLS,
+//! optional L2 (Ridge) penalization, and Dunn & Smyth (2005) Tweedie power selection.
+
 use crate::error::PricingError;
 use crate::linalg::{
     QrWorkspace, weighted_least_squares_qr_ridge_cm_beta_into,
@@ -141,10 +144,20 @@ impl GlmFamily {
                 2.0 * (t1 + t2)
             }
             Self::InverseGaussian => {
-                let diff = yi - mui;
-                (diff * diff) / (yi * mui * mui)
+                let ratio = (yi - mui) / mui;
+                (ratio * ratio) / yi
             }
         }
+    }
+
+    /// Returns `true` for families whose dispersion parameter `phi` is estimated
+    /// from the data rather than fixed at `1.0`.
+    #[inline]
+    pub(crate) const fn has_free_dispersion(self) -> bool {
+        matches!(
+            self,
+            Self::QuasiPoisson | Self::Gamma | Self::Tweedie { .. } | Self::InverseGaussian
+        )
     }
 
     #[inline]
@@ -609,6 +622,9 @@ pub fn fit_glm_irls_with_options(
     let mut mu = vec![0.0; n_samples];
     let mut eta = vec![0.0; n_samples];
     for i in 0..n_samples {
+        if weights[i] <= 0.0 {
+            continue;
+        }
         let mu0 = match family {
             GlmFamily::Binomial => f64::midpoint(y[i], 0.5),
             GlmFamily::Gamma | GlmFamily::InverseGaussian => y[i].max(1e-6),
@@ -675,6 +691,11 @@ pub fn fit_glm_irls_with_options(
 
         let mut max_change = 0.0;
         for j in 0..n_features {
+            if !beta_new[j].is_finite() {
+                return Err(PricingError::NonConvergence(
+                    "GLM IRLS produced non-finite coefficient",
+                ));
+            }
             let change = (beta_new[j] - beta[j]).abs();
             if change > max_change {
                 max_change = change;
@@ -723,18 +744,10 @@ pub fn fit_glm_irls_with_options(
     }
 
     let df_residual = active_samples.saturating_sub(n_features);
-    let dispersion = match family {
-        GlmFamily::Poisson | GlmFamily::NegativeBinomial { .. } | GlmFamily::Binomial => 1.0,
-        GlmFamily::QuasiPoisson
-        | GlmFamily::Gamma
-        | GlmFamily::Tweedie { .. }
-        | GlmFamily::InverseGaussian => {
-            if df_residual > 0 {
-                pearson_chi2 / df_residual as f64
-            } else {
-                1.0
-            }
-        }
+    let dispersion = if family.has_free_dispersion() && df_residual > 0 {
+        pearson_chi2 / df_residual as f64
+    } else {
+        1.0
     };
 
     let inv_xtwx = weighted_least_squares_qr_ridge_cm_cov(
@@ -876,10 +889,8 @@ pub fn select_tweedie_power(
             let yi = y[i];
             let d_i = family.unit_deviance(yi, mu[i]);
             if yi > 0.0 {
-                ll -= f64::midpoint(
-                    (std::f64::consts::TAU * (phi / wi) * yi.powf(p)).ln(),
-                    wi * d_i / phi,
-                );
+                let log_norm = (std::f64::consts::TAU * (phi / wi)).ln() + p * yi.ln();
+                ll -= f64::midpoint(log_norm, wi * d_i / phi);
             } else {
                 ll -= 0.5 * wi * d_i / phi;
             }

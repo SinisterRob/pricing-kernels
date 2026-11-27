@@ -1,3 +1,7 @@
+//! Geometric parallelogram on-level factor kernels for Calendar-Year earned
+//! (annual and arbitrary policy terms) and Policy-Year written premium adjustments
+//! (Kallop 1975 / Werner & Modlin *Basic Ratemaking*, Ch. 5).
+
 use crate::error::PricingError;
 use serde::{Deserialize, Serialize};
 
@@ -109,9 +113,9 @@ where
     let final_weight = (1.0 - prev_area_before).max(0.0);
     average_historical_level += final_weight * level;
 
-    if !(average_historical_level > 0.0) {
+    if !average_historical_level.is_finite() || !(average_historical_level > 0.0) {
         return Err(PricingError::SingularMatrix(
-            "historical average rate level is non-positive",
+            "historical average rate level is non-positive or non-finite",
         ));
     }
 

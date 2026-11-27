@@ -10,6 +10,7 @@
 use super::aggregate::{AggregateLossDistribution, FrequencyDistribution, fft_aggregate_loss};
 use crate::error::PricingError;
 use crate::layers::CommercialLayer;
+use crate::special::regularized_incomplete_beta;
 use serde::{Deserialize, Serialize};
 
 /// Validated catastrophe Event Loss Table (ELT) container anchoring OEP, PML,
@@ -51,7 +52,7 @@ impl EventLossTable {
         self.entries.is_empty()
     }
 
-    /// Analytical ELT summary (total arrival rate, AAL, occurrence SD).
+    /// Analytical ELT summary (total arrival rate, AAL, aggregate annual variance and SD).
     pub fn summary(&self) -> Result<EltSummary, PricingError> {
         elt_summary(&self.entries)
     }
@@ -148,7 +149,8 @@ impl EventLossEntry {
             }
             let mu0 = self.mean_loss / self.max_loss;
             let var0 = (sd / self.max_loss).powi(2);
-            if var0 >= mu0 * (1.0 - mu0) {
+            let common = mu0 * (1.0 - mu0) / var0 - 1.0;
+            if var0 >= mu0 * (1.0 - mu0) || !(common > 0.0) || !common.is_finite() {
                 return Err(PricingError::InvalidParameter(
                     "ELT variance exceeds maximum feasible Beta variance mu0 * (1 - mu0)",
                 ));
@@ -170,25 +172,37 @@ impl EventLossEntry {
         Ok(Some((mu0 * common, (1.0 - mu0) * common)))
     }
 
+    #[inline]
+    fn survival_with_params(&self, x: f64, beta_params: Option<(f64, f64)>) -> f64 {
+        if x < 0.0 {
+            return 1.0;
+        }
+        match beta_params {
+            None => {
+                if x < self.mean_loss {
+                    1.0
+                } else {
+                    0.0
+                }
+            }
+            Some((alpha, beta)) => {
+                if x >= self.max_loss {
+                    return 0.0;
+                }
+                let u = x / self.max_loss;
+                let cdf = regularized_incomplete_beta(u, alpha, beta);
+                (1.0 - cdf).clamp(0.0, 1.0)
+            }
+        }
+    }
+
     /// Conditional event severity survival function `S_i(x) = P(X_i > x)`.
     pub fn survival(&self, x: f64) -> Result<f64, PricingError> {
         if !x.is_finite() {
             return Err(PricingError::InvalidParameter("threshold x must be finite"));
         }
-        if x < 0.0 {
-            return Ok(1.0);
-        }
-        match self.beta_params()? {
-            None => Ok(if x < self.mean_loss { 1.0 } else { 0.0 }),
-            Some((alpha, beta)) => {
-                if x >= self.max_loss {
-                    return Ok(0.0);
-                }
-                let u = x / self.max_loss;
-                let cdf = regularized_incomplete_beta(u, alpha, beta);
-                Ok((1.0 - cdf).clamp(0.0, 1.0))
-            }
-        }
+        let params = self.beta_params()?;
+        Ok(self.survival_with_params(x, params))
     }
 }
 
@@ -257,13 +271,23 @@ pub fn elt_oep_pml(entries: &[EventLossEntry], return_period: f64) -> Result<f64
         ));
     }
     let target_prob = 1.0 / return_period;
+    let mut prepared = Vec::with_capacity(entries.len());
     let mut max_possible = 0.0_f64;
     for entry in entries {
-        entry.validate()?;
+        let params = entry.beta_params()?;
         max_possible = max_possible.max(entry.max_loss);
+        prepared.push((entry, params));
     }
 
-    if elt_oep(entries, 0.0)? <= target_prob {
+    let eval_oep = |threshold: f64| -> f64 {
+        let mut rate_exceeding = 0.0;
+        for &(entry, params) in &prepared {
+            rate_exceeding += entry.annual_rate * entry.survival_with_params(threshold, params);
+        }
+        (-(-rate_exceeding).exp_m1()).clamp(0.0, 1.0)
+    };
+
+    if eval_oep(0.0) <= target_prob {
         return Ok(0.0);
     }
 
@@ -271,7 +295,7 @@ pub fn elt_oep_pml(entries: &[EventLossEntry], return_period: f64) -> Result<f64
     let mut hi = max_possible;
     for _ in 0..80 {
         let mid = f64::midpoint(lo, hi);
-        let p = elt_oep(entries, mid)?;
+        let p = eval_oep(mid);
         if p > target_prob {
             lo = mid;
         } else {
@@ -285,7 +309,7 @@ pub fn elt_oep_pml(entries: &[EventLossEntry], return_period: f64) -> Result<f64
 }
 
 /// Expected annual ceded loss to a per-occurrence catastrophe excess-of-loss layer `layer`
-/// from an Event Loss Table (exact for point-mass events; 64-point Gauss-Legendre / midpoint
+/// from an Event Loss Table (exact for point-mass events; 128-point composite midpoint
 /// integral of `S_i(x)` over `[attachment, attachment + limit]` for Beta-uncertain events).
 pub fn elt_occurrence_layer_expected_loss(
     entries: &[EventLossEntry],
@@ -294,12 +318,17 @@ pub fn elt_occurrence_layer_expected_loss(
     if entries.is_empty() {
         return Err(PricingError::EmptyInput("ELT entries must not be empty"));
     }
+    layer.validate()?;
     let attach = layer.attachment;
     let detach = attach + layer.limit;
     let mut total_ceded = 0.0;
 
     for entry in entries {
-        if entry.beta_params()?.is_none() {
+        let params = entry.beta_params()?;
+        if entry.annual_rate == 0.0 {
+            continue;
+        }
+        if params.is_none() {
             total_ceded += entry.annual_rate * layer.payout(entry.mean_loss);
         } else {
             if attach >= entry.max_loss {
@@ -311,7 +340,7 @@ pub fn elt_occurrence_layer_expected_loss(
             let mut integral = 0.0;
             for k in 0..n {
                 let x = attach + (f64::from(k) + 0.5) * h;
-                integral += entry.survival(x)? * h;
+                integral += entry.survival_with_params(x, params) * h;
             }
             total_ceded += entry.annual_rate * layer.participation * integral;
         }
@@ -350,7 +379,8 @@ pub fn elt_aggregate_distribution(
             continue;
         }
         let weight = entry.annual_rate / summary.total_annual_rate;
-        if entry.beta_params()?.is_none() {
+        let params = entry.beta_params()?;
+        if params.is_none() {
             let exact_bin = entry.mean_loss / step;
             let lo = (exact_bin.floor() as usize).min(fft_size - 1);
             let hi = (lo + 1).min(fft_size - 1);
@@ -366,7 +396,7 @@ pub fn elt_aggregate_distribution(
             let mut prev_cdf = 0.0;
             for k in 0..max_bin {
                 let upper = ((k as f64) + 0.5) * step;
-                let cdf = 1.0 - entry.survival(upper)?;
+                let cdf = 1.0 - entry.survival_with_params(upper, params);
                 mix_pmf[k] += weight * (cdf - prev_cdf).max(0.0);
                 prev_cdf = cdf;
             }
@@ -383,93 +413,4 @@ pub fn elt_aggregate_distribution(
         fft_size,
         tilt,
     )
-}
-
-/// Log-gamma function via Lanczos approximation (`g = 7`, 9 coefficients, accuracy `< 1e-14`).
-fn ln_gamma(z: f64) -> f64 {
-    const COEFFS: [f64; 9] = [
-        0.999_999_999_999_809_9,
-        676.520_368_121_885_1,
-        -1_259.139_216_722_402_8,
-        771.323_428_777_653_1,
-        -176.615_029_162_140_6,
-        12.507_343_278_686_905,
-        -0.138_571_095_265_720_12,
-        9.984_369_578_019_572e-6,
-        1.505_632_735_149_311_6e-7,
-    ];
-    let z = z - 1.0;
-    let mut x = COEFFS[0];
-    for (i, &c) in COEFFS.iter().enumerate().skip(1) {
-        x += c / (z + (i as f64));
-    }
-    let t = z + 7.5;
-    0.5 * std::f64::consts::TAU.ln() + (z + 0.5) * t.ln() - t + x.ln()
-}
-
-/// Regularized incomplete beta function `I_x(a, b)` via modified Lentz continued fraction.
-fn regularized_incomplete_beta(x: f64, a: f64, b: f64) -> f64 {
-    if x <= 0.0 {
-        return 0.0;
-    }
-    if x >= 1.0 {
-        return 1.0;
-    }
-    let ln_bt = ln_gamma(a + b) - ln_gamma(a) - ln_gamma(b) + a * x.ln() + b * (1.0 - x).ln();
-    let bt = ln_bt.exp();
-    if x < (a + 1.0) / (a + b + 2.0) {
-        bt * betacf(x, a, b) / a
-    } else {
-        1.0 - bt * betacf(1.0 - x, b, a) / b
-    }
-}
-
-fn betacf(x: f64, a: f64, b: f64) -> f64 {
-    const MAX_ITER: usize = 200;
-    const EPS: f64 = 3.0e-15;
-    const FPMIN: f64 = 1.0e-300;
-
-    let qab = a + b;
-    let qap = a + 1.0;
-    let qam = a - 1.0;
-    let mut c = 1.0;
-    let mut d = 1.0 - qab * x / qap;
-    if d.abs() < FPMIN {
-        d = FPMIN;
-    }
-    d = 1.0 / d;
-    let mut h = d;
-
-    for m in 1..=MAX_ITER {
-        let mf = m as f64;
-        let m2 = 2.0 * mf;
-        let aa = mf * (b - mf) * x / ((qam + m2) * (a + m2));
-        d = 1.0 + aa * d;
-        if d.abs() < FPMIN {
-            d = FPMIN;
-        }
-        c = 1.0 + aa / c;
-        if c.abs() < FPMIN {
-            c = FPMIN;
-        }
-        d = 1.0 / d;
-        h *= d * c;
-
-        let aa = -(a + mf) * (qab + mf) * x / ((a + m2) * (qap + m2));
-        d = 1.0 + aa * d;
-        if d.abs() < FPMIN {
-            d = FPMIN;
-        }
-        c = 1.0 + aa / c;
-        if c.abs() < FPMIN {
-            c = FPMIN;
-        }
-        d = 1.0 / d;
-        let del = d * c;
-        h *= del;
-        if (del - 1.0).abs() < EPS {
-            break;
-        }
-    }
-    h
 }

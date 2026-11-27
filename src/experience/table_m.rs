@@ -1,8 +1,10 @@
+//! Lee (1988) Table M aggregate insurance charge and savings engine.
+
 use crate::error::PricingError;
 use serde::{Deserialize, Serialize};
 
 /// Discrete Table M aggregate distribution row.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct TableMRow {
     /// Entry ratio `r = Loss / ExpectedLoss`.
     pub entry_ratio: f64,
@@ -80,27 +82,39 @@ impl TableMEngine {
             merged.push((r, p));
         }
 
-        let mut rows = Vec::with_capacity(merged.len());
-        for &(r, _) in &merged {
-            let mut charge = 0.0;
-            for &(y, p) in &merged {
-                if y > r {
-                    charge += p * (y - r);
-                }
+        // O(N) cancellation-free right-to-left recurrence:
+        // phi(r_i) = phi(r_{i+1}) + P(Y > r_i) * (r_{i+1} - r_i).
+        let n = merged.len();
+        let mut rows = vec![
+            TableMRow {
+                entry_ratio: 0.0,
+                charge: 0.0,
+                savings: 0.0,
+            };
+            n
+        ];
+        let mut charge = 0.0;
+        let mut tail_prob = 0.0;
+        for i in (0..n).rev() {
+            let (r, _) = merged[i];
+            if i + 1 < n {
+                let (next_r, next_p) = merged[i + 1];
+                tail_prob += next_p;
+                charge += tail_prob * (next_r - r);
             }
             let savings = (charge + r - 1.0).max(0.0);
-            rows.push(TableMRow {
+            rows[i] = TableMRow {
                 entry_ratio: r,
                 charge,
                 savings,
-            });
+            };
         }
 
         Ok(Self { rows })
     }
 
-    /// Evaluates insurance charge `phi(r)` at any entry ratio `r` using exact piecewise-linear
-    /// evaluation for discrete distributions.
+    /// Evaluates insurance charge `phi(r)` at any entry ratio `r >= 0` using exact piecewise-linear
+    /// evaluation for discrete distributions (values `r <= 0` evaluate at `r = 0`).
     ///
     /// For `0 <= r < rows[0].entry_ratio`, `P(Y >= rows[0].entry_ratio) = 1`, so
     /// `phi'(r) = -1` and `phi(r) = rows[0].charge + (rows[0].entry_ratio - r)`.

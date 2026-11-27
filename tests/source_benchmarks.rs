@@ -1517,3 +1517,120 @@ fn test_phase1_anchor_types_builders_and_declarative_macros() {
     let ncci_res = calculate_ncci_experience_mod(&ncci_alias, &[]).unwrap();
     assert!(ncci_res.mod_factor < 1.0);
 }
+
+#[test]
+fn test_numerical_stability_and_validation_refinements() {
+    // 1. Centered TrendModel::fit_exponential on calendar years (2020..2025)
+    let years = [2020.0_f64, 2021.0, 2022.0, 2023.0, 2024.0, 2025.0];
+    let true_rate = 0.065_f64;
+    let vals: Vec<f64> = years
+        .iter()
+        .map(|&y| 100.0 * (1.0 + true_rate).powf(y - 2020.0))
+        .collect();
+    let fitted = TrendModel::fit_exponential(&years, &vals).unwrap();
+    assert!(close_rel(fitted.annual_rate, true_rate, 1e-12));
+
+    // 2. LER rejects deductible > policy_limit
+    let lomax = SeverityDistribution::Lomax {
+        alpha: 2.2,
+        theta: 100_000.0,
+    };
+    assert!(lomax.loss_elimination_ratio(600_000.0, 500_000.0).is_err());
+
+    // 3. burning_cost_xl rejects duplicate treaty years and invalid CommercialLayer
+    let dup_years = [
+        HistoricalTreatyYear {
+            year: 2023,
+            subject_premium: 1_000_000.0,
+            on_level_factor: 1.0,
+            exposure_trend_factor: 1.0,
+        },
+        HistoricalTreatyYear {
+            year: 2023,
+            subject_premium: 1_200_000.0,
+            on_level_factor: 1.0,
+            exposure_trend_factor: 1.0,
+        },
+    ];
+    let valid_layer = CommercialLayer::new(100_000.0, 400_000.0, 1.0).unwrap();
+    assert!(burning_cost_xl(&dup_years, &[], &valid_layer).is_err());
+    let invalid_layer = CommercialLayer {
+        attachment: -1.0,
+        limit: 100_000.0,
+        participation: 1.0,
+    };
+    assert!(burning_cost_xl(&dup_years[..1], &[], &invalid_layer).is_err());
+    assert!(LayerTower::try_new(vec![invalid_layer]).is_err());
+
+    // 4. glm_information_criteria rejects out-of-domain mu/y
+    assert!(
+        glm_information_criteria(
+            GlmFamily::Binomial,
+            &[0.5, 0.5],
+            &[1.2, 0.5],
+            &[1.0, 1.0],
+            1.0,
+            1
+        )
+        .is_err()
+    );
+    assert!(
+        glm_information_criteria(
+            GlmFamily::InverseGaussian,
+            &[0.0, 1.0],
+            &[0.5, 1.0],
+            &[1.0, 1.0],
+            1.0,
+            1
+        )
+        .is_err()
+    );
+
+    // 5. VIF rejects constant single predictor column
+    assert!(variance_inflation_factors(&[5.0, 5.0, 5.0, 5.0], 4, 1).is_err());
+
+    // 6. AggregateLossDistribution::from_pmf rejects negative mass; FFT guards tilt overflow
+    assert!(AggregateLossDistribution::from_pmf(1.0, vec![0.5, -0.1, 0.6]).is_err());
+    assert!(
+        fft_aggregate_loss(
+            FrequencyDistribution::Poisson { lambda: 1.0 },
+            &[0.5, 0.5],
+            1.0,
+            1024,
+            Some(1.0),
+        )
+        .is_err()
+    );
+
+    // 7. Hachemeister with identical groups (zero VHM) and tiny EPV does not falsely error
+    let t = [1.0, 2.0, 3.0, 4.0];
+    let w = [10.0, 10.0, 10.0, 10.0];
+    let y1 = [10.0 + 1e-6, 12.0, 14.0 - 1e-6, 16.0];
+    let y2 = [10.0 - 1e-6, 12.0, 14.0 + 1e-6, 16.0];
+    let hach = hachemeister_credibility(&[&t, &t], &[&y1, &y2], &[&w, &w]).unwrap();
+    assert!(hach.epv > 0.0);
+    for g in &hach.groups {
+        assert!(g.credibility_beta[0].is_finite() && g.credibility_beta[1].is_finite());
+    }
+}
+
+#[cfg(feature = "wasm")]
+#[test]
+fn test_wasm_exports_guard_overflow_and_basic_calls() {
+    use pricing_kernels::wasm_exports::{pk_ilf_gamma, pk_max_claims, pk_ncci_experience_mod};
+
+    let ilf = pk_ilf_gamma(2.5, 40_000.0, 1_000_000.0, 250_000.0);
+    assert!(ilf.is_finite() && ilf > 1.0);
+
+    // Exceeding MAX_CLAIMS must return NaN rather than silently truncating.
+    let overflow_mod = pk_ncci_experience_mod(
+        18_500.0,
+        100_000.0,
+        0.4,
+        0.15,
+        25_000.0,
+        1,
+        pk_max_claims() + 1,
+    );
+    assert!(overflow_mod.is_nan());
+}

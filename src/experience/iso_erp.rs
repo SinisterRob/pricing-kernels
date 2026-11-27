@@ -13,7 +13,7 @@ pub struct IsoErpSpec {
     pub max_single_limit: f64,
     /// Credibility constant `K > 0` (`Z = E / (E + K)`).
     pub credibility_k: f64,
-    /// Expected Unlimited / Excess-to-Basic adjustment or balance factor (default `1.0`).
+    /// Expected Unlimited / Excess-to-Basic adjustment or balance factor (typically `1.0`).
     pub balance_factor: f64,
 }
 
@@ -118,7 +118,6 @@ pub fn calculate_schedule_mod(
         || !overall_max.is_finite()
         || !(overall_min <= 0.0)
         || !(overall_max >= 0.0)
-        || !(overall_min <= overall_max)
         || overall_min <= -1.0
     {
         return Err(PricingError::InvalidParameter(

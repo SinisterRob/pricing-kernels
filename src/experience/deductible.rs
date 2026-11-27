@@ -38,14 +38,14 @@ pub struct LargeDeductibleSpec {
     /// Variable expense & profit ratio `v in [0, 1)` applied to net premium (commission, taxes, profit).
     pub variable_expense_ratio: f64,
     /// Optional aggregate deductible cap expressed as an entry ratio `r_agg` relative to
-    /// expected retained loss (requires a `TableMEngine` for aggregate cap pricing).
+    /// expected retained loss (requires a [`TableMEngine`] for aggregate cap pricing).
     pub aggregate_cap_entry_ratio: Option<f64>,
 }
 
 /// Financial breakdown of a priced commercial large deductible program.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct LargeDeductibleResult {
-    /// Per-occurrence Loss Elimination Ratio `LER(d; L) = E[X ^ d] / E[X ^ L]`.
+    /// Per-occurrence Loss Elimination Ratio `LER(d; L) = E[X ∧ d] / E[X ∧ L]`.
     pub loss_elimination_ratio: f64,
     /// Per-occurrence Excess Loss Factor `ELF = 1 - LER`.
     pub excess_loss_factor: f64,
@@ -68,8 +68,12 @@ pub struct LargeDeductibleResult {
     pub indicated_premium: f64,
 }
 
-/// Price a commercial large deductible program using a parametric severity distribution
-/// (and optional `TableMEngine` when `aggregate_cap_entry_ratio` is specified).
+/// Price a commercial large deductible program using a parametric [`SeverityDistribution`]
+/// (and optional [`TableMEngine`] when `aggregate_cap_entry_ratio` is specified).
+///
+/// Under [`AlaeTreatment::InsideLimit`], pass a combined Loss+ALAE severity distribution;
+/// under [`AlaeTreatment::ProRata`] or [`AlaeTreatment::OutsideLimit`], pass the indemnity
+/// severity distribution.
 pub fn price_large_deductible(
     spec: &LargeDeductibleSpec,
     severity: &SeverityDistribution,

@@ -1,8 +1,6 @@
 #![doc = include_str!("../README.md")]
 #![cfg_attr(not(feature = "wasm"), forbid(unsafe_code))]
 #![warn(missing_docs)]
-#![allow(clippy::needless_range_loop)]
-#![allow(clippy::neg_cmp_op_on_partial_ord)]
 
 pub mod classification;
 pub mod credibility;
@@ -11,6 +9,7 @@ pub mod error;
 pub mod experience;
 pub mod layers;
 pub(crate) mod linalg;
+pub(crate) mod special;
 pub mod trending;
 pub mod underwriting_risk;
 

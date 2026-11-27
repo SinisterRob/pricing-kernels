@@ -97,22 +97,34 @@ impl TableLEngine {
             merged.push((y, p));
         }
 
-        let mut rows = Vec::with_capacity(merged.len());
-        for &(r, _) in &merged {
-            let mut agg_excess = 0.0;
-            for &(y, p) in &merged {
-                if y > r {
-                    agg_excess += p * (y - r);
-                }
+        // O(N) cancellation-free right-to-left recurrence for E[max(0, Y* - r_i)].
+        let n = merged.len();
+        let mut rows = vec![
+            TableLRow {
+                entry_ratio: 0.0,
+                charge: 0.0,
+                aggregate_excess_charge: 0.0,
+                savings: 0.0,
+            };
+            n
+        ];
+        let mut agg_excess = 0.0;
+        let mut tail_prob = 0.0;
+        for i in (0..n).rev() {
+            let (r, _) = merged[i];
+            if i + 1 < n {
+                let (next_r, next_p) = merged[i + 1];
+                tail_prob += next_p;
+                agg_excess += tail_prob * (next_r - r);
             }
             let charge = agg_excess + k;
             let savings = (charge + r - 1.0).max(0.0);
-            rows.push(TableLRow {
+            rows[i] = TableLRow {
                 entry_ratio: r,
                 charge,
                 aggregate_excess_charge: agg_excess,
                 savings,
-            });
+            };
         }
 
         Ok(Self {

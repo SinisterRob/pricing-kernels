@@ -1,3 +1,5 @@
+//! Zero-allocation multiplicative rating plan scorer for real-time and batch pricing.
+
 use crate::error::PricingError;
 use serde::{Deserialize, Serialize};
 
@@ -5,7 +7,7 @@ use serde::{Deserialize, Serialize};
 ///
 /// Models the standard actuarial rating structure:
 /// `Premium = BaseRate * Exposure * Product_k(Factor_k)`
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct MultiplicativeRater {
     /// Base rate per unit of exposure (e.g., rate per power unit or per $100 payroll).
     pub base_rate: f64,
@@ -17,7 +19,7 @@ pub struct MultiplicativeRater {
 
 impl MultiplicativeRater {
     /// Construct a rater with given base rate.
-    pub fn new(base_rate: f64) -> Self {
+    pub const fn new(base_rate: f64) -> Self {
         Self {
             base_rate,
             minimum_premium: None,
@@ -26,13 +28,13 @@ impl MultiplicativeRater {
     }
 
     /// Set a minimum premium floor.
-    pub fn with_minimum_premium(mut self, min_prem: f64) -> Self {
+    pub const fn with_minimum_premium(mut self, min_prem: f64) -> Self {
         self.minimum_premium = Some(min_prem);
         self
     }
 
     /// Set a maximum premium cap.
-    pub fn with_maximum_premium(mut self, max_prem: f64) -> Self {
+    pub const fn with_maximum_premium(mut self, max_prem: f64) -> Self {
         self.maximum_premium = Some(max_prem);
         self
     }
@@ -45,17 +47,15 @@ impl MultiplicativeRater {
         for &f in factors {
             prem *= f;
         }
-        if let Some(min_p) = self.minimum_premium {
-            #[allow(clippy::collapsible_if)]
-            if prem < min_p {
-                prem = min_p;
-            }
+        if let Some(min_p) = self.minimum_premium
+            && prem < min_p
+        {
+            prem = min_p;
         }
-        if let Some(max_p) = self.maximum_premium {
-            #[allow(clippy::collapsible_if)]
-            if prem > max_p {
-                prem = max_p;
-            }
+        if let Some(max_p) = self.maximum_premium
+            && prem > max_p
+        {
+            prem = max_p;
         }
         prem
     }

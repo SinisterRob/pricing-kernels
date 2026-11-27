@@ -1,172 +1,10 @@
+//! Parametric severity distributions, Limited Expected Values (LEVs),
+//! Increased Limits Factors (ILFs), Loss Elimination Ratios (LERs),
+//! and commercial excess layer towers.
+
 use crate::error::PricingError;
+use crate::special::{gamma_p, ln_gamma, normal_cdf_exact};
 use serde::{Deserialize, Serialize};
-
-/// High-accuracy standard normal CDF `Φ(z)` via Cody (1969) rational `erfc`
-/// approximation (max absolute error `< 1e-15`).
-pub(crate) fn normal_cdf_exact(z: f64) -> f64 {
-    0.5 * erfc_approx(-z / std::f64::consts::SQRT_2)
-}
-
-/// Complementary error function `erfc(x)` accurate to ~1e-15 (Cody 1969).
-fn erfc_approx(x: f64) -> f64 {
-    if x.is_nan() {
-        return f64::NAN;
-    }
-    if x < 0.0 {
-        return 2.0 - erfc_approx(-x);
-    }
-    if x < 0.46875 {
-        const A: [f64; 5] = [
-            3.161_123_743_870_565_6e0,
-            1.138_641_541_510_501_6e2,
-            3.774_852_376_853_02e2,
-            3.209_377_589_138_469_5e3,
-            1.857_777_061_846_031_5e-1,
-        ];
-        const B: [f64; 4] = [
-            2.360_129_095_234_412_1e1,
-            2.440_246_379_344_441_7e2,
-            1.282_616_526_077_372_3e3,
-            2.844_236_833_439_171e3,
-        ];
-        let y = x * x;
-        let num = (((A[4] * y + A[0]) * y + A[1]) * y + A[2]) * y + A[3];
-        let den = (((y + B[0]) * y + B[1]) * y + B[2]) * y + B[3];
-        1.0 - x * num / den
-    } else if x <= 4.0 {
-        const C: [f64; 9] = [
-            5.641_884_969_886_701e-1,
-            8.883_149_794_388_375,
-            6.611_919_063_714_163e1,
-            2.986_351_381_974_001e2,
-            8.819_522_212_417_69e2,
-            1.712_047_612_634_070_6e3,
-            2.051_078_377_826_071_5e3,
-            1.230_339_354_797_997_2e3,
-            2.153_115_354_744_038_5e-8,
-        ];
-        const D: [f64; 8] = [
-            1.574_492_611_070_983_5e1,
-            1.176_939_508_913_125e2,
-            5.371_811_018_620_099e2,
-            1.621_389_574_566_690_2e3,
-            3.290_799_235_733_459_6e3,
-            4.362_619_090_143_247e3,
-            3.439_367_674_143_721_6e3,
-            1.230_339_354_803_749_4e3,
-        ];
-        let num = (((((((C[8] * x + C[0]) * x + C[1]) * x + C[2]) * x + C[3]) * x + C[4]) * x
-            + C[5])
-            * x
-            + C[6])
-            * x
-            + C[7];
-        let den = (((((((x + D[0]) * x + D[1]) * x + D[2]) * x + D[3]) * x + D[4]) * x + D[5]) * x
-            + D[6])
-            * x
-            + D[7];
-        (-x * x).exp() * num / den
-    } else if x < 26.5 {
-        const P: [f64; 6] = [
-            3.053_266_349_612_323_4e-1,
-            3.603_448_999_498_044_4e-1,
-            1.257_817_261_112_292_5e-1,
-            1.608_378_514_874_228e-2,
-            6.587_491_615_298_378e-4,
-            1.631_538_713_730_209_8e-2,
-        ];
-        const Q: [f64; 5] = [
-            2.568_520_192_289_822,
-            1.872_952_849_923_460_5e0,
-            5.279_051_029_514_285e-1,
-            6.051_834_131_244_132e-2,
-            2.335_204_976_268_691_9e-3,
-        ];
-        let y = 1.0 / (x * x);
-        let num = ((((P[5] * y + P[0]) * y + P[1]) * y + P[2]) * y + P[3]) * y + P[4];
-        let den = ((((y + Q[0]) * y + Q[1]) * y + Q[2]) * y + Q[3]) * y + Q[4];
-        let inv_sqrt_pi = std::f64::consts::FRAC_2_SQRT_PI * 0.5;
-        (-x * x).exp() / x * (inv_sqrt_pi - y * num / den)
-    } else {
-        0.0
-    }
-}
-
-/// High-accuracy `ln Γ(z)` for `z > 0` via the 9-term Lanczos approximation (`g = 7`).
-pub(crate) fn ln_gamma(z: f64) -> f64 {
-    const COEFFS: [f64; 9] = [
-        0.999_999_999_999_809_9,
-        676.520_368_121_885_1,
-        -1_259.139_216_722_402_8,
-        771.323_428_777_653_1,
-        -176.615_029_162_140_6,
-        12.507_343_278_686_905,
-        -0.138_571_095_265_720_12,
-        9.984_369_578_019_572e-6,
-        1.505_632_735_149_311_6e-7,
-    ];
-    let z = z - 1.0;
-    let mut x = COEFFS[0];
-    for (i, &c) in COEFFS.iter().enumerate().skip(1) {
-        x += c / (z + i as f64);
-    }
-    let t = z + 7.5;
-    0.5 * std::f64::consts::TAU.ln() + (z + 0.5) * t.ln() - t + x.ln()
-}
-
-/// Regularized lower incomplete gamma `P(a, x) = γ(a, x) / Γ(a)` for `a > 0, x >= 0`.
-pub(crate) fn gamma_p(a: f64, x: f64) -> f64 {
-    if !(x > 0.0) {
-        return 0.0;
-    }
-    if x < a + 1.0 {
-        // Series representation: P(a, x) = e^{-x} x^a sum_{n=0}^\infty x^n / Γ(a + n + 1).
-        let mut ap = a;
-        let mut term = 1.0 / a;
-        let mut sum = term;
-        for _ in 0..200 {
-            ap += 1.0;
-            term *= x / ap;
-            sum += term;
-            if term.abs() <= sum.abs() * 1e-15 {
-                break;
-            }
-        }
-        (sum * (-x + a * x.ln() - ln_gamma(a)).exp()).clamp(0.0, 1.0)
-    } else {
-        (1.0 - gamma_q_cf(a, x)).clamp(0.0, 1.0)
-    }
-}
-
-/// Regularized upper incomplete gamma `Q(a, x) = 1 - P(a, x)` via modified Lentz
-/// continued fraction for `x >= a + 1`.
-fn gamma_q_cf(a: f64, x: f64) -> f64 {
-    const TINY: f64 = 1e-300;
-    let mut b = x + 1.0 - a;
-    let mut c = 1.0 / TINY;
-    let mut d = 1.0 / b;
-    let mut h = d;
-    for i in 1..=200 {
-        let fi = f64::from(i);
-        let an = -fi * (fi - a);
-        b += 2.0;
-        d = an * d + b;
-        if d.abs() < TINY {
-            d = TINY;
-        }
-        c = b + an / c;
-        if c.abs() < TINY {
-            c = TINY;
-        }
-        d = 1.0 / d;
-        let del = d * c;
-        h *= del;
-        if (del - 1.0).abs() <= 1e-15 {
-            break;
-        }
-    }
-    ((-x + a * x.ln() - ln_gamma(a)).exp() * h).clamp(0.0, 1.0)
-}
 
 /// Continuous density `f_G(x)` for `Gamma(shape, scale)` at `x > 0`.
 #[inline]
@@ -551,7 +389,17 @@ impl SeverityDistribution {
             Self::Lognormal { mu, sigma } => {
                 let z = (limit.ln() - mu) / sigma;
                 let mean = (mu + 0.5 * sigma * sigma).exp();
-                mean * normal_cdf_exact(z - sigma) + limit * normal_cdf_exact(-z)
+                let cdf_shifted = normal_cdf_exact(z - sigma);
+                let body = if cdf_shifted == 0.0 {
+                    0.0
+                } else if !mean.is_finite() {
+                    return Err(PricingError::OutOfBounds(
+                        "lognormal mean overflowed floating-point range",
+                    ));
+                } else {
+                    mean * cdf_shifted
+                };
+                body + limit * normal_cdf_exact(-z)
             }
             Self::Lomax { alpha, theta } => {
                 if (alpha - 1.0).abs() < 1e-10 {
@@ -568,8 +416,8 @@ impl SeverityDistribution {
                 } else if (alpha - 1.0).abs() < 1e-10 {
                     x_m * (1.0 + (limit / x_m).ln())
                 } else {
-                    let term = (x_m / limit).powf(alpha - 1.0);
-                    x_m * (alpha - term) / (alpha - 1.0)
+                    let excess_term = -(((alpha - 1.0) * (x_m / limit).ln()).exp_m1());
+                    x_m + x_m * excess_term / (alpha - 1.0)
                 }
             }
             Self::Exponential { lambda } => -((-lambda * limit).exp_m1()) / lambda,
@@ -625,9 +473,8 @@ impl SeverityDistribution {
                     let tail_excess = if (tail_alpha - 1.0).abs() <= 1e-10 {
                         (1.0 - w) * splice * (limit / splice).ln()
                     } else {
-                        (1.0 - w)
-                            * (splice / (tail_alpha - 1.0))
-                            * (1.0 - (splice / limit).powf(tail_alpha - 1.0))
+                        let excess_term = -(((tail_alpha - 1.0) * (splice / limit).ln()).exp_m1());
+                        (1.0 - w) * (splice / (tail_alpha - 1.0)) * excess_term
                     };
                     lev_u + tail_excess
                 }
@@ -667,9 +514,10 @@ impl SeverityDistribution {
             || !policy_limit.is_finite()
             || !(deductible >= 0.0)
             || !(policy_limit > 0.0)
+            || deductible > policy_limit
         {
             return Err(PricingError::InvalidParameter(
-                "deductible must be finite and non-negative, policy limit finite and positive",
+                "must satisfy 0 <= deductible <= policy_limit with finite values and policy_limit > 0",
             ));
         }
         let lev_d = self.limited_expected_value(deductible)?;
@@ -728,12 +576,18 @@ impl CommercialLayer {
         })
     }
 
+    /// Validate layer parameters (`attachment >= 0`, `limit > 0`, `participation in (0, 1]`).
+    pub fn validate(&self) -> Result<(), PricingError> {
+        Self::new(self.attachment, self.limit, self.participation).map(|_| ())
+    }
+
     /// Evaluates expected loss cost in this specific layer:
     /// `LayerLoss = Participation * ( E[X ∧ (A + L)] - E[X ∧ A] )`
     pub fn layer_expected_loss(
         &self,
         severity: &SeverityDistribution,
     ) -> Result<f64, PricingError> {
+        self.validate()?;
         let lev_top = severity.limited_expected_value(self.attachment + self.limit)?;
         let lev_bot = severity.limited_expected_value(self.attachment)?;
         Ok(self.participation * (lev_top - lev_bot).max(0.0))
@@ -765,12 +619,15 @@ pub struct LayerTower {
 }
 
 impl LayerTower {
-    /// Construct a tower from pre-validated [`CommercialLayer`] entries.
+    /// Construct a tower from validated [`CommercialLayer`] entries.
     pub fn try_new(layers: Vec<CommercialLayer>) -> Result<Self, PricingError> {
         if layers.is_empty() {
             return Err(PricingError::EmptyInput(
                 "layer tower must contain at least one layer",
             ));
+        }
+        for layer in &layers {
+            layer.validate()?;
         }
         Ok(Self { layers })
     }

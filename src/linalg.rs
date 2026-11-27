@@ -103,27 +103,6 @@ pub fn solve_upper_transpose_into(
     Ok(())
 }
 
-/// Solve symmetric positive-definite system `A x = b` using Cholesky factorization.
-#[allow(dead_code)]
-pub fn cholesky_solve(a: &[f64], dim: usize, b: &[f64]) -> Result<Vec<f64>, PricingError> {
-    if b.len() != dim {
-        return Err(PricingError::DimensionMismatch(
-            "vector b length does not match dim",
-        ));
-    }
-    if b.iter().any(|v| !v.is_finite()) {
-        return Err(PricingError::InvalidParameter(
-            "vector b contains non-finite value",
-        ));
-    }
-    let l = cholesky_lower(a, dim)?;
-    let mut y = vec![0.0; dim];
-    solve_lower_into(&l, dim, b, &mut y)?;
-    let mut x = vec![0.0; dim];
-    solve_upper_transpose_into(&l, dim, &y, &mut x)?;
-    Ok(x)
-}
-
 /// Invert a symmetric positive-definite `dim × dim` matrix `A` using Cholesky factor `L`.
 pub fn cholesky_invert(a: &[f64], dim: usize) -> Result<Vec<f64>, PricingError> {
     let l = cholesky_lower(a, dim)?;
@@ -142,47 +121,6 @@ pub fn cholesky_invert(a: &[f64], dim: usize) -> Result<Vec<f64>, PricingError> 
         }
     }
     Ok(inv)
-}
-
-/// Multiply matrix `A` (`rows_a × cols_a`) by matrix `B` (`cols_a × cols_b`) into `C` (`rows_a × cols_b`).
-#[allow(dead_code)]
-pub fn mat_mul(
-    a: &[f64],
-    b: &[f64],
-    rows_a: usize,
-    cols_a: usize,
-    cols_b: usize,
-    c: &mut [f64],
-) -> Result<(), PricingError> {
-    if a.len() != rows_a * cols_a || b.len() != cols_a * cols_b || c.len() != rows_a * cols_b {
-        return Err(PricingError::DimensionMismatch(
-            "matrix dimensions do not match slice lengths for mat_mul",
-        ));
-    }
-    c.fill(0.0);
-    for i in 0..rows_a {
-        for k in 0..cols_a {
-            let aik = a[i * cols_a + k];
-            if aik == 0.0 {
-                continue;
-            }
-            for j in 0..cols_b {
-                c[i * cols_b + j] += aik * b[k * cols_b + j];
-            }
-        }
-    }
-    Ok(())
-}
-
-/// Compute weighted dot product: `sum_i w_i * x_i * y_i`.
-#[allow(dead_code)]
-#[inline]
-pub fn weighted_dot(x: &[f64], y: &[f64], w: &[f64]) -> f64 {
-    x.iter()
-        .zip(y.iter())
-        .zip(w.iter())
-        .map(|((&xi, &yi), &wi)| wi * xi * yi)
-        .sum()
 }
 
 /// Reusable workspace for allocation-free column-major Householder QR WLS solves
@@ -515,8 +453,6 @@ mod tests {
     fn linalg_rejects_mismatched_and_non_finite_inputs() {
         let mut y = [0.0; 1];
         assert!(solve_lower_into(&[1.0, 0.0, 0.0, 1.0], 2, &[1.0, 2.0], &mut y).is_err());
-        let mut c = [0.0; 1];
-        assert!(mat_mul(&[1.0, 2.0], &[3.0, 4.0], 1, 2, 2, &mut c).is_err());
-        assert!(cholesky_solve(&[1.0, 0.0, 0.0, 1.0], 2, &[1.0, f64::NAN]).is_err());
+        assert!(cholesky_invert(&[1.0, f64::NAN, f64::NAN, 1.0], 2).is_err());
     }
 }

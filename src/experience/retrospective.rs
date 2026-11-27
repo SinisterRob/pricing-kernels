@@ -1,10 +1,12 @@
+//! Actuarially balanced incurred-loss retrospective rating plan solver (CAS Exam 8 / Brosius 1989).
+
 use super::table_l::{TableLEngine, solve_balanced_retro_plan_table_l};
 use super::table_m::TableMEngine;
 use crate::error::{PricingError, SolverOptions};
 use serde::{Deserialize, Serialize};
 
 /// Parameters defining a Commercial Incurred Loss Retrospective Rating Plan.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct RetroPlanSpec {
     /// Standard Premium (`P`).
     pub standard_premium: f64,
@@ -44,7 +46,7 @@ impl RetroPlanSpec {
 }
 
 /// Solved retrospective rating plan parameters and financial breakdown.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct RetroPlanResult {
     /// Basic Premium Factor (`BPF`).
     pub basic_premium_factor: f64,

@@ -267,18 +267,44 @@ pub fn glm_information_criteria(
     let mut n_active = 0usize;
 
     for i in 0..n {
-        if !y[i].is_finite() || !mu[i].is_finite() || !weights[i].is_finite() || weights[i] < 0.0 {
+        let yi = y[i];
+        let mui = mu[i];
+        let wi = weights[i];
+        if !yi.is_finite() || !mui.is_finite() || !wi.is_finite() || wi < 0.0 {
             return Err(PricingError::InvalidParameter(
                 "y, mu, and weights must be finite with weights >= 0",
             ));
         }
-        if weights[i] <= 0.0 {
+        if wi <= 0.0 {
             continue;
         }
+        match family {
+            GlmFamily::Binomial => {
+                if !((0.0..=1.0).contains(&yi) && mui > 0.0 && mui < 1.0) {
+                    return Err(PricingError::InvalidParameter(
+                        "Binomial information criteria require y in [0, 1] and mu in (0, 1)",
+                    ));
+                }
+            }
+            GlmFamily::Gamma | GlmFamily::InverseGaussian => {
+                if !(yi > 0.0) || !(mui > 0.0) {
+                    return Err(PricingError::NonPositiveValue(
+                        "Gamma/InverseGaussian information criteria require y > 0 and mu > 0",
+                    ));
+                }
+            }
+            _ => {
+                if !(yi >= 0.0) || !(mui > 0.0) {
+                    return Err(PricingError::InvalidParameter(
+                        "count/Tweedie information criteria require y >= 0 and mu > 0",
+                    ));
+                }
+            }
+        }
         n_active += 1;
-        deviance += weights[i] * family.unit_deviance(y[i], mu[i]);
-        let diff = y[i] - mu[i];
-        pearson_chi2 += weights[i] * (diff * diff) / family.variance_fn(mu[i]);
+        deviance += wi * family.unit_deviance(yi, mui);
+        let diff = yi - mui;
+        pearson_chi2 += wi * (diff * diff) / family.variance_fn(mui);
     }
     if n_active == 0 {
         return Err(PricingError::EmptyInput(
@@ -287,12 +313,10 @@ pub fn glm_information_criteria(
     }
 
     let scaled_deviance = deviance / dispersion;
-    let extra_disp_param = match family {
-        GlmFamily::Poisson | GlmFamily::NegativeBinomial { .. } | GlmFamily::Binomial => 0.0,
-        GlmFamily::QuasiPoisson
-        | GlmFamily::Gamma
-        | GlmFamily::Tweedie { .. }
-        | GlmFamily::InverseGaussian => 1.0,
+    let extra_disp_param = if family.has_free_dispersion() {
+        1.0
+    } else {
+        0.0
     };
     let k = (n_features as f64) + extra_disp_param;
     let aic = scaled_deviance + 2.0 * k;
@@ -321,7 +345,7 @@ pub fn variance_inflation_factors(
             "at least 2 samples and 1 predictor column are required for VIF",
         ));
     }
-    if predictors.len() != n_samples * n_features {
+    if n_samples.checked_mul(n_features) != Some(predictors.len()) {
         return Err(PricingError::DimensionMismatch(
             "predictors length != n_samples * n_features",
         ));
@@ -330,9 +354,6 @@ pub fn variance_inflation_factors(
         return Err(PricingError::InvalidParameter(
             "predictors contain non-finite value",
         ));
-    }
-    if n_features == 1 {
-        return Ok(vec![1.0]);
     }
 
     let nf = n_samples as f64;
@@ -355,13 +376,16 @@ pub fn variance_inflation_factors(
             stds[j] += d * d;
         }
     }
-    for s in &mut stds {
+    for (s, &mean) in stds.iter_mut().zip(means.iter()) {
         *s = (*s).sqrt();
-        if *s <= 1e-14 {
+        if *s <= 1e-14 * mean.abs().max(1.0) {
             return Err(PricingError::SingularMatrix(
                 "constant predictor column encountered in VIF (exclude intercept column)",
             ));
         }
+    }
+    if n_features == 1 {
+        return Ok(vec![1.0]);
     }
 
     let mut corr = vec![0.0; n_features * n_features];

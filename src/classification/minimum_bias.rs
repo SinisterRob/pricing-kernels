@@ -1,3 +1,6 @@
+//! Bailey (1963) balance-principle and Bailey–Simon (1960) chi-squared minimum bias
+//! classification ratemaking solvers.
+
 use crate::error::{PricingError, SolverOptions};
 use serde::{Deserialize, Serialize};
 
@@ -96,7 +99,7 @@ pub struct MinimumBiasResult {
     pub base_rate: f64,
     /// Number of iterations until convergence.
     pub iterations: usize,
-    /// Final absolute maximum difference across normalized relativities between the last two iterations.
+    /// Final maximum change across normalized relativities and relative `base_rate` between the last two iterations.
     pub max_diff: f64,
     /// Weighted Chi-squared goodness-of-fit diagnostic: `sum_ij P_ij * (A_ij - fitted_ij)^2 / fitted_ij`.
     pub chi_squared: f64,

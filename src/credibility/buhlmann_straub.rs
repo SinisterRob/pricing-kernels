@@ -1,3 +1,5 @@
+//! Non-parametric Bühlmann–Straub (1970) empirical Bayes credibility for heterogeneous risk groups.
+
 use crate::error::PricingError;
 use serde::{Deserialize, Serialize};
 
@@ -103,9 +105,15 @@ pub fn buhlmann_straub(
         .sum::<f64>()
         / total_weight;
 
-    // c = P - (sum_i P_i^2) / P
-    let sum_p_sq: f64 = group_total_weights.iter().map(|&w| w * w).sum();
-    let c = total_weight - (sum_p_sq / total_weight);
+    // c = P * (1 - sum_i (P_i / P)^2) avoids intermediate w^2 overflow for large exposures.
+    let sum_rel_sq: f64 = group_total_weights
+        .iter()
+        .map(|&w| {
+            let r = w / total_weight;
+            r * r
+        })
+        .sum();
+    let c = total_weight * (1.0 - sum_rel_sq);
 
     // Unbiased estimator of VHM:
     // a = (1 / c) * [ sum_i P_i * (X_bar_i - mu)^2 - (n_groups - 1) * s^2 ]

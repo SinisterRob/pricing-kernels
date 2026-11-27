@@ -43,7 +43,8 @@ pub struct HachemeisterResult {
 #[inline]
 fn invert_2x2(m: [f64; 4]) -> Result<[f64; 4], PricingError> {
     let det = m[0] * m[3] - m[1] * m[2];
-    if !det.is_finite() || det.abs() <= 1e-18 {
+    let scale = (m[0] * m[3]).abs().max((m[1] * m[2]).abs());
+    if !det.is_finite() || det.abs() <= 1e-14 * scale.max(1e-30) {
         return Err(PricingError::SingularMatrix(
             "2x2 normal matrix is singular in Hachemeister regression credibility",
         ));
@@ -77,7 +78,7 @@ fn mat_vec_2x2(m: [f64; 4], v: [f64; 2]) -> [f64; 2] {
 fn project_psd_2x2(a: f64, b: f64, d: f64) -> [f64; 4] {
     let tr = a + d;
     let diff = a - d;
-    let disc = (diff * diff + 4.0 * b * b).sqrt();
+    let disc = diff.hypot(2.0 * b);
     let l1 = f64::midpoint(tr, disc);
     let l2 = 0.5 * (tr - disc);
     if l2 >= 0.0 {
@@ -221,9 +222,12 @@ pub fn hachemeister_credibility(
     let vhm = project_psd_2x2(a00, a01, a11);
 
     let mut groups = Vec::with_capacity(k);
+    let vhm_is_zero = vhm.iter().all(|&v| v == 0.0);
     for i in 0..k {
         let z_mat = if epv == 0.0 {
             [1.0, 0.0, 0.0, 1.0]
+        } else if vhm_is_zero {
+            [0.0, 0.0, 0.0, 0.0]
         } else {
             let cov_total = [
                 vhm[0] + epv * xtwx_inv_list[i][0],

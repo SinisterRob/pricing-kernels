@@ -74,6 +74,13 @@ impl MbbefdCurve {
         Ok(Self { b, g })
     }
 
+    #[inline]
+    fn swiss_re_bg(c: f64) -> (f64, f64) {
+        let b = (3.1 - 0.15 * (1.0 + c) * c).exp();
+        let g = ((0.78 + 0.12 * c) * c).exp();
+        (b, g)
+    }
+
     /// Construct an MBBEFD exposure curve from the Swiss Re continuous parameter `c >= 0`
     /// using Bernegger (1997) equation (4.1):
     /// - `b(c) = exp(3.1 - 0.15 * (1 + c) * c)`
@@ -84,16 +91,13 @@ impl MbbefdCurve {
                 "Swiss Re parameter c must be finite and non-negative",
             ));
         }
-        let b = (3.1 - 0.15 * (1.0 + c) * c).exp();
-        let g = ((0.78 + 0.12 * c) * c).exp();
+        let (b, g) = Self::swiss_re_bg(c);
         Self::new(b, g)
     }
 
     /// Construct one of the canonical Swiss Re preset curves (`Y1`–`Y4`, `Lloyds`).
     pub fn from_preset(preset: SwissReCurve) -> Self {
-        let c = preset.c_parameter();
-        let b = (3.1 - 0.15 * (1.0 + c) * c).exp();
-        let g = ((0.78 + 0.12 * c) * c).exp();
+        let (b, g) = Self::swiss_re_bg(preset.c_parameter());
         Self { b, g }
     }
 
@@ -184,7 +188,13 @@ impl MbbefdCurve {
 
         let bx = b.powf(x);
         let denom = (g - 1.0) * b + (1.0 - bg) * bx;
-        Ok(((1.0 - b) * bx / denom).clamp(0.0, 1.0))
+        let s = (1.0 - b) * bx / denom;
+        if !s.is_finite() {
+            return Err(PricingError::OutOfBounds(
+                "MBBEFD survival calculation overflowed or became undefined",
+            ));
+        }
+        Ok(s.clamp(0.0, 1.0))
     }
 
     /// Expected normalized loss `E[X] = 1 / G'(0)` on `[0, 1]`.
@@ -203,7 +213,13 @@ impl MbbefdCurve {
         if (bg - 1.0).abs() <= 1e-12 {
             return Ok((b - 1.0) / b.ln());
         }
-        Ok(((1.0 - b) * bg.ln()) / ((1.0 - bg) * b.ln()))
+        let mean = ((1.0 - b) * bg.ln()) / ((1.0 - bg) * b.ln());
+        if !mean.is_finite() {
+            return Err(PricingError::OutOfBounds(
+                "MBBEFD mean loss ratio overflowed or became undefined",
+            ));
+        }
+        Ok(mean)
     }
 
     /// Probability of a total loss (`X = 1`), equal to `1 / g`.

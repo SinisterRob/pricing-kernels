@@ -173,18 +173,21 @@ impl AggregateLossDistribution {
             return Err(PricingError::EmptyInput("pmf must not be empty"));
         }
         let mut mean = 0.0;
-        let mut m2 = 0.0;
         for (k, &p) in pmf.iter().enumerate() {
-            if !p.is_finite() {
+            if !p.is_finite() || !(p >= 0.0) {
                 return Err(PricingError::InvalidParameter(
-                    "pmf contains non-finite probability",
+                    "pmf probabilities must be finite and non-negative",
                 ));
             }
             let x = (k as f64) * step;
             mean += p * x;
-            m2 += p * x * x;
         }
-        let variance = (m2 - mean * mean).max(0.0);
+        let mut variance = 0.0;
+        for (k, &p) in pmf.iter().enumerate() {
+            let diff = (k as f64) * step - mean;
+            variance += p * diff * diff;
+        }
+        let variance = variance.max(0.0);
         Ok(Self {
             step,
             pmf,
@@ -473,6 +476,11 @@ pub fn fft_aggregate_loss(
             "tilt parameter must be finite and non-negative",
         ));
     }
+    if theta * (fft_size as f64) > 700.0 {
+        return Err(PricingError::OutOfBounds(
+            "tilt * fft_size exceeds safe exponential range (700.0)",
+        ));
+    }
 
     let mut re = vec![0.0; fft_size];
     let mut im = vec![0.0; fft_size];
@@ -495,12 +503,12 @@ pub fn fft_aggregate_loss(
     radix2_fft(&mut re, &mut im, true)?;
 
     for (k, val) in re.iter_mut().enumerate() {
-        let untitled = if theta == 0.0 {
+        let untilted = if theta == 0.0 {
             *val
         } else {
             *val * (theta * (k as f64)).exp()
         };
-        *val = untitled.max(0.0);
+        *val = untilted.max(0.0);
     }
 
     AggregateLossDistribution::from_pmf(step, re)
@@ -523,8 +531,13 @@ pub fn convolve_independent_aggregates(
         ));
     }
     let step = components[0].step;
+    if !step.is_finite() || !(step > 0.0) {
+        return Err(PricingError::NonPositiveValue(
+            "aggregate component grid step must be finite and positive",
+        ));
+    }
     for comp in components {
-        if (comp.step - step).abs() > 1e-12 * step.max(1.0) {
+        if !comp.step.is_finite() || (comp.step - step).abs() > 1e-12 * step.max(1.0) {
             return Err(PricingError::DimensionMismatch(
                 "all aggregate components must share the same grid step",
             ));

@@ -4,9 +4,10 @@
 //! doctests, and benchmarks without external file I/O.
 
 use crate::experience::{ExperienceClaim, NcciErpSpecification, RetroPlanSpec};
+use serde::{Deserialize, Serialize};
 
 /// Bailey (1963) / Brown (1988) 3x2 commercial classification grid.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ClassificationGridDataset {
     /// Number of row classes.
     pub n_rows: usize,
@@ -30,7 +31,7 @@ pub fn commercial_classification_grid() -> ClassificationGridDataset {
 }
 
 /// NCCI Workers' Compensation Experience Rating worksheet benchmark.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct NcciWorksheetDataset {
     /// Plan parameters (split point, expected losses, D-ratio, W, B, ERA).
     pub spec: NcciErpSpecification,
@@ -73,7 +74,7 @@ pub fn ncci_erp_worksheet() -> NcciWorksheetDataset {
 }
 
 /// Discrete entry-ratio distribution and balanced retrospective rating plan fixture.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RetroBenchmarkDataset {
     /// Discrete aggregate entry ratios `r_k` with mean `1.0`.
     pub entry_ratios: Vec<f64>,
@@ -102,7 +103,7 @@ pub fn retro_plan_benchmark() -> RetroBenchmarkDataset {
 }
 
 /// Non-parametric Bühlmann–Straub credibility worked example (3 risk groups, 3 periods each).
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct BuhlmannStraubDataset {
     /// Per-group loss rates `X_{ij}`.
     pub group_losses: Vec<Vec<f64>>,

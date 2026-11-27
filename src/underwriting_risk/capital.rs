@@ -61,7 +61,7 @@ pub fn sample_var(samples: &[f64], alpha: f64) -> Result<f64, PricingError> {
     }
     let mut sorted = samples.to_vec();
     sorted.sort_by(f64::total_cmp);
-    let idx = ((alpha * (sorted.len() as f64)).ceil() as usize)
+    let idx = ((alpha * (sorted.len() as f64) - 1e-15).ceil() as usize)
         .saturating_sub(1)
         .min(sorted.len() - 1);
     Ok(sorted[idx])

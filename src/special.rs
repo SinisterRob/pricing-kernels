@@ -1,0 +1,356 @@
+//! Pure-Rust special mathematical functions shared across pricing and capital kernels.
+//!
+//! Includes Cody (1969) `erfc` / standard normal CDF, Acklam inverse normal CDF,
+//! Lanczos `ln Γ(z)`, regularized incomplete gamma `P(a, x)`, and regularized
+//! incomplete beta `I_x(a, b)`.
+
+/// High-accuracy standard normal CDF `Φ(z)` via Cody (1969) rational `erfc`
+/// approximation (max absolute error `< 1e-15`).
+pub(crate) fn normal_cdf_exact(z: f64) -> f64 {
+    0.5 * erfc_approx(-z / std::f64::consts::SQRT_2)
+}
+
+/// Complementary error function `erfc(x)` accurate to ~1e-15 (Cody 1969).
+fn erfc_approx(x: f64) -> f64 {
+    if x.is_nan() {
+        return f64::NAN;
+    }
+    if x < 0.0 {
+        return 2.0 - erfc_approx(-x);
+    }
+    if x < 0.46875 {
+        const A: [f64; 5] = [
+            3.161_123_743_870_565_6e0,
+            1.138_641_541_510_501_6e2,
+            3.774_852_376_853_02e2,
+            3.209_377_589_138_469_5e3,
+            1.857_777_061_846_031_5e-1,
+        ];
+        const B: [f64; 4] = [
+            2.360_129_095_234_412_1e1,
+            2.440_246_379_344_441_7e2,
+            1.282_616_526_077_372_3e3,
+            2.844_236_833_439_171e3,
+        ];
+        let y = x * x;
+        let num = (((A[4] * y + A[0]) * y + A[1]) * y + A[2]) * y + A[3];
+        let den = (((y + B[0]) * y + B[1]) * y + B[2]) * y + B[3];
+        1.0 - x * num / den
+    } else if x <= 4.0 {
+        const C: [f64; 9] = [
+            5.641_884_969_886_701e-1,
+            8.883_149_794_388_375,
+            6.611_919_063_714_163e1,
+            2.986_351_381_974_001e2,
+            8.819_522_212_417_69e2,
+            1.712_047_612_634_070_6e3,
+            2.051_078_377_826_071_5e3,
+            1.230_339_354_797_997_2e3,
+            2.153_115_354_744_038_5e-8,
+        ];
+        const D: [f64; 8] = [
+            1.574_492_611_070_983_5e1,
+            1.176_939_508_913_125e2,
+            5.371_811_018_620_099e2,
+            1.621_389_574_566_690_2e3,
+            3.290_799_235_733_459_6e3,
+            4.362_619_090_143_247e3,
+            3.439_367_674_143_721_6e3,
+            1.230_339_354_803_749_4e3,
+        ];
+        let num = (((((((C[8] * x + C[0]) * x + C[1]) * x + C[2]) * x + C[3]) * x + C[4]) * x
+            + C[5])
+            * x
+            + C[6])
+            * x
+            + C[7];
+        let den = (((((((x + D[0]) * x + D[1]) * x + D[2]) * x + D[3]) * x + D[4]) * x + D[5]) * x
+            + D[6])
+            * x
+            + D[7];
+        (-x * x).exp() * num / den
+    } else if x < 26.5 {
+        const P: [f64; 6] = [
+            3.053_266_349_612_323_4e-1,
+            3.603_448_999_498_044_4e-1,
+            1.257_817_261_112_292_5e-1,
+            1.608_378_514_874_228e-2,
+            6.587_491_615_298_378e-4,
+            1.631_538_713_730_209_8e-2,
+        ];
+        const Q: [f64; 5] = [
+            2.568_520_192_289_822,
+            1.872_952_849_923_460_5e0,
+            5.279_051_029_514_285e-1,
+            6.051_834_131_244_132e-2,
+            2.335_204_976_268_691_9e-3,
+        ];
+        let y = 1.0 / (x * x);
+        let num = ((((P[5] * y + P[0]) * y + P[1]) * y + P[2]) * y + P[3]) * y + P[4];
+        let den = ((((y + Q[0]) * y + Q[1]) * y + Q[2]) * y + Q[3]) * y + Q[4];
+        let inv_sqrt_pi = std::f64::consts::FRAC_2_SQRT_PI * 0.5;
+        (-x * x).exp() / x * (inv_sqrt_pi - y * num / den)
+    } else {
+        0.0
+    }
+}
+
+/// High-accuracy inverse standard normal CDF `Φ⁻¹(p)` for `p in (0, 1)`
+/// via Acklam rational approximation refined with one Newton-Raphson step (`< 1e-15`).
+pub(crate) fn normal_inv_cdf(p: f64) -> f64 {
+    const A: [f64; 6] = [
+        -3.969_683_028_665_376e1,
+        2.209_460_984_245_205e2,
+        -2.759_285_104_469_687e2,
+        1.383_577_518_672_69e2,
+        -3.066_479_806_614_716e1,
+        2.506_628_277_459_239,
+    ];
+    const B: [f64; 5] = [
+        -5.447_609_879_822_406e1,
+        1.615_858_368_580_409e2,
+        -1.556_989_798_598_866e2,
+        6.680_131_188_771_972e1,
+        -1.328_068_155_288_572e1,
+    ];
+    const C: [f64; 6] = [
+        -7.784_894_002_430_293e-3,
+        -3.223_964_580_411_365e-1,
+        -2.400_758_277_161_838,
+        -2.549_732_539_343_734,
+        4.374_664_141_464_968,
+        2.938_163_982_698_783,
+    ];
+    const D: [f64; 4] = [
+        7.784_695_709_041_462e-3,
+        3.224_671_290_700_398e-1,
+        2.445_134_137_142_996,
+        3.754_408_661_907_416,
+    ];
+
+    if p.is_nan() {
+        return f64::NAN;
+    }
+    let p = p.clamp(1e-300, 1.0 - 1e-16);
+    let p_low = 0.02425;
+    let p_high = 1.0 - p_low;
+
+    let mut x = if p < p_low {
+        let q = (-2.0 * p.ln()).sqrt();
+        (((((C[0] * q + C[1]) * q + C[2]) * q + C[3]) * q + C[4]) * q + C[5])
+            / ((((D[0] * q + D[1]) * q + D[2]) * q + D[3]) * q + 1.0)
+    } else if p <= p_high {
+        let q = p - 0.5;
+        let r = q * q;
+        (((((A[0] * r + A[1]) * r + A[2]) * r + A[3]) * r + A[4]) * r + A[5]) * q
+            / (((((B[0] * r + B[1]) * r + B[2]) * r + B[3]) * r + B[4]) * r + 1.0)
+    } else {
+        let q = (-2.0 * (1.0 - p).ln()).sqrt();
+        -(((((C[0] * q + C[1]) * q + C[2]) * q + C[3]) * q + C[4]) * q + C[5])
+            / ((((D[0] * q + D[1]) * q + D[2]) * q + D[3]) * q + 1.0)
+    };
+
+    // One Newton-Raphson refinement step using exact Cody normal CDF.
+    let err = normal_cdf_exact(x) - p;
+    let pdf = (-0.5 * x * x).exp() / std::f64::consts::TAU.sqrt();
+    if pdf > 1e-300 {
+        x -= err / pdf;
+    }
+    x
+}
+
+/// High-accuracy `ln Γ(z)` for `z > 0` via the 9-term Lanczos approximation (`g = 7`).
+pub(crate) fn ln_gamma(z: f64) -> f64 {
+    const COEFFS: [f64; 9] = [
+        0.999_999_999_999_809_9,
+        676.520_368_121_885_1,
+        -1_259.139_216_722_402_8,
+        771.323_428_777_653_1,
+        -176.615_029_162_140_6,
+        12.507_343_278_686_905,
+        -0.138_571_095_265_720_12,
+        9.984_369_578_019_572e-6,
+        1.505_632_735_149_311_6e-7,
+    ];
+    if !z.is_finite() || z <= 0.0 {
+        return f64::NAN;
+    }
+    let z = z - 1.0;
+    let mut x = COEFFS[0];
+    for (i, &c) in COEFFS.iter().enumerate().skip(1) {
+        x += c / (z + i as f64);
+    }
+    let t = z + 7.5;
+    0.5 * std::f64::consts::TAU.ln() + (z + 0.5) * t.ln() - t + x.ln()
+}
+
+/// Regularized lower incomplete gamma `P(a, x) = γ(a, x) / Γ(a)` for `a > 0, x >= 0`.
+pub(crate) fn gamma_p(a: f64, x: f64) -> f64 {
+    if a.is_nan() || x.is_nan() || a <= 0.0 {
+        return f64::NAN;
+    }
+    if x <= 0.0 {
+        return 0.0;
+    }
+    if x.is_infinite() {
+        return 1.0;
+    }
+    if x < a + 1.0 {
+        // Series representation: P(a, x) = e^{-x} x^a sum_{n=0}^∞ x^n / Γ(a + n + 1).
+        let max_iter = 2_000_usize
+            .max((12.0 * a.sqrt()).ceil() as usize)
+            .min(50_000);
+        let mut ap = a;
+        let mut term = 1.0 / a;
+        let mut sum = term;
+        for _ in 0..max_iter {
+            ap += 1.0;
+            term *= x / ap;
+            sum += term;
+            if term.abs() <= sum.abs() * 1e-15 {
+                break;
+            }
+        }
+        (sum * (-x + a * x.ln() - ln_gamma(a)).exp()).clamp(0.0, 1.0)
+    } else {
+        (1.0 - gamma_q_cf(a, x)).clamp(0.0, 1.0)
+    }
+}
+
+/// Regularized upper incomplete gamma `Q(a, x) = 1 - P(a, x)` via modified Lentz
+/// continued fraction for `x >= a + 1`.
+fn gamma_q_cf(a: f64, x: f64) -> f64 {
+    const TINY: f64 = 1e-300;
+    let max_iter = 2_000_usize
+        .max((12.0 * a.sqrt()).ceil() as usize)
+        .min(50_000);
+    let mut b = x + 1.0 - a;
+    let mut c = 1.0 / TINY;
+    let mut d = 1.0 / b;
+    let mut h = d;
+    for i in 1..=max_iter {
+        let fi = i as f64;
+        let an = -fi * (fi - a);
+        b += 2.0;
+        d = an * d + b;
+        if d.abs() < TINY {
+            d = TINY;
+        }
+        c = b + an / c;
+        if c.abs() < TINY {
+            c = TINY;
+        }
+        d = 1.0 / d;
+        let del = d * c;
+        h *= del;
+        if (del - 1.0).abs() <= 1e-15 {
+            break;
+        }
+    }
+    ((-x + a * x.ln() - ln_gamma(a)).exp() * h).clamp(0.0, 1.0)
+}
+
+/// Regularized incomplete beta function `I_x(a, b)` via modified Lentz continued fraction.
+pub(crate) fn regularized_incomplete_beta(x: f64, a: f64, b: f64) -> f64 {
+    if x.is_nan() || a.is_nan() || b.is_nan() || a <= 0.0 || b <= 0.0 {
+        return f64::NAN;
+    }
+    if x <= 0.0 {
+        return 0.0;
+    }
+    if x >= 1.0 {
+        return 1.0;
+    }
+    let ln_bt = ln_gamma(a + b) - ln_gamma(a) - ln_gamma(b) + a * x.ln() + b * (1.0 - x).ln();
+    let bt = ln_bt.exp();
+    if x < (a + 1.0) / (a + b + 2.0) {
+        (bt * betacf(x, a, b) / a).clamp(0.0, 1.0)
+    } else {
+        (1.0 - bt * betacf(1.0 - x, b, a) / b).clamp(0.0, 1.0)
+    }
+}
+
+fn betacf(x: f64, a: f64, b: f64) -> f64 {
+    const EPS: f64 = 3.0e-15;
+    const FPMIN: f64 = 1.0e-300;
+    let max_iter = 2_000_usize
+        .max((12.0 * (a + b).sqrt()).ceil() as usize)
+        .min(50_000);
+
+    let qab = a + b;
+    let qap = a + 1.0;
+    let qam = a - 1.0;
+    let mut c = 1.0;
+    let mut d = 1.0 - qab * x / qap;
+    if d.abs() < FPMIN {
+        d = FPMIN;
+    }
+    d = 1.0 / d;
+    let mut h = d;
+
+    for m in 1..=max_iter {
+        let mf = m as f64;
+        let m2 = 2.0 * mf;
+        let aa = mf * (b - mf) * x / ((qam + m2) * (a + m2));
+        d = 1.0 + aa * d;
+        if d.abs() < FPMIN {
+            d = FPMIN;
+        }
+        c = 1.0 + aa / c;
+        if c.abs() < FPMIN {
+            c = FPMIN;
+        }
+        d = 1.0 / d;
+        h *= d * c;
+
+        let aa = -(a + mf) * (qab + mf) * x / ((a + m2) * (qap + m2));
+        d = 1.0 + aa * d;
+        if d.abs() < FPMIN {
+            d = FPMIN;
+        }
+        c = 1.0 + aa / c;
+        if c.abs() < FPMIN {
+            c = FPMIN;
+        }
+        d = 1.0 / d;
+        let del = d * c;
+        h *= del;
+        if (del - 1.0).abs() < EPS {
+            break;
+        }
+    }
+    h
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn normal_cdf_and_inv_roundtrip() {
+        for &p in &[1e-6, 0.01, 0.25, 0.5, 0.75, 0.99, 1.0 - 1e-6] {
+            let z = normal_inv_cdf(p);
+            let p2 = normal_cdf_exact(z);
+            assert!((p2 - p).abs() < 1e-13, "p={p}, z={z}, p2={p2}");
+        }
+        assert!(normal_cdf_exact(f64::NAN).is_nan());
+        assert!(normal_inv_cdf(f64::NAN).is_nan());
+    }
+
+    #[test]
+    fn gamma_p_converges_for_large_shape() {
+        // For Gamma(a = 10_000, scale = 1), P(a, a) ≈ 0.5 + 1 / (3 * sqrt(2 * pi * a)) ≈ 0.50133
+        let p = gamma_p(10_000.0, 10_000.0);
+        assert!((p - 0.501_330).abs() < 1e-4, "p={p}");
+        assert!(gamma_p(1.0, f64::NAN).is_nan());
+        assert!(ln_gamma(0.0).is_nan());
+    }
+
+    #[test]
+    fn incomplete_beta_converges_for_large_params() {
+        // Symmetric Beta(5_000, 5_000) has exact median 0.5 (ln_bt subtracts ~8e4, so ~1e-11 floor).
+        let cdf = regularized_incomplete_beta(0.5, 5_000.0, 5_000.0);
+        assert!((cdf - 0.5).abs() < 1e-10, "cdf={cdf}");
+        assert!(regularized_incomplete_beta(f64::NAN, 2.0, 2.0).is_nan());
+    }
+}

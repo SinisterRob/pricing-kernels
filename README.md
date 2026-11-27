@@ -10,10 +10,10 @@
   <a href="https://crates.io/crates/pricing-kernels"><img src="https://img.shields.io/crates/v/pricing-kernels?style=flat" alt="Crates.io" /></a>
   <a href="https://docs.rs/pricing-kernels"><img src="https://img.shields.io/docsrs/pricing-kernels?style=flat" alt="docs.rs" /></a>
   <a href="https://github.com/SinisterRob/pricing-kernels/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/SinisterRob/pricing-kernels/ci.yml?branch=main&label=CI&style=flat" alt="CI" /></a>
-  <a href="Cargo.toml"><img src="https://img.shields.io/badge/Rust-1.97%2B-f97316?style=flat" alt="Rust 1.97+" /></a>
+  <a href="https://github.com/SinisterRob/pricing-kernels/blob/main/Cargo.toml"><img src="https://img.shields.io/badge/Rust-1.97%2B-f97316?style=flat" alt="Rust 1.97+" /></a>
   <a href="#license"><img src="https://img.shields.io/badge/license-MIT%20%2F%20Apache--2.0-30363d?style=flat" alt="License: MIT or Apache-2.0" /></a>
-  <a href="src/lib.rs"><img src="https://img.shields.io/badge/unsafe-forbidden-30363d?style=flat" alt="No unsafe code" /></a>
-  <a href="Cargo.toml"><img src="https://img.shields.io/badge/deps-serde%20only-30363d?style=flat" alt="Dependencies: serde only" /></a>
+  <a href="https://github.com/SinisterRob/pricing-kernels/blob/main/src/lib.rs"><img src="https://img.shields.io/badge/unsafe-forbidden-30363d?style=flat" alt="No unsafe code" /></a>
+  <a href="https://github.com/SinisterRob/pricing-kernels/blob/main/Cargo.toml"><img src="https://img.shields.io/badge/deps-serde%20only-30363d?style=flat" alt="Dependencies: serde only" /></a>
   <a href="#building-and-testing"><img src="https://img.shields.io/badge/target-wasm32-30363d?style=flat" alt="WebAssembly target" /></a>
 </p>
 
@@ -21,24 +21,24 @@
   <a href="#performance">Performance</a> &nbsp;·&nbsp;
   <a href="#quick-start">Quick Start</a> &nbsp;·&nbsp;
   <a href="#building-and-testing">Build &amp; Test</a> &nbsp;·&nbsp;
-  <a href="docs/SOURCES.md">Literature</a> &nbsp;·&nbsp;
+  <a href="https://github.com/SinisterRob/pricing-kernels/blob/main/docs/SOURCES.md">Literature</a> &nbsp;·&nbsp;
   <a href="https://github.com/SinisterRob/reserving-kernels">reserving-kernels</a>
 </p>
 
 ---
 
-`pricing-kernels` covers prospective commercial-lines ratemaking (classification, credibility, experience rating, ILFs, retrospective plans, large deductibles), treaty reinsurance pricing (MBBEFD exposure curves, burning cost, reinstatements, sliding-scale & profit commissions), and the **underwriting risk** module of capital modeling. Every method is implemented from peer-reviewed actuarial literature ([`docs/SOURCES.md`](docs/SOURCES.md)) and verified against published benchmark problems ([`tests/source_benchmarks.rs`](tests/source_benchmarks.rs)). Standalone sister crate to [`reserving-kernels`](https://github.com/SinisterRob/reserving-kernels) (retrospective loss development and reserve risk).
+`pricing-kernels` covers prospective commercial-lines ratemaking (classification, credibility, experience rating, ILFs, retrospective plans, large deductibles), treaty reinsurance pricing (MBBEFD exposure curves, burning cost, reinstatements, sliding-scale & profit commissions), and the **underwriting risk** module of capital modeling. Every method is implemented from peer-reviewed actuarial literature ([`docs/SOURCES.md`](https://github.com/SinisterRob/pricing-kernels/blob/main/docs/SOURCES.md)) and verified against published benchmark problems ([`tests/source_benchmarks.rs`](https://github.com/SinisterRob/pricing-kernels/blob/main/tests/source_benchmarks.rs)). Standalone sister crate to [`reserving-kernels`](https://github.com/SinisterRob/reserving-kernels) (retrospective loss development and reserve risk).
 
 ## Implemented Modules
 
 | Area | Modules | Capabilities |
 | --- | --- | --- |
-| **Classification & Scoring** | `classification::{minimum_bias, irls_glm, diagnostics, scoring}` | Bailey (1963) & Bailey–Simon (1960) minimum bias, Poisson / Quasi-Poisson / Gamma / Tweedie / NegBin / Logistic / InvGauss IRLS GLMs + Ridge penalty + Tweedie power selection, Gini/Lorenz/double-lift/AIC/BIC/VIF diagnostics, zero-alloc `MultiplicativeRater` |
+| **Classification & Scoring** | `classification::{minimum_bias, irls_glm, diagnostics, scoring}` | `RatingTable` Bailey (1963) & Bailey–Simon (1960) minimum bias, `DesignMatrix` / `GlmFit` Householder-QR IRLS GLMs (Poisson, Quasi-Poisson, Gamma, Tweedie, NegBin, Logistic, InvGauss) + Ridge penalty + Tweedie power selection, Gini/Lorenz/double-lift/AIC/BIC/VIF diagnostics, zero-alloc `MultiplicativeRater` |
 | **Credibility** | `credibility::{classical, buhlmann_straub, hachemeister}` | Longley-Cook limited-fluctuation credibility, non-parametric Bühlmann–Straub credibility, Hachemeister (1975) regression trend credibility |
 | **Experience, Retro & Deductibles** | `experience::{ncci_erp, iso_erp, table_m, table_l, retrospective, deductible}` | NCCI WC ERP & off-balance, ISO Commercial ERP & bounded IRPM schedule rating, Lee (1988) Table M, Skurnick (1974) Table L, balanced retro solvers, large deductibles (ALAE inside/pro-rata/outside + aggregate caps) |
-| **Severity, ILFs & Reinsurance** | `layers::{ilf, mbbefd, reinsurance}` | 6 parametric severity families (LEV/ILF/LER/excess), `CommercialLayer`, Bernegger (1997) MBBEFD / Swiss Re `Y1`–`Lloyds` exposure curves, Clark (2014) burning cost, Sundt (1991) reinstatements, sliding-scale / corridor / profit commissions |
-| **Trending & On-Leveling** | `trending::{parallelogram, trend}` | Exact multi-change Calendar-Year earned parallelogram (annual & arbitrary policy terms) & Policy-Year written on-leveling, single-step & two-step exponential trending |
-| **Underwriting-Risk Capital** | `underwriting_risk::{aggregate, catastrophe, risk_load, capital}` | Panjer `(a, b, 0)` & tilted radix-2 FFT aggregate risk, Cat ELT OEP/AEP/PML, Wang / PH / Kreps / RMK risk loads, Euler & Myers–Read capital allocation |
+| **Severity, ILFs & Reinsurance** | `layers::{ilf, mbbefd, reinsurance}` | 8 parametric severity families incl. Gamma & Spliced Gamma–Pareto (LEV/ILF/LER/excess), `CommercialLayer` & `LayerTower` (`tower!`), Bernegger (1997) MBBEFD / Swiss Re `Y1`–`Lloyds` exposure curves, Clark (2014) burning cost, Sundt (1991) reinstatements, sliding-scale / corridor / profit commissions |
+| **Trending & On-Leveling** | `trending::{parallelogram, trend}` | Exact multi-change Calendar-Year earned parallelogram (annual & arbitrary policy terms) & Policy-Year written on-leveling (`rate_changes!`), single-step & two-step exponential trending |
+| **Underwriting-Risk Capital** | `underwriting_risk::{aggregate, catastrophe, risk_load, capital}` | Panjer `(a, b, 0)` & tilted radix-2 FFT aggregate risk, `EventLossTable` Cat ELT OEP/AEP/PML, Wang / PH / Kreps / RMK risk loads, Euler & Myers–Read capital allocation |
 | **Fixtures & WASM** | `datasets`, `wasm_exports` (`--features wasm`) | Zero-I/O CAS Exam 5/8 benchmark fixtures, single-threaded `wasm32` C-ABI exports |
 
 ## Why `pricing-kernels`?
@@ -195,4 +195,4 @@ cargo build --release --target wasm32-unknown-unknown --features wasm
 
 ## License
 
-Licensed under either of [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE) at your option.
+Licensed under either of [MIT](https://github.com/SinisterRob/pricing-kernels/blob/main/LICENSE-MIT) or [Apache-2.0](https://github.com/SinisterRob/pricing-kernels/blob/main/LICENSE-APACHE) at your option.

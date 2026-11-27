@@ -11,7 +11,6 @@
 //! invoke them concurrently from multiple threads on native targets.
 
 #![allow(unsafe_code)]
-#![allow(missing_docs)]
 
 use crate::credibility::ClassicalCredibility;
 use crate::experience::{ExperienceClaim, NcciErpSpecification, calculate_ncci_experience_mod};
@@ -104,9 +103,6 @@ pub extern "C" fn pk_mbbefd_layer_factor(c: f64, attachment: f64, limit: f64, mp
 /// Evaluate classical limited-fluctuation credibility weight `Z` for given full-credibility standard.
 #[unsafe(no_mangle)]
 pub extern "C" fn pk_classical_credibility(full_standard: f64, observed_volume: f64) -> f64 {
-    if !full_standard.is_finite() || !(full_standard > 0.0) || !observed_volume.is_finite() {
-        return f64::NAN;
-    }
     ClassicalCredibility {
         full_credibility_standard: full_standard,
     }
@@ -129,6 +125,8 @@ pub extern "C" fn pk_parallelogram_olf(
 
 /// Compute NCCI Experience Modification Factor from the first `n_claims` entries
 /// populated in `pk_claim_amounts_ptr` and `pk_claim_med_only_ptr`.
+///
+/// Returns `f64::NAN` if `n_claims > pk_max_claims()` or if any parameter is invalid.
 #[unsafe(no_mangle)]
 pub extern "C" fn pk_ncci_experience_mod(
     split_point: f64,
@@ -139,12 +137,18 @@ pub extern "C" fn pk_ncci_experience_mod(
     apply_era: u32,
     n_claims: u32,
 ) -> f64 {
-    let count = (n_claims as usize).min(MAX_CLAIMS);
+    let count = n_claims as usize;
+    if count > MAX_CLAIMS {
+        return f64::NAN;
+    }
     let mut claims = Vec::with_capacity(count);
+    let amounts_ptr = core::ptr::addr_of!(CLAIM_AMOUNTS).cast::<f64>();
+    let med_ptr = core::ptr::addr_of!(CLAIM_MED_ONLY).cast::<u8>();
     for i in 0..count {
         // SAFETY: Single-threaded WASM host; `i < count <= MAX_CLAIMS` stays within
         // the static scratch buffers initialized to valid `f64` / `u8` values.
-        let (incurred, med_only) = unsafe { (CLAIM_AMOUNTS[i], CLAIM_MED_ONLY[i] != 0) };
+        let (incurred, med_only) =
+            unsafe { (amounts_ptr.add(i).read(), med_ptr.add(i).read() != 0) };
         claims.push(ExperienceClaim {
             incurred,
             is_medical_only: med_only,
