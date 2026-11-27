@@ -11,6 +11,8 @@ readme = "README.md"
 keywords = ["actuarial", "pricing", "commercial-lines", "experience-rating", "glm"]
 categories = ["mathematics", "science", "simulation"]
 
+publish = false
+
 [lib]
 name = "pricing_kernels"
 path = "src/lib.rs"
