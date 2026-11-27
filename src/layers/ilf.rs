@@ -92,6 +92,105 @@ fn erfc_approx(x: f64) -> f64 {
     }
 }
 
+/// High-accuracy `ln Γ(z)` for `z > 0` via the 9-term Lanczos approximation (`g = 7`).
+pub(crate) fn ln_gamma(z: f64) -> f64 {
+    const COEFFS: [f64; 9] = [
+        0.999_999_999_999_809_9,
+        676.520_368_121_885_1,
+        -1_259.139_216_722_402_8,
+        771.323_428_777_653_1,
+        -176.615_029_162_140_6,
+        12.507_343_278_686_905,
+        -0.138_571_095_265_720_12,
+        9.984_369_578_019_572e-6,
+        1.505_632_735_149_311_6e-7,
+    ];
+    let z = z - 1.0;
+    let mut x = COEFFS[0];
+    for (i, &c) in COEFFS.iter().enumerate().skip(1) {
+        x += c / (z + i as f64);
+    }
+    let t = z + 7.5;
+    0.5 * std::f64::consts::TAU.ln() + (z + 0.5) * t.ln() - t + x.ln()
+}
+
+/// Regularized lower incomplete gamma `P(a, x) = γ(a, x) / Γ(a)` for `a > 0, x >= 0`.
+pub(crate) fn gamma_p(a: f64, x: f64) -> f64 {
+    if !(x > 0.0) {
+        return 0.0;
+    }
+    if x < a + 1.0 {
+        // Series representation: P(a, x) = e^{-x} x^a sum_{n=0}^\infty x^n / Γ(a + n + 1).
+        let mut ap = a;
+        let mut term = 1.0 / a;
+        let mut sum = term;
+        for _ in 0..200 {
+            ap += 1.0;
+            term *= x / ap;
+            sum += term;
+            if term.abs() <= sum.abs() * 1e-15 {
+                break;
+            }
+        }
+        (sum * (-x + a * x.ln() - ln_gamma(a)).exp()).clamp(0.0, 1.0)
+    } else {
+        (1.0 - gamma_q_cf(a, x)).clamp(0.0, 1.0)
+    }
+}
+
+/// Regularized upper incomplete gamma `Q(a, x) = 1 - P(a, x)` via modified Lentz
+/// continued fraction for `x >= a + 1`.
+fn gamma_q_cf(a: f64, x: f64) -> f64 {
+    const TINY: f64 = 1e-300;
+    let mut b = x + 1.0 - a;
+    let mut c = 1.0 / TINY;
+    let mut d = 1.0 / b;
+    let mut h = d;
+    for i in 1..=200 {
+        let fi = f64::from(i);
+        let an = -fi * (fi - a);
+        b += 2.0;
+        d = an * d + b;
+        if d.abs() < TINY {
+            d = TINY;
+        }
+        c = b + an / c;
+        if c.abs() < TINY {
+            c = TINY;
+        }
+        d = 1.0 / d;
+        let del = d * c;
+        h *= del;
+        if (del - 1.0).abs() <= 1e-15 {
+            break;
+        }
+    }
+    ((-x + a * x.ln() - ln_gamma(a)).exp() * h).clamp(0.0, 1.0)
+}
+
+/// Continuous density `f_G(x)` for `Gamma(shape, scale)` at `x > 0`.
+#[inline]
+fn gamma_pdf_raw(shape: f64, scale: f64, x: f64) -> f64 {
+    if !(x > 0.0) {
+        return 0.0;
+    }
+    ((shape - 1.0) * x.ln() - x / scale - shape * scale.ln() - ln_gamma(shape)).exp()
+}
+
+/// Continuity-enforced body weight `w = P(X <= splice)` for `SplicedGammaPareto`.
+#[inline]
+fn spliced_body_weight(shape: f64, scale: f64, splice: f64, tail_alpha: f64) -> (f64, f64) {
+    let f_u = gamma_p(shape, splice / scale);
+    let pdf_u = gamma_pdf_raw(shape, scale, splice);
+    let denom = tail_alpha * f_u + splice * pdf_u;
+    let w = if denom > 0.0 && denom.is_finite() {
+        (tail_alpha * f_u / denom).clamp(0.0, 1.0)
+    } else {
+        1.0
+    };
+    (w, f_u)
+}
+
 /// Continuous parametric severity distributions for commercial liability, auto, and property pricing.
 ///
 /// Closed-form formulas follow Klugman, Panjer & Willmot (*Loss Models*, 5th ed.),
@@ -140,6 +239,27 @@ pub enum SeverityDistribution {
         /// Scale parameter `beta > 0`.
         beta: f64,
     },
+    /// Gamma distribution: `f(x) = x^(shape - 1) exp(-x / scale) / (Γ(shape) scale^shape)`
+    /// for `shape > 0`, `scale > 0`.
+    Gamma {
+        /// Shape parameter `shape > 0`.
+        shape: f64,
+        /// Scale parameter `scale > 0`.
+        scale: f64,
+    },
+    /// Composite spliced Gamma body (`x <= splice`) and Single-Parameter Pareto tail
+    /// (`x > splice`) with continuity-enforced body weight `w = α F_G(u) / (α F_G(u) + u f_G(u))`
+    /// (Klugman, Panjer & Willmot *Loss Models* §4.4; Scollnik & Sun 2012).
+    SplicedGammaPareto {
+        /// Gamma body shape parameter `shape > 0`.
+        shape: f64,
+        /// Gamma body scale parameter `scale > 0`.
+        scale: f64,
+        /// Splice threshold `splice > 0` where the Gamma body transitions to the Pareto tail.
+        splice: f64,
+        /// Pareto tail index `tail_alpha > 0` (`> 1` for finite mean).
+        tail_alpha: f64,
+    },
 }
 
 impl SeverityDistribution {
@@ -154,6 +274,63 @@ impl SeverityDistribution {
         let sigma = sigma2.sqrt();
         let mu = mean.ln() - 0.5 * sigma2;
         Ok(Self::Lognormal { mu, sigma })
+    }
+
+    /// Construct a `Gamma` distribution from ground-up `mean > 0` and coefficient of variation `cv > 0`.
+    pub fn gamma_from_mean_cv(mean: f64, cv: f64) -> Result<Self, PricingError> {
+        if !mean.is_finite() || !cv.is_finite() || !(mean > 0.0) || !(cv > 0.0) {
+            return Err(PricingError::InvalidParameter(
+                "mean and cv must be finite and strictly positive",
+            ));
+        }
+        let shape = 1.0 / (cv * cv);
+        let scale = mean / shape;
+        Ok(Self::Gamma { shape, scale })
+    }
+
+    /// Construct a `SplicedGammaPareto` distribution normalized to exact ground-up `mean > 0`
+    /// for a given Gamma body `shape > 0`, dimensionless splice ratio `splice_ratio = splice / scale > 0`,
+    /// and Pareto tail index `tail_alpha > 1.0`.
+    pub fn spliced_gamma_pareto_from_mean(
+        mean: f64,
+        shape: f64,
+        splice_ratio: f64,
+        tail_alpha: f64,
+    ) -> Result<Self, PricingError> {
+        if !mean.is_finite()
+            || !shape.is_finite()
+            || !splice_ratio.is_finite()
+            || !tail_alpha.is_finite()
+            || !(mean > 0.0)
+            || !(shape > 0.0)
+            || !(splice_ratio > 0.0)
+            || !(tail_alpha > 1.0)
+        {
+            return Err(PricingError::InvalidParameter(
+                "SplicedGammaPareto requires finite mean > 0, shape > 0, splice_ratio > 0, tail_alpha > 1",
+            ));
+        }
+        let (w, f_u) = spliced_body_weight(shape, 1.0, splice_ratio, tail_alpha);
+        let body_unit = if f_u > 0.0 {
+            (w / f_u) * shape * gamma_p(shape + 1.0, splice_ratio)
+        } else {
+            0.0
+        };
+        let tail_unit = (1.0 - w) * tail_alpha * splice_ratio / (tail_alpha - 1.0);
+        let unit_mean = body_unit + tail_unit;
+        if !(unit_mean > 0.0) || !unit_mean.is_finite() {
+            return Err(PricingError::InvalidParameter(
+                "SplicedGammaPareto unit mean must be finite and positive",
+            ));
+        }
+        let scale = mean / unit_mean;
+        let splice = splice_ratio * scale;
+        Ok(Self::SplicedGammaPareto {
+            shape,
+            scale,
+            splice,
+            tail_alpha,
+        })
     }
 
     /// Validate distribution parameters for finiteness and mathematical domain constraints.
@@ -215,6 +392,33 @@ impl SeverityDistribution {
                     ));
                 }
             }
+            Self::Gamma { shape, scale } => {
+                if !shape.is_finite() || !scale.is_finite() || !(*shape > 0.0) || !(*scale > 0.0) {
+                    return Err(PricingError::InvalidParameter(
+                        "Gamma requires finite shape > 0 and scale > 0",
+                    ));
+                }
+            }
+            Self::SplicedGammaPareto {
+                shape,
+                scale,
+                splice,
+                tail_alpha,
+            } => {
+                if !shape.is_finite()
+                    || !scale.is_finite()
+                    || !splice.is_finite()
+                    || !tail_alpha.is_finite()
+                    || !(*shape > 0.0)
+                    || !(*scale > 0.0)
+                    || !(*splice > 0.0)
+                    || !(*tail_alpha > 0.0)
+                {
+                    return Err(PricingError::InvalidParameter(
+                        "SplicedGammaPareto requires finite shape, scale, splice, and tail_alpha > 0",
+                    ));
+                }
+            }
         }
         Ok(())
     }
@@ -254,6 +458,24 @@ impl SeverityDistribution {
                     (-(1.0 / xi) * (xi * x / beta).ln_1p()).exp()
                 }
             }
+            Self::Gamma { shape, scale } => 1.0 - gamma_p(*shape, x / scale),
+            Self::SplicedGammaPareto {
+                shape,
+                scale,
+                splice,
+                tail_alpha,
+            } => {
+                let (w, f_u) = spliced_body_weight(*shape, *scale, *splice, *tail_alpha);
+                if x <= *splice {
+                    if f_u > 0.0 {
+                        1.0 - w * gamma_p(*shape, x / scale) / f_u
+                    } else {
+                        1.0
+                    }
+                } else {
+                    (1.0 - w) * (splice / x).powf(*tail_alpha)
+                }
+            }
         };
         Ok(s.clamp(0.0, 1.0))
     }
@@ -284,6 +506,26 @@ impl SeverityDistribution {
             Self::GeneralizedPareto { xi, beta } => {
                 if *xi < 1.0 {
                     Some(beta / (1.0 - xi))
+                } else {
+                    None
+                }
+            }
+            Self::Gamma { shape, scale } => Some(shape * scale),
+            Self::SplicedGammaPareto {
+                shape,
+                scale,
+                splice,
+                tail_alpha,
+            } => {
+                if *tail_alpha > 1.0 {
+                    let (w, f_u) = spliced_body_weight(*shape, *scale, *splice, *tail_alpha);
+                    let body = if f_u > 0.0 {
+                        (w / f_u) * shape * scale * gamma_p(shape + 1.0, splice / scale)
+                    } else {
+                        0.0
+                    };
+                    let tail = (1.0 - w) * tail_alpha * splice / (tail_alpha - 1.0);
+                    Some(body + tail)
                 } else {
                     None
                 }
@@ -347,6 +589,47 @@ impl SeverityDistribution {
                         let omx = 1.0 - xi;
                         beta * -(((-omx / xi) * ln_u).exp_m1()) / omx
                     }
+                }
+            }
+            Self::Gamma { shape, scale } => {
+                let z = limit / scale;
+                shape * scale * gamma_p(shape + 1.0, z) + limit * (1.0 - gamma_p(*shape, z))
+            }
+            Self::SplicedGammaPareto {
+                shape,
+                scale,
+                splice,
+                tail_alpha,
+            } => {
+                let (w, f_u) = spliced_body_weight(*shape, *scale, *splice, *tail_alpha);
+                if limit <= *splice {
+                    let z = limit / scale;
+                    let body = if f_u > 0.0 {
+                        (w / f_u) * shape * scale * gamma_p(shape + 1.0, z)
+                    } else {
+                        0.0
+                    };
+                    let surv_part = if f_u > 0.0 {
+                        limit * (1.0 - w * gamma_p(*shape, z) / f_u)
+                    } else {
+                        limit
+                    };
+                    body + surv_part
+                } else {
+                    let zu = splice / scale;
+                    let lev_u = if f_u > 0.0 {
+                        (w / f_u) * shape * scale * gamma_p(shape + 1.0, zu) + (1.0 - w) * splice
+                    } else {
+                        *splice
+                    };
+                    let tail_excess = if (tail_alpha - 1.0).abs() <= 1e-10 {
+                        (1.0 - w) * splice * (limit / splice).ln()
+                    } else {
+                        (1.0 - w)
+                            * (splice / (tail_alpha - 1.0))
+                            * (1.0 - (splice / limit).powf(tail_alpha - 1.0))
+                    };
+                    lev_u + tail_excess
                 }
             }
         };

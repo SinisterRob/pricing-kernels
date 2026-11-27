@@ -57,6 +57,34 @@ pub extern "C" fn pk_ilf_lognormal(mu: f64, sigma: f64, limit: f64, basic_limit:
         .unwrap_or(f64::NAN)
 }
 
+/// Compute Increased Limit Factor for a Gamma severity distribution.
+#[unsafe(no_mangle)]
+pub extern "C" fn pk_ilf_gamma(shape: f64, scale: f64, limit: f64, basic_limit: f64) -> f64 {
+    let dist = SeverityDistribution::Gamma { shape, scale };
+    dist.increased_limits_factor(limit, basic_limit)
+        .unwrap_or(f64::NAN)
+}
+
+/// Compute Increased Limit Factor for a composite Spliced Gamma–Pareto severity distribution.
+#[unsafe(no_mangle)]
+pub extern "C" fn pk_ilf_spliced_gamma_pareto(
+    shape: f64,
+    scale: f64,
+    splice: f64,
+    tail_alpha: f64,
+    limit: f64,
+    basic_limit: f64,
+) -> f64 {
+    let dist = SeverityDistribution::SplicedGammaPareto {
+        shape,
+        scale,
+        splice,
+        tail_alpha,
+    };
+    dist.increased_limits_factor(limit, basic_limit)
+        .unwrap_or(f64::NAN)
+}
+
 /// Evaluate Swiss Re / Bernegger (1997) MBBEFD exposure curve `G(d)` for continuous `c >= 0`.
 #[unsafe(no_mangle)]
 pub extern "C" fn pk_mbbefd_swiss_re_g(c: f64, d: f64) -> f64 {

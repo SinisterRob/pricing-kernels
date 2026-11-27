@@ -391,6 +391,8 @@ fn test_all_six_severity_families_lev_ilf_ler_and_lee_survival_integral() {
             xi: 0.35,
             beta: 80_000.0,
         },
+        SeverityDistribution::gamma_from_mean_cv(100_000.0, 0.7).unwrap(),
+        SeverityDistribution::spliced_gamma_pareto_from_mean(100_000.0, 2.5, 3.5, 2.5).unwrap(),
     ];
 
     // Lee (1988) identity: E[X ∧ L] = integral_0^L S(x) dx
