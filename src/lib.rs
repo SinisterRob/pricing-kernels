@@ -12,6 +12,7 @@ pub mod experience;
 pub mod layers;
 pub(crate) mod linalg;
 pub mod trending;
+pub mod underwriting_risk;
 
 #[cfg(feature = "wasm")]
 #[doc(hidden)]
@@ -41,5 +42,15 @@ pub mod prelude {
     };
     pub use crate::trending::{
         RateChange, TrendModel, parallelogram_on_level_factor, policy_year_on_level_factor,
+    };
+    pub use crate::underwriting_risk::{
+        AggregateLossDistribution, DistortionOperator, DistortionPricingResult, EltSummary,
+        EulerAllocationResult, EventLossEntry, FrequencyDistribution, KrepsRiskLoadResult,
+        MyersReadAllocationResult, RmkPricingResult, convolve_independent_aggregates,
+        discretize_severity_mean_preserving, distortion_price_aggregate, distortion_price_discrete,
+        elt_aggregate_distribution, elt_occurrence_layer_expected_loss, elt_oep, elt_oep_pml,
+        elt_summary, euler_rvar_allocation, euler_sd_allocation, euler_tvar_allocation,
+        fft_aggregate_loss, kreps_marginal_risk_load, myers_read_allocation, panjer_recursion,
+        rmk_risk_adjusted_pricing, sample_rvar, sample_tvar, sample_var,
     };
 }

@@ -35,6 +35,7 @@
 | **Experience, Retro & Deductibles** | `experience::{ncci_erp, iso_erp, table_m, table_l, retrospective, deductible}` | NCCI WC ERP & off-balance, ISO Commercial ERP & bounded IRPM schedule rating, Lee (1988) Table M, Skurnick (1974) Table L, balanced retro solvers, large deductibles (ALAE inside/pro-rata/outside + aggregate caps) |
 | **Severity, ILFs & Reinsurance** | `layers::{ilf, mbbefd, reinsurance}` | 6 parametric severity families (LEV/ILF/LER/excess), `CommercialLayer`, Bernegger (1997) MBBEFD / Swiss Re `Y1`–`Lloyds` exposure curves, Clark (2014) burning cost, Sundt (1991) reinstatements, sliding-scale / corridor / profit commissions |
 | **Trending & On-Leveling** | `trending::{parallelogram, trend}` | Exact multi-change Calendar-Year earned parallelogram & Policy-Year written on-leveling, exponential trend fitting |
+| **Underwriting-Risk Capital** | `underwriting_risk::{aggregate, catastrophe, risk_load, capital}` | Panjer `(a, b, 0)` & tilted radix-2 FFT aggregate risk, Cat ELT OEP/AEP/PML, Wang / PH / Kreps / RMK risk loads, Euler & Myers–Read capital allocation |
 | **Fixtures & WASM** | `datasets`, `wasm_exports` (`--features wasm`) | Zero-I/O CAS Exam 5/8 benchmark fixtures, single-threaded `wasm32` C-ABI exports |
 
 ## Why `pricing-kernels`?

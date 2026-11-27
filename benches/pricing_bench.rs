@@ -165,11 +165,69 @@ fn bench_layers_and_reinsurance(c: &mut Criterion) {
     group.finish();
 }
 
+fn bench_underwriting_risk(c: &mut Criterion) {
+    let mut group = c.benchmark_group("underwriting_risk");
+
+    let freq = FrequencyDistribution::Poisson { lambda: 4.5 };
+    let sev_pmf = [0.0, 0.45, 0.30, 0.15, 0.10];
+
+    group.bench_function("panjer_poisson_256", |b| {
+        b.iter(|| panjer_recursion(black_box(freq), black_box(&sev_pmf), 100.0, 256));
+    });
+
+    group.bench_function("fft_aggregate_1024", |b| {
+        b.iter(|| {
+            fft_aggregate_loss(
+                black_box(freq),
+                black_box(&sev_pmf),
+                100.0,
+                1024,
+                Some(0.01),
+            )
+        });
+    });
+
+    let elt = [
+        EventLossEntry {
+            event_id: 1,
+            annual_rate: 0.04,
+            mean_loss: 2_500_000.0,
+            std_dev_indep: 600_000.0,
+            std_dev_corr: 300_000.0,
+            max_loss: 10_000_000.0,
+        },
+        EventLossEntry {
+            event_id: 2,
+            annual_rate: 0.01,
+            mean_loss: 8_000_000.0,
+            std_dev_indep: 1_500_000.0,
+            std_dev_corr: 1_000_000.0,
+            max_loss: 25_000_000.0,
+        },
+    ];
+    group.bench_function("elt_oep_pml_100", |b| {
+        b.iter(|| elt_oep_pml(black_box(&elt), black_box(100.0)));
+    });
+
+    let line1: Vec<f64> = (0..500_i32).map(|i| 100.0 + f64::from(i) * 0.8).collect();
+    let line2: Vec<f64> = (0..500_i32)
+        .map(|i| 80.0 + f64::from((i * 7) % 500) * 0.6)
+        .collect();
+    let lines = [line1.as_slice(), line2.as_slice()];
+
+    group.bench_function("euler_tvar_500_scenarios", |b| {
+        b.iter(|| euler_tvar_allocation(black_box(&lines), black_box(0.95)));
+    });
+
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_classification,
     bench_credibility_and_trending,
     bench_experience_and_retro,
-    bench_layers_and_reinsurance
+    bench_layers_and_reinsurance,
+    bench_underwriting_risk
 );
 criterion_main!(benches);

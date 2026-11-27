@@ -904,3 +904,243 @@ fn test_large_deductible_alae_treatments_and_iso_erp() {
     ));
     assert_eq!(ncci_res.mod_factor, ncci.expected_mod_rounded);
 }
+
+#[test]
+fn test_panjer_vs_tilted_fft_and_compound_moments() {
+    let sev_pmf = [0.0, 0.50, 0.30, 0.20];
+    let step = 100.0;
+    let ex = 0.50 * 100.0 + 0.30 * 200.0 + 0.20 * 300.0; // 170.0
+    let ex2 = 0.50 * 10_000.0 + 0.30 * 40_000.0 + 0.20 * 90_000.0; // 35_000.0
+    let var_x = ex2 - ex * ex;
+
+    let freqs = [
+        FrequencyDistribution::Poisson { lambda: 3.0 },
+        FrequencyDistribution::Binomial { m: 8, q: 0.35 },
+        FrequencyDistribution::NegativeBinomial { r: 2.5, beta: 1.2 },
+    ];
+
+    for freq in freqs {
+        let panjer = panjer_recursion(freq, &sev_pmf, step, 256).unwrap();
+        let fft = fft_aggregate_loss(freq, &sev_pmf, step, 256, Some(0.02)).unwrap();
+
+        let en = freq.mean().unwrap();
+        let var_n = freq.variance().unwrap();
+        let exact_mean = en * ex;
+        let exact_var = en * var_x + var_n * ex * ex;
+
+        assert!(close_rel(panjer.mean, exact_mean, 1e-8));
+        assert!(close_rel(panjer.variance, exact_var, 1e-7));
+        assert!(close_rel(fft.mean, panjer.mean, 1e-8));
+        assert!(close_rel(fft.variance, panjer.variance, 1e-7));
+        assert!(close_rel(
+            fft.tvar(0.95).unwrap(),
+            panjer.tvar(0.95).unwrap(),
+            1e-7
+        ));
+    }
+
+    // Independent convolution of two components preserves sum of means and sum of variances
+    let comp1 = panjer_recursion(
+        FrequencyDistribution::Poisson { lambda: 2.0 },
+        &sev_pmf,
+        step,
+        128,
+    )
+    .unwrap();
+    let comp2 = panjer_recursion(
+        FrequencyDistribution::Poisson { lambda: 1.5 },
+        &sev_pmf,
+        step,
+        128,
+    )
+    .unwrap();
+    let combined = convolve_independent_aggregates(&[&comp1, &comp2], 256).unwrap();
+    assert!(close_rel(combined.mean, comp1.mean + comp2.mean, 1e-8));
+    assert!(close_rel(
+        combined.variance,
+        comp1.variance + comp2.variance,
+        1e-7
+    ));
+
+    // Mean-preserving LEV discretization of Lomax matches E[X ^ max_grid]
+    let lomax = SeverityDistribution::Lomax {
+        alpha: 3.0,
+        theta: 10_000.0,
+    };
+    let disc = discretize_severity_mean_preserving(&lomax, 1_000.0, 64).unwrap();
+    let sum_p: f64 = disc.iter().sum();
+    assert!(close_rel(sum_p, 1.0, 1e-12));
+    let disc_mean: f64 = disc
+        .iter()
+        .enumerate()
+        .map(|(k, &p)| (k as f64) * 1_000.0 * p)
+        .sum();
+    let exact_lev = lomax.limited_expected_value(63_000.0).unwrap();
+    assert!(close_rel(disc_mean, exact_lev, 1e-6));
+}
+
+#[test]
+fn test_catastrophe_elt_oep_aep_pml_and_layer_pricing() {
+    let entries = [
+        EventLossEntry {
+            event_id: 1,
+            annual_rate: 0.05,
+            mean_loss: 2_000_000.0,
+            std_dev_indep: 400_000.0,
+            std_dev_corr: 300_000.0,
+            max_loss: 10_000_000.0,
+        },
+        EventLossEntry {
+            event_id: 2,
+            annual_rate: 0.02,
+            mean_loss: 6_000_000.0,
+            std_dev_indep: 0.0,
+            std_dev_corr: 0.0,
+            max_loss: 6_000_000.0, // point-mass event
+        },
+    ];
+
+    let summary = elt_summary(&entries).unwrap();
+    let expected_aal = 0.05 * 2_000_000.0 + 0.02 * 6_000_000.0;
+    let expected_var =
+        0.05 * (2_000_000.0_f64.powi(2) + 500_000.0_f64.powi(2)) + 0.02 * 6_000_000.0_f64.powi(2);
+    assert!(close_rel(summary.average_annual_loss, expected_aal, 1e-12));
+    assert!(close_rel(summary.aggregate_variance, expected_var, 1e-12));
+
+    // Mixed Beta + point-mass ELT: PML satisfies exact quantile bracket across jump discontinuities
+    for &rp in &[50.0, 100.0] {
+        let pml = elt_oep_pml(&entries, rp).unwrap();
+        let target = 1.0 / rp;
+        assert!(elt_oep(&entries, (pml - 1.0).max(0.0)).unwrap() >= target - 1e-6);
+        assert!(elt_oep(&entries, pml + 1.0).unwrap() <= target + 1e-6);
+    }
+    // Continuous Beta-only ELT: exact continuous inversion OEP(PML(T)) == 1 / T
+    let pml_beta = elt_oep_pml(&entries[..1], 50.0).unwrap();
+    assert!(close_rel(
+        elt_oep(&entries[..1], pml_beta).unwrap(),
+        1.0 / 50.0,
+        1e-7
+    ));
+
+    // Compound-Poisson AEP via FFT: mean matches AAL and AEP(x) >= OEP(x)
+    let aep = elt_aggregate_distribution(&entries, 250_000.0, 256, Some(0.01)).unwrap();
+    assert!(close_rel(aep.mean, summary.average_annual_loss, 1e-2));
+    let oep_3m = elt_oep(&entries, 3_000_000.0).unwrap();
+    let aep_3m = aep.exceedance_probability(3_000_000.0).unwrap();
+    assert!(aep_3m >= oep_3m - 1e-3);
+
+    // Occurrence layer expected loss for $4M xs $2M
+    let layer = CommercialLayer::new(2_000_000.0, 4_000_000.0, 1.0).unwrap();
+    let ceded = elt_occurrence_layer_expected_loss(&entries, &layer).unwrap();
+    // Event 2 alone contributes 0.02 * 4M = 80k; Event 1 adds positive Beta tail above 2M
+    assert!(ceded > 80_000.0);
+    assert!(ceded < summary.average_annual_loss);
+}
+
+#[test]
+fn test_wang_ph_kreps_and_rmk_risk_loads() {
+    let losses = [0.0, 100.0, 250.0, 600.0];
+    let probs = [0.40, 0.30, 0.20, 0.10];
+    let mean = 0.30 * 100.0 + 0.20 * 250.0 + 0.10 * 600.0; // 140.0
+
+    // Risk-neutral limits recover exact expected loss
+    for op in [
+        DistortionOperator::ProportionalHazards { rho: 1.0 },
+        DistortionOperator::Wang { lambda: 0.0 },
+        DistortionOperator::DualPower { alpha: 1.0 },
+    ] {
+        let res = distortion_price_discrete(&losses, &probs, op).unwrap();
+        assert!(close_rel(res.expected_loss, mean, 1e-12));
+        assert!(close_rel(res.risk_adjusted_price, mean, 1e-12));
+        assert!(res.risk_load.abs() < 1e-12);
+    }
+
+    // Wang (2000) exact Lognormal theorem: E_lambda[X] = exp(mu + 0.5*sigma^2 + lambda*sigma)
+    let mu = 4.0;
+    let sigma = 0.5;
+    let lambda = 0.35;
+    let ln_dist = SeverityDistribution::Lognormal { mu, sigma };
+    let pmf = discretize_severity_mean_preserving(&ln_dist, 1.0, 1024).unwrap();
+    let agg = AggregateLossDistribution::from_pmf(1.0, pmf).unwrap();
+    let wang_res = distortion_price_aggregate(&agg, DistortionOperator::Wang { lambda }).unwrap();
+    let exact_wang = (mu + 0.5 * sigma * sigma + lambda * sigma).exp();
+    assert!(close_rel(wang_res.risk_adjusted_price, exact_wang, 1e-3));
+
+    // Kreps (1990) marginal surplus risk load
+    let kreps = kreps_marginal_risk_load(1_000.0, 200.0, 10_000.0, 20_000.0, 3.0, 0.15).unwrap();
+    let expected_sd_after = (1_000_000.0 + 10_000.0 + 40_000.0_f64).sqrt();
+    let expected_rl = (0.15 / 1.15) * 3.0 * (expected_sd_after - 1_000.0);
+    assert!(close_rel(kreps.risk_load, expected_rl, 1e-12));
+    assert!(kreps_marginal_risk_load(100.0, 50.0, 100.0, 5_000.0, 3.0, 0.15).is_err());
+
+    // Ruhm-Mango-Kreps exact portfolio additivity and permutation invariance under ties
+    let l1 = [10.0, 20.0, 30.0, 30.0, 80.0];
+    let l2 = [5.0, 15.0, 20.0, 20.0, 40.0];
+    let rmk =
+        rmk_risk_adjusted_pricing(&[&l1, &l2], DistortionOperator::Wang { lambda: 0.4 }).unwrap();
+    let sum_prices: f64 = rmk.line_prices.iter().sum();
+    assert!(close_rel(sum_prices, rmk.portfolio_price, 1e-12));
+    assert!(rmk.portfolio_risk_load > 0.0);
+
+    // Permute scenarios (reversing order) -> identical RMK prices
+    let l1_rev = [80.0, 30.0, 30.0, 20.0, 10.0];
+    let l2_rev = [40.0, 20.0, 20.0, 15.0, 5.0];
+    let rmk_rev = rmk_risk_adjusted_pricing(
+        &[&l1_rev, &l2_rev],
+        DistortionOperator::Wang { lambda: 0.4 },
+    )
+    .unwrap();
+    assert!(close_rel(rmk.line_prices[0], rmk_rev.line_prices[0], 1e-12));
+    assert!(close_rel(rmk.line_prices[1], rmk_rev.line_prices[1], 1e-12));
+}
+
+#[test]
+fn test_euler_tvar_rvar_sd_and_myers_read_capital_allocation() {
+    // 10 scenarios with an intentional tie in aggregate loss (scenarios 5 & 6 both sum to 100)
+    let line_a = [10.0, 20.0, 30.0, 40.0, 50.0, 60.0, 40.0, 80.0, 90.0, 150.0];
+    let line_b = [30.0, 25.0, 20.0, 35.0, 40.0, 40.0, 60.0, 50.0, 70.0, 100.0];
+    let agg: Vec<f64> = line_a
+        .iter()
+        .zip(line_b.iter())
+        .map(|(a, b)| a + b)
+        .collect();
+    let lines = [line_a.as_slice(), line_b.as_slice()];
+
+    // 1. Euler TVaR conservation: sum AC_i == sample_tvar(S, 0.80)
+    let tvar_alloc = euler_tvar_allocation(&lines, 0.80).unwrap();
+    let port_tvar = sample_tvar(&agg, 0.80).unwrap();
+    assert!(close_rel(
+        tvar_alloc.portfolio_risk_measure,
+        port_tvar,
+        1e-12
+    ));
+    let sum_ac: f64 = tvar_alloc.allocated_total.iter().sum();
+    assert!(close_rel(sum_ac, port_tvar, 1e-12));
+    assert!(tvar_alloc.diversification_ratio <= 1.0 + 1e-12);
+
+    // 2. Euler RVaR conservation: sum AC_i == sample_rvar(S, 0.50, 0.90)
+    let rvar_alloc = euler_rvar_allocation(&lines, 0.50, 0.90).unwrap();
+    let port_rvar = sample_rvar(&agg, 0.50, 0.90).unwrap();
+    assert!(close_rel(
+        rvar_alloc.portfolio_risk_measure,
+        port_rvar,
+        1e-12
+    ));
+    let sum_rvar: f64 = rvar_alloc.allocated_total.iter().sum();
+    assert!(close_rel(sum_rvar, port_rvar, 1e-12));
+
+    // 3. Euler SD conservation: sum AC_i == E[S] + 2.5 * SD(S)
+    let sd_alloc = euler_sd_allocation(&lines, 2.5).unwrap();
+    let sum_sd: f64 = sd_alloc.allocated_total.iter().sum();
+    assert!(close_rel(sum_sd, sd_alloc.portfolio_risk_measure, 1e-12));
+    assert!(sd_alloc.diversification_ratio <= 1.0 + 1e-12);
+
+    // 4. Myers & Read (2001) exact conservation: sum Q_i == Q and sum A_i == A
+    let mr = myers_read_allocation(&lines, 150.0).unwrap();
+    let sum_q: f64 = mr.allocated_surplus.iter().sum();
+    let sum_a: f64 = mr.allocated_assets.iter().sum();
+    assert!(close_rel(sum_q, mr.portfolio_surplus, 1e-12));
+    assert!(close_rel(sum_a, 150.0, 1e-12));
+    assert!(mr.default_probability > 0.0 && mr.default_put_value > 0.0);
+    assert!(sample_var(&agg, 0.90).unwrap() >= sample_var(&agg, 0.50).unwrap());
+}
