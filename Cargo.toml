@@ -11,6 +11,8 @@ homepage = "https://sinisterrob.github.io"
 documentation = "https://docs.rs/pricing-kernels"
 readme = "README.md"
 exclude = [
+    "assets/",
+    "scripts/",
     ".github/",
     ".githooks/",
     ".gitignore",

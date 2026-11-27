@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="assets/banner.svg" alt="pricing-kernels — Ratemaking & underwriting risk" width="100%" />
+  <img src="assets/banner.png" alt="pricing-kernels — Actuarial ratemaking in Rust" width="100%" />
 </p>
 
 <p align="center">
