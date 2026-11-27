@@ -1,24 +1,37 @@
-# pricing-kernels
+<p align="center">
+  <img src="assets/banner.svg" alt="pricing-kernels — Ratemaking & underwriting risk" width="100%" />
+</p>
 
-Pure Rust numeric kernels for P&C actuarial pricing and underwriting-risk capital modeling.
+<p align="center">
+  <strong>Pure Rust numeric kernels for P&amp;C actuarial pricing and underwriting-risk capital modeling.</strong>
+</p>
 
-[![CI](https://img.shields.io/github/actions/workflow/status/SinisterRob/pricing-kernels/ci.yml?branch=main&label=CI&style=flat)](https://github.com/SinisterRob/pricing-kernels/actions/workflows/ci.yml)
-![Rust 1.97+](https://img.shields.io/badge/Rust-1.97%2B-f97316?style=flat)
-![License](https://img.shields.io/badge/license-MIT%20%2F%20Apache--2.0-30363d?style=flat)
-![No Unsafe](https://img.shields.io/badge/unsafe-forbidden-30363d?style=flat)
-![Deps](https://img.shields.io/badge/deps-serde%20only-30363d?style=flat)
-![WASM](https://img.shields.io/badge/target-wasm32-30363d?style=flat)
+<p align="center">
+  <a href="https://github.com/SinisterRob/pricing-kernels/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/SinisterRob/pricing-kernels/ci.yml?branch=main&label=CI&style=flat" alt="CI" /></a>
+  <a href="Cargo.toml"><img src="https://img.shields.io/badge/Rust-1.97%2B-f97316?style=flat" alt="Rust 1.97+" /></a>
+  <a href="#license"><img src="https://img.shields.io/badge/license-MIT%20%2F%20Apache--2.0-30363d?style=flat" alt="License: MIT or Apache-2.0" /></a>
+  <a href="src/lib.rs"><img src="https://img.shields.io/badge/unsafe-forbidden-30363d?style=flat" alt="No unsafe code" /></a>
+  <a href="Cargo.toml"><img src="https://img.shields.io/badge/deps-serde%20only-30363d?style=flat" alt="Dependencies: serde only" /></a>
+  <a href="#building-and-testing"><img src="https://img.shields.io/badge/target-wasm32-30363d?style=flat" alt="WebAssembly target" /></a>
+</p>
 
-Covers prospective ratemaking (classification, credibility, experience rating, ILFs, retrospective plans) and the **underwriting risk** module of capital modeling. For retrospective loss development and reserve risk, see [`reserving-kernels`](https://github.com/SinisterRob/reserving-kernels).
+<p align="center">
+  <a href="#quick-start">Quick Start</a> &nbsp;·&nbsp;
+  <a href="#building-and-testing">Build &amp; Test</a> &nbsp;·&nbsp;
+  <a href="docs/SOURCES.md">Literature</a> &nbsp;·&nbsp;
+  <a href="https://github.com/SinisterRob/reserving-kernels">reserving-kernels</a>
+</p>
 
-Every method is implemented from peer-reviewed actuarial literature and verified against published benchmark problems in [`tests/source_benchmarks.rs`](tests/source_benchmarks.rs). See [`docs/SOURCES.md`](docs/SOURCES.md) for full citations and equation mappings.
+---
+
+`pricing-kernels` covers prospective ratemaking (classification, credibility, experience rating, ILFs, retrospective plans) and the **underwriting risk** module of capital modeling. Every method is implemented from peer-reviewed actuarial literature ([`docs/SOURCES.md`](docs/SOURCES.md)) and verified against published benchmark problems ([`tests/source_benchmarks.rs`](tests/source_benchmarks.rs)). For retrospective loss development and reserve risk, see [`reserving-kernels`](https://github.com/SinisterRob/reserving-kernels).
 
 ## Why `pricing-kernels`?
 
-* **Zero heavy dependencies**: Pure Rust with no BLAS, LAPACK, or large external frameworks. Linear algebra, IRLS, and root-finding routines are built in and compile cleanly to `wasm32` (`--features wasm`).
-* **Deterministic by design**: Numerical algorithms converge deterministically across native and browser targets.
-* **Microsecond execution**: High-performance classification and commercial rating routines designed for real-time quotation engines, large account underwriting workflows, and batch raters.
-* **Actuarial verification**: Standard models verified against CAS Exam 5 and Exam 8 literature: Bailey & Simon (1960), Brown (1988), Bühlmann & Straub (1970), NCCI Experience Rating Plan, and Lee (1988) Table M.
+- **Zero heavy dependencies:** Pure Rust with no BLAS, LAPACK, or large external frameworks. Linear algebra, IRLS, and root-finding routines are built in and compile cleanly to `wasm32` (`--features wasm`).
+- **Deterministic by design:** Numerical algorithms converge deterministically across native and browser targets.
+- **Microsecond execution:** High-performance classification and commercial rating routines designed for real-time quotation engines, large-account underwriting workflows, and batch raters.
+- **Actuarial verification:** Standard models verified against CAS Exam 5 and Exam 8 literature — Bailey & Simon (1960), Brown (1988), Bühlmann & Straub (1970), NCCI Experience Rating Plan, and Lee (1988) Table M.
 
 ## Quick Start
 
@@ -81,7 +94,7 @@ use pricing_kernels::prelude::*;
 
 fn main() -> Result<(), PricingError> {
     let lomax = SeverityDistribution::Lomax { alpha: 2.2, theta: 150_000.0 };
-    
+
     // Calculate $1M ILF relative to $500k basic limit
     let ilf_1m = lomax.increased_limits_factor(1_000_000.0, 500_000.0)?;
     println!("$1M ILF: {:.4}", ilf_1m);
@@ -121,14 +134,15 @@ fn main() -> Result<(), PricingError> {
 }
 ```
 
-## Building & Testing
+## Building and Testing
 
 ```bash
-# Run all unit and benchmark-parity tests
+# Run unit, integration, doctest, and benchmark-parity tests
 cargo test --all-targets --all-features
+cargo test --doc --all-features
 
 # Build for WebAssembly
-cargo build --target wasm32-unknown-unknown --features wasm
+cargo build --release --target wasm32-unknown-unknown --features wasm
 ```
 
 ## License
