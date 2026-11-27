@@ -9,6 +9,7 @@ pub struct TrendModel {
 }
 
 impl TrendModel {
+    /// Construct a trend model with specified annual percentage rate.
     pub fn new(annual_rate: f64) -> Self {
         Self { annual_rate }
     }

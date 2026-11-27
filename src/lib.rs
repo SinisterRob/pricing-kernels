@@ -1,10 +1,8 @@
-//! # pricing-kernels
-//!
-//! Pure Rust numeric kernels for P&C commercial actuarial pricing, classification,
-//! experience rating, and retrospective plans.
-//!
-//! Zero heavy dependencies, WASM-ready, deterministic, and verified against published
-//! actuarial literature (Bailey & Simon 1960, Lee 1988, NCCI ERP, Bühlmann-Straub, CAS Exam 5 & 8).
+#![doc = include_str!("../README.md")]
+#![cfg_attr(not(feature = "wasm"), forbid(unsafe_code))]
+#![warn(missing_docs)]
+#![allow(clippy::needless_range_loop)]
+#![allow(clippy::neg_cmp_op_on_partial_ord)]
 
 pub mod classification;
 pub mod credibility;

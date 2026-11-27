@@ -15,6 +15,7 @@ pub struct MultiplicativeRater {
 }
 
 impl MultiplicativeRater {
+    /// Construct a rater with given base rate.
     pub fn new(base_rate: f64) -> Self {
         Self {
             base_rate,
@@ -23,11 +24,13 @@ impl MultiplicativeRater {
         }
     }
 
+    /// Set a minimum premium floor.
     pub fn with_minimum_premium(mut self, min_prem: f64) -> Self {
         self.minimum_premium = Some(min_prem);
         self
     }
 
+    /// Set a maximum premium cap.
     pub fn with_maximum_premium(mut self, max_prem: f64) -> Self {
         self.maximum_premium = Some(max_prem);
         self

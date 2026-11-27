@@ -6,12 +6,25 @@ use serde::{Deserialize, Serialize};
 pub enum SeverityDistribution {
     /// Pareto Type II (Lomax): F(x) = 1 - (1 + x / theta)^(-alpha).
     /// Heavy-tailed standard in commercial liability (Auto Liability / General Liability).
-    Lomax { alpha: f64, theta: f64 },
+    Lomax {
+        /// Shape parameter alpha > 0.
+        alpha: f64,
+        /// Scale parameter theta > 0.
+        theta: f64,
+    },
     /// Single-Parameter Pareto (strictly positive above threshold x_m):
     /// F(x) = 1 - (x_m / x)^alpha for x >= x_m.
-    SingleParameterPareto { alpha: f64, x_m: f64 },
+    SingleParameterPareto {
+        /// Shape parameter alpha > 0.
+        alpha: f64,
+        /// Threshold parameter x_m > 0.
+        x_m: f64,
+    },
     /// Exponential distribution: F(x) = 1 - exp(-lambda * x).
-    Exponential { lambda: f64 },
+    Exponential {
+        /// Rate parameter lambda > 0.
+        lambda: f64,
+    },
 }
 
 impl SeverityDistribution {
@@ -118,6 +131,7 @@ pub struct CommercialLayer {
 }
 
 impl CommercialLayer {
+    /// Construct a commercial excess layer with given attachment, limit, and participation share.
     pub fn new(attachment: f64, limit: f64, participation: f64) -> Result<Self, PricingError> {
         if attachment < 0.0 || limit <= 0.0 {
             return Err(PricingError::InvalidParameter(

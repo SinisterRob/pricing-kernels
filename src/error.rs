@@ -1,14 +1,23 @@
+//! Error types and error definitions for numerical pricing kernels.
+
 use std::fmt;
 
 /// Standard error type for pricing numerical kernels and validations.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PricingError {
+    /// Provided slice or vector input was empty.
     EmptyInput(&'static str),
+    /// Dimension or slice length mismatch between inputs.
     DimensionMismatch(&'static str),
+    /// Non-positive or negative value encountered where strictly positive is required.
     NonPositiveValue(&'static str),
+    /// Parameter value outside valid mathematical domain.
     InvalidParameter(&'static str),
+    /// Iterative numerical solver failed to reach specified tolerance.
     NonConvergence(&'static str),
+    /// Non-invertible or singular matrix encountered.
     SingularMatrix(&'static str),
+    /// Value evaluated outside supported boundaries.
     OutOfBounds(&'static str),
 }
 

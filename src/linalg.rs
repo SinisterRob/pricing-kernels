@@ -1,3 +1,5 @@
+//! Pure-Rust dense linear algebra helpers for Cholesky factorization and matrix equations.
+
 use crate::error::PricingError;
 
 /// Compute the lower-triangular Cholesky factor `L` of symmetric positive-definite
