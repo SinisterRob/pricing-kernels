@@ -1,0 +1,221 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v[0-9]+.[0-9]+.[0-9]+*"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Verify release checks, WASM bundle, and cargo package without publishing"
+        required: false
+        default: true
+        type: boolean
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  verify:
+    name: Verify Release
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.meta.outputs.version }}
+      tag: ${{ steps.meta.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Validate crate version, tag, and README parity
+        id: meta
+        shell: bash
+        run: |
+          VERSION="$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["package"]["version"])')"
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
+            TAG="${GITHUB_REF#refs/tags/}"
+            echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+            if [[ "$TAG" != "v${VERSION}" ]]; then
+              echo "::error::Tag ${TAG} does not match Cargo.toml version v${VERSION}"
+              exit 1
+            fi
+          else
+            echo "tag=v${VERSION}-dryrun" >> "$GITHUB_OUTPUT"
+          fi
+          python3 - <<'PY'
+          import re, sys, tomllib
+          pkg = tomllib.load(open("Cargo.toml", "rb"))["package"]
+          name, ver = pkg["name"], pkg["version"]
+          major_minor = ".".join(ver.split(".")[:2])
+          readme = open("README.md", encoding="utf-8").read()
+          m = re.search(rf'^{re.escape(name)}\s*=\s*"([^"]+)"', readme, re.MULTILINE)
+          if not m or m.group(1) not in (major_minor, ver):
+              sys.exit(f'ERROR: README.md dependency version does not match Cargo.toml ({ver})')
+          PY
+
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --all-targets --no-default-features -- -D warnings
+      - run: cargo clippy --all-targets --all-features -- -D warnings
+      - run: cargo clippy --lib --all-features -- -D warnings -D clippy::unwrap_used -D clippy::panic -D clippy::expect_used
+      - run: cargo test --all-targets --no-default-features
+      - run: cargo test --all-targets --all-features
+      - run: cargo test --doc --all-features
+      - run: cargo doc --no-deps --all-features
+        env:
+          RUSTDOCFLAGS: "-D warnings"
+      - run: cargo package
+
+  build-wasm:
+    name: Build & Verify WASM Artifact
+    needs: verify
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "22"
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install binaryen (wasm-opt)
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends binaryen
+
+      - name: Build optimized wasm32 release binary
+        env:
+          CARGO_PROFILE_RELEASE_LTO: "true"
+          CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "1"
+          CARGO_PROFILE_RELEASE_OPT_LEVEL: "z"
+          CARGO_PROFILE_RELEASE_STRIP: "symbols"
+        run: cargo build --release --target wasm32-unknown-unknown --features wasm
+
+      - name: Optimize, smoke-test, and checksum WASM artifact
+        env:
+          VERSION: ${{ needs.verify.outputs.version }}
+        run: |
+          mkdir -p dist
+          RAW="target/wasm32-unknown-unknown/release/pricing_kernels.wasm"
+          OUT="dist/pricing-kernels-${VERSION}-wasm32.wasm"
+          wasm-opt -Oz \
+            --enable-bulk-memory \
+            --enable-nontrapping-float-to-int \
+            --enable-sign-ext \
+            --enable-mutable-globals \
+            "$RAW" -o "$OUT"
+          node scripts/wasm-smoke.mjs "$OUT"
+          gzip -9 -c "$OUT" > "${OUT}.gz"
+          (cd dist && sha256sum "$(basename "$OUT")" "$(basename "${OUT}.gz")" > SHA256SUMS.txt)
+          cat dist/SHA256SUMS.txt
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: release-wasm-${{ needs.verify.outputs.version }}
+          path: dist/
+          retention-days: 14
+
+  github-release:
+    name: Publish GitHub Release (Single Latest)
+    needs: [verify, build-wasm]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: release-wasm-${{ needs.verify.outputs.version }}
+          path: dist/
+
+      - name: Create or update GitHub Release and prune older releases
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.verify.outputs.tag }}
+        run: |
+          EXTRA_FLAGS=()
+          if [[ "$TAG" == *-* ]]; then
+            EXTRA_FLAGS+=(--prerelease)
+          fi
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" dist/* --clobber
+          else
+            gh release create "$TAG" dist/* --generate-notes "${EXTRA_FLAGS[@]}"
+          fi
+          # Enforce single-release invariant on stable tags: remove older GitHub Releases.
+          if [[ "$TAG" != *-* ]]; then
+            for old_rel in $(gh release list --json tagName --jq '.[].tagName'); do
+              if [[ "$old_rel" != "$TAG" ]]; then
+                echo "Deleting superseded GitHub Release ${old_rel}..."
+                gh release delete "$old_rel" --yes
+              fi
+            done
+          fi
+
+  publish-crates:
+    name: Publish to crates.io (Single Active Version)
+    needs: [verify, github-release]
+    if: startsWith(github.ref, 'refs/tags/v') && !contains(github.ref, '-')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Publish crate to crates.io and yank previous versions
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+          VERSION: ${{ needs.verify.outputs.version }}
+        run: |
+          if [ -z "$CARGO_REGISTRY_TOKEN" ]; then
+            {
+              echo "### crates.io publish skipped"
+              echo "Set the \`CARGO_REGISTRY_TOKEN\` repository secret (scopes: \`publish-new\`, \`publish-update\`, \`yank\`) to enable automatic crates.io publishing on stable \`v*\` tags."
+            } >> "$GITHUB_STEP_SUMMARY"
+            echo "CARGO_REGISTRY_TOKEN not configured; skipping crates.io publish."
+            exit 0
+          fi
+
+          CRATE_JSON="$(curl -fsSL -H "User-Agent: pricing-kernels-release-bot (https://github.com/SinisterRob/pricing-kernels)" \
+            "https://crates.io/api/v1/crates/pricing-kernels" 2>/dev/null || echo '{"versions":[]}')"
+
+          ALREADY_PUBLISHED="$(python3 -c '
+          import json, os, sys
+          data = json.loads(sys.stdin.read())
+          target = os.environ["VERSION"]
+          print("true" if any(v.get("num") == target for v in data.get("versions", [])) else "false")
+          ' <<< "$CRATE_JSON")"
+
+          if [ "$ALREADY_PUBLISHED" = "true" ]; then
+            echo "pricing-kernels ${VERSION} is already published on crates.io; skipping publish."
+          else
+            cargo publish
+          fi
+
+          # Yank all older non-yanked versions so only the latest release resolves.
+          OLD_VERSIONS="$(python3 -c '
+          import json, os, sys
+          data = json.loads(sys.stdin.read())
+          target = os.environ["VERSION"]
+          for v in data.get("versions", []):
+              num = v.get("num", "")
+              if num and num != target and not v.get("yanked", False):
+                  print(num)
+          ' <<< "$CRATE_JSON")"
+
+          for old in $OLD_VERSIONS; do
+            echo "Yanking previous version ${old}..."
+            cargo yank --version "$old"
+          done

@@ -51,7 +51,7 @@ Add `pricing-kernels` to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-pricing-kernels = { git = "https://github.com/SinisterRob/pricing-kernels" }
+pricing-kernels = "0.4"
 ```
 
 ### 1. Classification Minimum Bias (Bailey & Simon 1960)
