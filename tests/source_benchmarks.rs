@@ -1146,3 +1146,244 @@ fn test_euler_tvar_rvar_sd_and_myers_read_capital_allocation() {
     assert!(mr.default_probability > 0.0 && mr.default_put_value > 0.0);
     assert!(sample_var(&agg, 0.90).unwrap() >= sample_var(&agg, 0.50).unwrap());
 }
+
+#[test]
+fn test_tweedie_negbin_binomial_invgauss_and_ridge_glm() {
+    // 1. Tweedie (p = 1.5) with zero-inflated pure-premium outcomes + power selection
+    let design = [
+        1.0, 0.0, //
+        1.0, 0.0, //
+        1.0, 0.0, //
+        1.0, 1.0, //
+        1.0, 1.0, //
+        1.0, 1.0, //
+    ];
+    let y_tw = [0.0, 80.0, 100.0, 0.0, 220.0, 260.0];
+    let w = [1.0; 6];
+    let offsets = [0.0; 6];
+
+    let tw = fit_glm_irls_with_options(
+        GlmFamily::Tweedie { power: 1.5 },
+        &design,
+        6,
+        2,
+        &y_tw,
+        &w,
+        &offsets,
+        &GlmOptions::default(),
+    )
+    .unwrap();
+    // Group 0 mean = 60, Group 1 mean = 160 -> exact log-link recovery
+    assert!(close_rel(tw.coefficients[0].exp(), 60.0, 1e-6));
+    assert!(close_rel(tw.coefficients[1].exp(), 160.0 / 60.0, 1e-6));
+
+    let sel = select_tweedie_power(
+        &[1.2, 1.5, 1.8],
+        &design,
+        6,
+        2,
+        &y_tw,
+        &w,
+        &offsets,
+        &GlmOptions::default(),
+    )
+    .unwrap();
+    assert_eq!(sel.profile.len(), 3);
+    assert!(sel.best_power > 1.0 && sel.best_power < 2.0);
+
+    // 2. Ridge penalty shrinks non-intercept slope strictly toward 0
+    let tw_ridge = fit_glm_irls_with_options(
+        GlmFamily::Tweedie { power: 1.5 },
+        &design,
+        6,
+        2,
+        &y_tw,
+        &w,
+        &offsets,
+        &GlmOptions {
+            ridge_lambda: 10.0,
+            ..GlmOptions::default()
+        },
+    )
+    .unwrap();
+    assert!(tw_ridge.coefficients[1].abs() < tw.coefficients[1].abs());
+
+    // 3. Negative Binomial approaches Poisson as alpha -> 0
+    let y_cnt = [2.0, 4.0, 3.0, 8.0, 10.0, 9.0];
+    let pois = fit_glm_irls(
+        GlmFamily::Poisson,
+        &design,
+        6,
+        2,
+        &y_cnt,
+        &w,
+        &offsets,
+        100,
+        1e-10,
+    )
+    .unwrap();
+    let nb_small = fit_glm_irls(
+        GlmFamily::NegativeBinomial { alpha: 1e-6 },
+        &design,
+        6,
+        2,
+        &y_cnt,
+        &w,
+        &offsets,
+        100,
+        1e-10,
+    )
+    .unwrap();
+    assert!(close_rel(
+        pois.coefficients[0],
+        nb_small.coefficients[0],
+        1e-5
+    ));
+    assert!(close_rel(
+        pois.coefficients[1],
+        nb_small.coefficients[1],
+        1e-5
+    ));
+
+    // 4. Binomial / Logistic GLM + AIC/BIC
+    let y_bin = [0.0, 0.0, 1.0, 1.0, 1.0, 0.0];
+    let logit = fit_glm_irls(
+        GlmFamily::Binomial,
+        &design,
+        6,
+        2,
+        &y_bin,
+        &w,
+        &offsets,
+        100,
+        1e-10,
+    )
+    .unwrap();
+    let probs = predict_glm(
+        GlmFamily::Binomial,
+        &design,
+        6,
+        2,
+        &logit.coefficients,
+        &offsets,
+    )
+    .unwrap();
+    // Group 0 empirical p = 1/3, Group 1 empirical p = 2/3
+    assert!(close_rel(probs[0], 1.0 / 3.0, 1e-7));
+    assert!(close_rel(probs[3], 2.0 / 3.0, 1e-7));
+    let ic = glm_information_criteria(GlmFamily::Binomial, &y_bin, &probs, &w, logit.dispersion, 2)
+        .unwrap();
+    assert!(close_rel(ic.scaled_deviance, logit.deviance, 1e-10));
+    assert!(ic.aic > ic.scaled_deviance);
+
+    // 5. Inverse Gaussian severity GLM
+    let y_ig = [500.0, 620.0, 580.0, 1_400.0, 1_650.0, 1_550.0];
+    let ig = fit_glm_irls(
+        GlmFamily::InverseGaussian,
+        &design,
+        6,
+        2,
+        &y_ig,
+        &w,
+        &offsets,
+        100,
+        1e-10,
+    )
+    .unwrap();
+    assert!(ig.coefficients[1] > 0.5);
+    assert!(ig.deviance > 0.0);
+}
+
+#[test]
+fn test_gini_lorenz_double_lift_and_vif_diagnostics() {
+    let exposures = [10.0, 10.0, 10.0, 10.0, 10.0, 10.0];
+    let actuals = [100.0, 200.0, 300.0, 300.0, 600.0, 900.0];
+    let pred_good = [10.0, 20.0, 30.0, 30.0, 60.0, 90.0];
+    let pred_flat = [40.0; 6];
+    let pred_rev = [90.0, 60.0, 30.0, 30.0, 20.0, 10.0];
+
+    let g_flat = weighted_gini_index(&exposures, &actuals, &pred_flat).unwrap();
+    assert!(g_flat.gini_index.abs() < 1e-12);
+
+    let g_good = weighted_gini_index(&exposures, &actuals, &pred_good).unwrap();
+    let g_rev = weighted_gini_index(&exposures, &actuals, &pred_rev).unwrap();
+    assert!(g_good.gini_index > 0.30);
+    assert!(close_rel(g_good.gini_index, -g_rev.gini_index, 1e-12));
+
+    // Double-lift chart conserves total exposure and actual loss across buckets
+    let dl = double_lift_chart(&exposures, &actuals, &pred_flat, &pred_good, 3).unwrap();
+    assert_eq!(dl.len(), 3);
+    let tot_exp: f64 = dl.iter().map(|b| b.exposure).sum();
+    let tot_act: f64 = dl.iter().map(|b| b.exposure * b.actual_pure_premium).sum();
+    assert!(close_rel(tot_exp, 60.0, 1e-12));
+    assert!(close_rel(tot_act, 2400.0, 1e-12));
+    assert!(dl[0].mean_ratio_b_to_a < dl[1].mean_ratio_b_to_a);
+    assert!(dl[1].mean_ratio_b_to_a < dl[2].mean_ratio_b_to_a);
+
+    // VIF: orthogonal predictors -> VIF == 1.0; correlated predictors -> VIF > 1.0
+    let ortho = [-1.0, -1.0, -1.0, 1.0, 1.0, -1.0, 1.0, 1.0];
+    let vif_ortho = variance_inflation_factors(&ortho, 4, 2).unwrap();
+    assert!(close_rel(vif_ortho[0], 1.0, 1e-12));
+    assert!(close_rel(vif_ortho[1], 1.0, 1e-12));
+
+    let corr = [1.0, 1.1, 2.0, 2.0, 3.0, 2.9, 4.0, 4.1];
+    let vif_corr = variance_inflation_factors(&corr, 4, 2).unwrap();
+    assert!(vif_corr[0] > 10.0 && vif_corr[1] > 10.0);
+}
+
+#[test]
+fn test_subannual_parallelogram_two_step_trend_and_hachemeister() {
+    // 1. Annual policy_term_years = 1.0 matches parallelogram_on_level_factor identically
+    let changes = [
+        RateChange {
+            effective_date: 2021.5,
+            rate_factor: 1.08,
+        },
+        RateChange {
+            effective_date: 2022.25,
+            rate_factor: 1.05,
+        },
+    ];
+    let ann = parallelogram_on_level_factor(2022.0, &changes).unwrap();
+    let ann_term = parallelogram_on_level_factor_with_term(2022.0, 1.0, &changes).unwrap();
+    assert!(close_rel(ann, ann_term, 1e-12));
+
+    // 2. 6-month policy term (T = 0.5) with single mid-year rate change (+10% on July 1):
+    // Area after d = 2022.5 is the upper-right triangle of width 0.5 and height 1.0 -> 0.25.
+    // Avg level = 0.75 * 1.0 + 0.25 * 1.10 = 1.025 -> OLF = 1.10 / 1.025
+    let mid_year = [RateChange {
+        effective_date: 2022.5,
+        rate_factor: 1.10,
+    }];
+    let semi_olf = parallelogram_on_level_factor_with_term(2022.0, 0.5, &mid_year).unwrap();
+    assert!(close_rel(semi_olf, 1.10 / 1.025, 1e-12));
+
+    // 3. Two-step exponential trend model
+    let two_step = TwoStepTrendModel::new(0.04, 0.06).unwrap();
+    let f = two_step.compound_factor(2.0, 1.5).unwrap();
+    assert!(close_rel(f, 1.04_f64.powf(2.0) * 1.06_f64.powf(1.5), 1e-12));
+
+    // 4. Hachemeister (1975) regression credibility:
+    // Large-exposure group retains near-full credibility; small noisy group shrinks toward collective.
+    let t = [1.0, 2.0, 3.0, 4.0, 5.0];
+    let y_large = [100.0, 108.0, 117.0, 124.0, 133.0];
+    let w_large = [1000.0; 5];
+    let y_med = [90.0, 95.0, 101.0, 106.0, 112.0];
+    let w_med = [500.0; 5];
+    let y_small_noisy = [120.0, 95.0, 150.0, 110.0, 185.0];
+    let w_small = [5.0; 5];
+
+    let hach = hachemeister_credibility(
+        &[&t, &t, &t],
+        &[&y_large, &y_med, &y_small_noisy],
+        &[&w_large, &w_med, &w_small],
+    )
+    .unwrap();
+
+    assert!(hach.epv > 0.0);
+    // Small noisy group's slope is shrunk closer to collective slope than its raw WLS slope
+    let raw_dist = (hach.groups[2].wls_beta[1] - hach.collective_beta[1]).abs();
+    let cred_dist = (hach.groups[2].credibility_beta[1] - hach.collective_beta[1]).abs();
+    assert!(cred_dist < raw_dist);
+    assert!(hach.groups[0].predict(6.0) > hach.groups[0].predict(5.0));
+}

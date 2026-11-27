@@ -21,10 +21,16 @@ pub mod wasm_exports;
 /// Standard prelude re-exporting common pricing kernels and structs.
 pub mod prelude {
     pub use crate::classification::{
-        GlmFamily, GlmResult, MinimumBiasResult, MultiplicativeRater, bailey_simon_chi_squared,
-        bailey_simon_multiplicative, fit_glm_irls,
+        DoubleLiftBucket, GiniResult, GlmFamily, GlmOptions, GlmResult, InformationCriteria,
+        LorenzCurvePoint, MinimumBiasResult, MultiplicativeRater, TweediePowerSelection,
+        bailey_simon_chi_squared, bailey_simon_multiplicative, double_lift_chart, fit_glm_irls,
+        fit_glm_irls_with_options, glm_information_criteria, predict_glm, select_tweedie_power,
+        variance_inflation_factors, weighted_gini_index,
     };
-    pub use crate::credibility::{BuhlmannStraubResult, ClassicalCredibility, buhlmann_straub};
+    pub use crate::credibility::{
+        BuhlmannStraubResult, ClassicalCredibility, HachemeisterGroupResult, HachemeisterResult,
+        buhlmann_straub, hachemeister_credibility,
+    };
     pub use crate::error::PricingError;
     pub use crate::experience::{
         AlaeTreatment, ExperienceClaim, IsoErpResult, IsoErpSpec, LargeDeductibleResult,
@@ -41,7 +47,8 @@ pub mod prelude {
         expected_loss_corridor_retention, expected_profit_commission, price_reinstatements,
     };
     pub use crate::trending::{
-        RateChange, TrendModel, parallelogram_on_level_factor, policy_year_on_level_factor,
+        RateChange, TrendModel, TwoStepTrendModel, parallelogram_on_level_factor,
+        parallelogram_on_level_factor_with_term, policy_year_on_level_factor,
     };
     pub use crate::underwriting_risk::{
         AggregateLossDistribution, DistortionOperator, DistortionPricingResult, EltSummary,

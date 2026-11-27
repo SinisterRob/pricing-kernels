@@ -69,6 +69,43 @@ fn bench_classification(c: &mut Criterion) {
         b.iter(|| rater.score(black_box(12.5), black_box(&factors)));
     });
 
+    let tweedie_y = [0.0, 45.0, 0.0, 120.0, 35.0, 210.0];
+    let tweedie_opts = GlmOptions {
+        ridge_lambda: 0.5,
+        ..GlmOptions::default()
+    };
+    group.bench_function("glm_irls_tweedie_ridge_3x2", |b| {
+        b.iter(|| {
+            fit_glm_irls_with_options(
+                GlmFamily::Tweedie { power: 1.5 },
+                black_box(&design),
+                6,
+                4,
+                black_box(&tweedie_y),
+                black_box(&weights),
+                black_box(&offsets),
+                black_box(&tweedie_opts),
+            )
+        });
+    });
+
+    let gini_exp: Vec<f64> = (1..=200_i32).map(f64::from).collect();
+    let gini_pred: Vec<f64> = (1..=200_i32).map(|i| 50.0 + f64::from(i) * 1.5).collect();
+    let gini_act: Vec<f64> = gini_exp
+        .iter()
+        .zip(gini_pred.iter())
+        .map(|(&e, &p)| e * p)
+        .collect();
+    group.bench_function("weighted_gini_200", |b| {
+        b.iter(|| {
+            weighted_gini_index(
+                black_box(&gini_exp),
+                black_box(&gini_act),
+                black_box(&gini_pred),
+            )
+        });
+    });
+
     group.finish();
 }
 

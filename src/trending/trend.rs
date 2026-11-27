@@ -81,3 +81,66 @@ impl TrendModel {
         Ok(Self { annual_rate })
     }
 }
+
+/// Two-step exponential trending model (Werner & Modlin *Basic Ratemaking*, Ch. 6).
+///
+/// Separates historical experience-to-latest trend (`historical_rate`, applied over
+/// `historical_years`) from prospective latest-to-future projection trend
+/// (`prospective_rate`, applied over `prospective_years`).
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct TwoStepTrendModel {
+    /// Annual trend rate from historical experience period to latest available data point.
+    pub historical_rate: f64,
+    /// Annual trend rate from latest available data point to prospective policy period.
+    pub prospective_rate: f64,
+}
+
+impl TwoStepTrendModel {
+    /// Construct a two-step trend model with validated rates (`> -1.0`).
+    pub fn new(historical_rate: f64, prospective_rate: f64) -> Result<Self, PricingError> {
+        if !historical_rate.is_finite()
+            || !prospective_rate.is_finite()
+            || !(historical_rate > -1.0)
+            || !(prospective_rate > -1.0)
+        {
+            return Err(PricingError::InvalidParameter(
+                "trend rates must be finite and strictly greater than -1.0",
+            ));
+        }
+        Ok(Self {
+            historical_rate,
+            prospective_rate,
+        })
+    }
+
+    /// Combined multiplicative two-step trend factor:
+    /// `(1 + historical_rate)^historical_years * (1 + prospective_rate)^prospective_years`.
+    pub fn compound_factor(
+        &self,
+        historical_years: f64,
+        prospective_years: f64,
+    ) -> Result<f64, PricingError> {
+        if !historical_years.is_finite() || !prospective_years.is_finite() {
+            return Err(PricingError::InvalidParameter(
+                "trend periods must be finite",
+            ));
+        }
+        Ok((1.0 + self.historical_rate).powf(historical_years)
+            * (1.0 + self.prospective_rate).powf(prospective_years))
+    }
+
+    /// Apply the two-step trend factor to a historical loss cost or average premium.
+    pub fn apply_compound(
+        &self,
+        historic_val: f64,
+        historical_years: f64,
+        prospective_years: f64,
+    ) -> Result<f64, PricingError> {
+        if !historic_val.is_finite() {
+            return Err(PricingError::InvalidParameter(
+                "historic_val must be finite",
+            ));
+        }
+        Ok(historic_val * self.compound_factor(historical_years, prospective_years)?)
+    }
+}

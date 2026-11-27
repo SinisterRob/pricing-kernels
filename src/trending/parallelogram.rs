@@ -131,6 +131,55 @@ pub fn parallelogram_on_level_factor(
     compute_on_level_from_area_fn(experience_year, rate_changes, cy_earned_area_after)
 }
 
+/// Fraction of Calendar-Year `Y` earned exposures written on or after `effective_date = d`
+/// under uniform writings and arbitrary policy term `policy_term_years = T > 0`
+/// (e.g. `0.5` for 6-month policies, `1.0` for annual policies).
+#[inline]
+fn cy_earned_area_after_with_term(experience_year: f64, policy_term_years: f64, d: f64) -> f64 {
+    let t = policy_term_years;
+    let a = experience_year - t;
+    let e = experience_year + 1.0;
+    if d <= a {
+        return 1.0;
+    }
+    if d >= e {
+        return 0.0;
+    }
+    let b = experience_year.min(e - t);
+    let c = experience_year.max(e - t);
+    let h_max = (1.0 / t).min(1.0);
+    let ramp = b - a; // == min(t, 1.0) > 0
+
+    let area_before = if d <= b {
+        let u = d - a;
+        0.5 * (u * u / ramp) * h_max
+    } else if d <= c {
+        0.5 * ramp * h_max + (d - b) * h_max
+    } else {
+        let rem = e - d;
+        1.0 - 0.5 * (rem * rem / ramp) * h_max
+    };
+    (1.0 - area_before).clamp(0.0, 1.0)
+}
+
+/// Exact Geometric Parallelogram Method for Calendar-Year **earned** on-level factors
+/// with arbitrary uniform policy term `policy_term_years > 0` (e.g. `0.5` for 6-month
+/// commercial auto policies, `1.0` for annual policies; Werner & Modlin Ch. 5).
+pub fn parallelogram_on_level_factor_with_term(
+    experience_year: f64,
+    policy_term_years: f64,
+    rate_changes: &[RateChange],
+) -> Result<f64, PricingError> {
+    if !policy_term_years.is_finite() || !(policy_term_years > 0.0) {
+        return Err(PricingError::NonPositiveValue(
+            "policy_term_years must be finite and positive",
+        ));
+    }
+    compute_on_level_from_area_fn(experience_year, rate_changes, |y, d| {
+        cy_earned_area_after_with_term(y, policy_term_years, d)
+    })
+}
+
 /// Exact Policy-Year **written** on-level factor for uniform writings over `[Y, Y + 1]`.
 ///
 /// Supports arbitrarily many rate changes (sorted or unsorted).

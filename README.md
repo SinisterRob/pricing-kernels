@@ -30,11 +30,11 @@
 
 | Area | Modules | Capabilities |
 | --- | --- | --- |
-| **Classification & Scoring** | `classification::{minimum_bias, irls_glm, scoring}` | Bailey (1963) balance & Bailey–Simon (1960) $\chi^2$ minimum bias, Poisson / Quasi-Poisson / Gamma log-link IRLS GLMs, zero-alloc `MultiplicativeRater` |
-| **Credibility** | `credibility::{classical, buhlmann_straub}` | Longley-Cook limited-fluctuation credibility, non-parametric Bühlmann–Straub credibility for heterogeneous exposures |
+| **Classification & Scoring** | `classification::{minimum_bias, irls_glm, diagnostics, scoring}` | Bailey (1963) & Bailey–Simon (1960) minimum bias, Poisson / Quasi-Poisson / Gamma / Tweedie / NegBin / Logistic / InvGauss IRLS GLMs + Ridge penalty + Tweedie power selection, Gini/Lorenz/double-lift/AIC/BIC/VIF diagnostics, zero-alloc `MultiplicativeRater` |
+| **Credibility** | `credibility::{classical, buhlmann_straub, hachemeister}` | Longley-Cook limited-fluctuation credibility, non-parametric Bühlmann–Straub credibility, Hachemeister (1975) regression trend credibility |
 | **Experience, Retro & Deductibles** | `experience::{ncci_erp, iso_erp, table_m, table_l, retrospective, deductible}` | NCCI WC ERP & off-balance, ISO Commercial ERP & bounded IRPM schedule rating, Lee (1988) Table M, Skurnick (1974) Table L, balanced retro solvers, large deductibles (ALAE inside/pro-rata/outside + aggregate caps) |
 | **Severity, ILFs & Reinsurance** | `layers::{ilf, mbbefd, reinsurance}` | 6 parametric severity families (LEV/ILF/LER/excess), `CommercialLayer`, Bernegger (1997) MBBEFD / Swiss Re `Y1`–`Lloyds` exposure curves, Clark (2014) burning cost, Sundt (1991) reinstatements, sliding-scale / corridor / profit commissions |
-| **Trending & On-Leveling** | `trending::{parallelogram, trend}` | Exact multi-change Calendar-Year earned parallelogram & Policy-Year written on-leveling, exponential trend fitting |
+| **Trending & On-Leveling** | `trending::{parallelogram, trend}` | Exact multi-change Calendar-Year earned parallelogram (annual & arbitrary policy terms) & Policy-Year written on-leveling, single-step & two-step exponential trending |
 | **Underwriting-Risk Capital** | `underwriting_risk::{aggregate, catastrophe, risk_load, capital}` | Panjer `(a, b, 0)` & tilted radix-2 FFT aggregate risk, Cat ELT OEP/AEP/PML, Wang / PH / Kreps / RMK risk loads, Euler & Myers–Read capital allocation |
 | **Fixtures & WASM** | `datasets`, `wasm_exports` (`--features wasm`) | Zero-I/O CAS Exam 5/8 benchmark fixtures, single-threaded `wasm32` C-ABI exports |
 
