@@ -84,7 +84,7 @@ if command -v python3 >/dev/null 2>&1; then
 fi
 if command -v node >/dev/null 2>&1; then
   for js in scripts/*.mjs scripts/*.js; do
-    [[ -f "$js" ]] && node --check "$js"
+    if [[ -f "$js" ]]; then node --check "$js"; fi
   done
 fi
 

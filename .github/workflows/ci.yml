@@ -127,8 +127,9 @@ jobs:
         run: shellcheck .githooks/* scripts/*.sh
       - name: Syntax-check Node scripts
         run: |
+          shopt -s nullglob
           for js in scripts/*.mjs scripts/*.js; do
-            [[ -f "$js" ]] && node --check "$js"
+            node --check "$js"
           done
 
   benchmarks:
