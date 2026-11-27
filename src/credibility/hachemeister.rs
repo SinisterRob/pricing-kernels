@@ -78,7 +78,7 @@ fn project_psd_2x2(a: f64, b: f64, d: f64) -> [f64; 4] {
     let tr = a + d;
     let diff = a - d;
     let disc = (diff * diff + 4.0 * b * b).sqrt();
-    let l1 = 0.5 * (tr + disc);
+    let l1 = f64::midpoint(tr, disc);
     let l2 = 0.5 * (tr - disc);
     if l2 >= 0.0 {
         return [a, b, b, d];
@@ -215,7 +215,8 @@ pub fn hachemeister_credibility(
     }
     let denom = (k - 1) as f64;
     let a00 = emp_cov[0] / denom - epv * mean_inv[0];
-    let a01 = 0.5 * (emp_cov[1] + emp_cov[2]) / denom - epv * 0.5 * (mean_inv[1] + mean_inv[2]);
+    let a01 = f64::midpoint(emp_cov[1], emp_cov[2]) / denom
+        - epv * f64::midpoint(mean_inv[1], mean_inv[2]);
     let a11 = emp_cov[3] / denom - epv * mean_inv[3];
     let vhm = project_psd_2x2(a00, a01, a11);
 

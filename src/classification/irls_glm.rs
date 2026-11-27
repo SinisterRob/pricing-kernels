@@ -351,7 +351,7 @@ pub fn fit_glm_irls_with_options(
     let mut eta = vec![0.0; n_samples];
     for i in 0..n_samples {
         let mu0 = match family {
-            GlmFamily::Binomial => (y[i] + 0.5) * 0.5,
+            GlmFamily::Binomial => f64::midpoint(y[i], 0.5),
             GlmFamily::Gamma | GlmFamily::InverseGaussian => y[i].max(1e-6),
             _ => y[i].max(0.1),
         };
@@ -632,8 +632,10 @@ pub fn select_tweedie_power(
             let yi = y[i];
             let d_i = family.unit_deviance(yi, mu[i]);
             if yi > 0.0 {
-                ll -=
-                    0.5 * ((std::f64::consts::TAU * (phi / wi) * yi.powf(p)).ln() + wi * d_i / phi);
+                ll -= f64::midpoint(
+                    (std::f64::consts::TAU * (phi / wi) * yi.powf(p)).ln(),
+                    wi * d_i / phi,
+                );
             } else {
                 ll -= 0.5 * wi * d_i / phi;
             }
