@@ -4,27 +4,26 @@ use serde::{Deserialize, Serialize};
 /// Result of non-parametric Bühlmann-Straub credibility estimation.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct BuhlmannStraubResult {
-    /// Credibility parameter K = s^2 / a = Expected Process Variance / Variance of Hypothetical Means.
+    /// Credibility parameter `K = s^2 / a = EPV / VHM`.
     pub k: f64,
-    /// Expected value of process variance (s^2 or EPV).
+    /// Expected value of process variance (`s^2` or EPV).
     pub epv: f64,
-    /// Variance of hypothetical means (a or VHM).
+    /// Variance of hypothetical means (`a` or VHM).
     pub vhm: f64,
-    /// Collective overall grand mean (mu).
+    /// Collective overall grand mean (`mu`), credibility-weighted when `VHM > 0`.
     pub grand_mean: f64,
-    /// Credibility weights Z_i = P_i / (P_i + K) for each group/risk.
+    /// Credibility weights `Z_i = P_i / (P_i + K)` for each group/risk.
     pub credibilities: Vec<f64>,
-    /// Blended credibility estimates for each group: Z_i * X_bar_i + (1 - Z_i) * mu.
+    /// Blended credibility estimates for each group: `Z_i * X_bar_i + (1 - Z_i) * mu`.
     pub blended_estimates: Vec<f64>,
 }
 
 /// Computes Bühlmann-Straub credibility for heterogeneous risk groups with non-uniform exposures.
 ///
-/// Ref: Bühlmann & Straub (1970) / CAS Exam 8 syllabus.
+/// Ref: Bühlmann & Straub (1970) / Klugman, Panjer & Willmot / CAS Exam 8 syllabus.
 ///
-/// - `groups_losses`: Slice of loss rates / loss ratios $X_{ij}$ for each group $i$ and period $j$.
-/// - `groups_weights`: Slice of exposures / weights $P_{ij}$ corresponding to each observation.
-/// - `periods_per_group`: Number of observation periods for each group.
+/// - `groups_losses`: Slice of per-period loss rates / loss ratios `X_{ij}` for each group `i`.
+/// - `groups_weights`: Slice of strictly positive exposures / weights `P_{ij}` for each observation.
 pub fn buhlmann_straub(
     groups_losses: &[&[f64]],
     groups_weights: &[&[f64]],
@@ -41,7 +40,7 @@ pub fn buhlmann_straub(
         ));
     }
 
-    let mut total_periods = 0;
+    let mut total_periods = 0usize;
     let mut group_total_weights = vec![0.0; n_groups];
     let mut group_weighted_means = vec![0.0; n_groups];
 
@@ -57,7 +56,12 @@ pub fn buhlmann_straub(
         let mut sum_p = 0.0;
         let mut sum_px = 0.0;
         for (&x, &p) in losses.iter().zip(weights.iter()) {
-            if p <= 0.0 {
+            if !x.is_finite() || !p.is_finite() {
+                return Err(PricingError::InvalidParameter(
+                    "losses and weights must be finite",
+                ));
+            }
+            if !(p > 0.0) {
                 return Err(PricingError::NonPositiveValue(
                     "weights must be strictly positive",
                 ));
@@ -75,7 +79,7 @@ pub fn buhlmann_straub(
         ));
     }
 
-    // 1. Calculate Expected Process Variance (s^2):
+    // 1. Expected Process Variance (s^2 = EPV):
     // s^2 = (1 / sum_i (n_i - 1)) * sum_i sum_j P_ij * (X_ij - X_bar_i)^2
     let mut s2_num = 0.0;
     for i in 0..n_groups {
@@ -88,19 +92,18 @@ pub fn buhlmann_straub(
         }
     }
     let df_epv = total_periods - n_groups;
-    let epv = (s2_num / df_epv as f64).max(1e-12);
+    let epv = (s2_num / df_epv as f64).max(0.0);
 
-    // 2. Calculate Grand Mean (mu) and Variance of Hypothetical Means (a / VHM):
+    // 2. Collective Exposure-Weighted Mean and Variance of Hypothetical Means (a = VHM):
     let total_weight: f64 = group_total_weights.iter().sum();
-    let mu_unweighted: f64 = group_weighted_means
+    let mu_exposure_weighted: f64 = group_weighted_means
         .iter()
         .zip(group_total_weights.iter())
         .map(|(&m, &w)| m * w)
         .sum::<f64>()
         / total_weight;
 
-    // m* calculation:
-    // c = total_weight - (sum_i P_i^2) / total_weight
+    // c = P - (sum_i P_i^2) / P
     let sum_p_sq: f64 = group_total_weights.iter().map(|&w| w * w).sum();
     let c = total_weight - (sum_p_sq / total_weight);
 
@@ -109,11 +112,14 @@ pub fn buhlmann_straub(
     let mut vhm_num = 0.0;
     for i in 0..n_groups {
         let p_i = group_total_weights[i];
-        let diff = group_weighted_means[i] - mu_unweighted;
+        let diff = group_weighted_means[i] - mu_exposure_weighted;
         vhm_num += p_i * diff * diff;
     }
-    let a_raw = (vhm_num - ((n_groups - 1) as f64) * epv) / c;
-    let vhm = a_raw.max(0.0);
+    let vhm = if c > 0.0 {
+        ((vhm_num - ((n_groups - 1) as f64) * epv) / c).max(0.0)
+    } else {
+        0.0
+    };
 
     // 3. Credibility K and Z_i
     let k = if vhm > 0.0 { epv / vhm } else { f64::INFINITY };
@@ -121,13 +127,12 @@ pub fn buhlmann_straub(
     let mut credibilities = vec![0.0; n_groups];
     let mut blended_estimates = vec![0.0; n_groups];
 
-    // Iteratively re-estimate mu with credibility weights if K is finite
     let mu = if vhm > 0.0 {
         let mut sum_z = 0.0;
         let mut sum_zx = 0.0;
         for i in 0..n_groups {
             let p_i = group_total_weights[i];
-            let z_i = p_i / (p_i + k);
+            let z_i = if k == 0.0 { 1.0 } else { p_i / (p_i + k) };
             credibilities[i] = z_i;
             sum_z += z_i;
             sum_zx += z_i * group_weighted_means[i];
@@ -135,10 +140,10 @@ pub fn buhlmann_straub(
         if sum_z > 0.0 {
             sum_zx / sum_z
         } else {
-            mu_unweighted
+            mu_exposure_weighted
         }
     } else {
-        mu_unweighted
+        mu_exposure_weighted
     };
 
     for i in 0..n_groups {

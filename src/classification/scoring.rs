@@ -1,9 +1,10 @@
+use crate::error::PricingError;
 use serde::{Deserialize, Serialize};
 
 /// High-performance multi-factor scoring table for commercial rating plans.
 ///
 /// Models the standard actuarial rating structure:
-/// Premium = BaseRate * Exposure * Product_k(Factor_k)
+/// `Premium = BaseRate * Exposure * Product_k(Factor_k)`
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MultiplicativeRater {
     /// Base rate per unit of exposure (e.g., rate per power unit or per $100 payroll).
@@ -65,9 +66,19 @@ impl MultiplicativeRater {
         exposures: &[f64],
         factor_matrix: &[&[f64]],
         results: &mut [f64],
-    ) {
-        for (i, (&exp, &factors)) in exposures.iter().zip(factor_matrix.iter()).enumerate() {
-            results[i] = self.score(exp, factors);
+    ) -> Result<(), PricingError> {
+        if exposures.len() != factor_matrix.len() || results.len() != exposures.len() {
+            return Err(PricingError::DimensionMismatch(
+                "exposures, factor_matrix, and results must have identical lengths",
+            ));
         }
+        for ((&exp, &factors), out) in exposures
+            .iter()
+            .zip(factor_matrix.iter())
+            .zip(results.iter_mut())
+        {
+            *out = self.score(exp, factors);
+        }
+        Ok(())
     }
 }

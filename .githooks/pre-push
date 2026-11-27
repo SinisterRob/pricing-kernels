@@ -1,0 +1,31 @@
+#!/usr/bin/env bash
+# Pre-push hook for pricing-kernels matching reserving-kernels CI gates.
+# Bypass in an emergency with: SKIP_HOOKS=1 git push ...
+
+set -euo pipefail
+
+if [[ "${SKIP_HOOKS:-0}" == "1" ]]; then
+  exit 0
+fi
+
+if ! command -v cargo >/dev/null 2>&1; then
+  echo "pre-push: cargo not found in PATH; skipping checks." >&2
+  exit 0
+fi
+
+echo "pre-push: running CI checks (fmt, clippy, rustdoc, tests, wasm, benches)..."
+cargo fmt --all -- --check
+cargo clippy --all-targets --no-default-features -- -D warnings
+cargo clippy --all-targets --all-features -- -D warnings
+cargo clippy --lib --all-features -- -D warnings -D clippy::unwrap_used -D clippy::panic
+RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --all-features
+cargo test --lib --tests --all-features
+cargo test --doc --all-features
+cargo check --benches --release
+
+if command -v rustup >/dev/null 2>&1; then
+  if rustup target list --installed 2>/dev/null | grep -qx 'wasm32-unknown-unknown'; then
+    echo "pre-push: building wasm32 release binary..."
+    cargo build --release --target wasm32-unknown-unknown --features wasm
+  fi
+fi

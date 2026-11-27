@@ -15,8 +15,8 @@ pub mod trending;
 /// Standard prelude re-exporting common pricing kernels and structs.
 pub mod prelude {
     pub use crate::classification::{
-        GlmFamily, GlmResult, MinimumBiasResult, MultiplicativeRater, bailey_simon_multiplicative,
-        fit_glm_irls,
+        GlmFamily, GlmResult, MinimumBiasResult, MultiplicativeRater, bailey_simon_chi_squared,
+        bailey_simon_multiplicative, fit_glm_irls,
     };
     pub use crate::credibility::{BuhlmannStraubResult, ClassicalCredibility, buhlmann_straub};
     pub use crate::error::PricingError;
@@ -26,5 +26,7 @@ pub mod prelude {
         solve_balanced_retro_plan,
     };
     pub use crate::layers::{CommercialLayer, SeverityDistribution};
-    pub use crate::trending::{RateChange, TrendModel, parallelogram_on_level_factor};
+    pub use crate::trending::{
+        RateChange, TrendModel, parallelogram_on_level_factor, policy_year_on_level_factor,
+    };
 }

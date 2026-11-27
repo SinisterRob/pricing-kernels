@@ -2,27 +2,29 @@ use crate::error::PricingError;
 use crate::linalg::{cholesky_invert, cholesky_solve};
 use serde::{Deserialize, Serialize};
 
-/// GLM error family for pricing kernels.
+/// GLM error family for pricing kernels (all using canonical/standard log link).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum GlmFamily {
-    /// Poisson family with log link: log(mu) = X beta + offset. Variance V(mu) = mu.
+    /// Poisson family with log link: `log(mu) = X beta + offset`, `V(mu) = mu`, `phi = 1.0`.
     Poisson,
-    /// Gamma family with log link: log(mu) = X beta + offset. Variance V(mu) = mu^2.
+    /// Overdispersed (quasi-)Poisson family with log link: `V(mu) = mu`, `phi` estimated via Pearson chi-squared / df.
+    QuasiPoisson,
+    /// Gamma family with log link: `log(mu) = X beta + offset`, `V(mu) = mu^2`, `phi` estimated via Pearson chi-squared / df.
     Gamma,
 }
 
 /// Fitted GLM result with coefficients, standard errors, dispersion, and deviance.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct GlmResult {
-    /// Estimated regression coefficients (beta).
+    /// Estimated regression coefficients (`beta`).
     pub coefficients: Vec<f64>,
-    /// Asymptotic standard errors for coefficients: sqrt(diag(phi * (X^T W X)^-1)).
+    /// Asymptotic standard errors for coefficients: `sqrt(diag(phi * (X^T W X)^-1))`.
     pub standard_errors: Vec<f64>,
-    /// Estimated dispersion parameter (phi). For Poisson, fixed or quasi-dispersion.
+    /// Dispersion parameter (`phi`): `1.0` for `Poisson`, Pearson `chi^2 / df` for `QuasiPoisson` and `Gamma`.
     pub dispersion: f64,
-    /// Residual deviance: 2 * sum w_i * d(y_i, mu_i).
+    /// Residual deviance: `2 * sum w_i * d(y_i, mu_i)`.
     pub deviance: f64,
-    /// Degrees of freedom of the residuals (N - p).
+    /// Residual degrees of freedom (`n_active - p`).
     pub df_residual: usize,
     /// Number of IRLS iterations until convergence.
     pub iterations: usize,
@@ -32,9 +34,9 @@ pub struct GlmResult {
 ///
 /// Designed specifically for actuarial commercial rating tables:
 /// - `design_matrix`: Row-major slice of size `n_samples * n_features`.
-/// - `y`: Observed responses (e.g. claim count for Poisson, average severity for Gamma).
-/// - `weights`: Prior weights (e.g. 1.0 for counts, claim count for severity).
-/// - `offsets`: Exposure offset $\ln(E)$ for Poisson log-link (use 0.0 if none).
+/// - `y`: Observed responses (`>= 0` for Poisson/QuasiPoisson, `> 0` for Gamma on active rows).
+/// - `weights`: Non-negative prior weights (e.g. `1.0` for counts, claim count for severity).
+/// - `offsets`: Exposure offset `ln(E)` for log-link (use `0.0` if none).
 #[allow(clippy::too_many_arguments)]
 pub fn fit_glm_irls(
     family: GlmFamily,
@@ -52,6 +54,14 @@ pub fn fit_glm_irls(
             "samples and features must be non-zero",
         ));
     }
+    if max_iter == 0 {
+        return Err(PricingError::InvalidParameter("max_iter must be > 0"));
+    }
+    if !tol.is_finite() || !(tol > 0.0) {
+        return Err(PricingError::InvalidParameter(
+            "tolerance must be finite and positive",
+        ));
+    }
     if n_samples < n_features {
         return Err(PricingError::DimensionMismatch(
             "number of samples must be >= features",
@@ -67,31 +77,70 @@ pub fn fit_glm_irls(
             "vector dimensions do not match n_samples",
         ));
     }
+    if design_matrix.iter().any(|v| !v.is_finite()) {
+        return Err(PricingError::InvalidParameter(
+            "design matrix contains non-finite value",
+        ));
+    }
 
-    // Initialize beta = 0.0 or intercept-based
-    let mut beta = vec![0.0; n_features];
-
-    // Compute sample mean with offsets for sensible starting value
-    let mut sum_y = 0.0;
-    let mut sum_w = 0.0;
+    let mut active_samples = 0usize;
     for i in 0..n_samples {
-        if weights[i] > 0.0 {
-            sum_y += weights[i] * y[i];
-            sum_w += weights[i];
+        let yi = y[i];
+        let wi = weights[i];
+        let oi = offsets[i];
+        if !yi.is_finite() || !wi.is_finite() || !oi.is_finite() {
+            return Err(PricingError::InvalidParameter(
+                "y, weights, and offsets must be finite",
+            ));
+        }
+        if wi < 0.0 {
+            return Err(PricingError::InvalidParameter(
+                "weights must be non-negative",
+            ));
+        }
+        if wi > 0.0 {
+            active_samples += 1;
+            match family {
+                GlmFamily::Poisson | GlmFamily::QuasiPoisson => {
+                    if yi < 0.0 {
+                        return Err(PricingError::InvalidParameter(
+                            "Poisson response y must be non-negative",
+                        ));
+                    }
+                }
+                GlmFamily::Gamma => {
+                    if !(yi > 0.0) {
+                        return Err(PricingError::NonPositiveValue(
+                            "Gamma response y must be strictly positive",
+                        ));
+                    }
+                }
+            }
         }
     }
-    let mean_y = if sum_w > 0.0 {
-        (sum_y / sum_w).max(1e-4)
-    } else {
-        1.0
-    };
-    beta[0] = mean_y.ln();
 
-    let mut eta = vec![0.0; n_samples];
+    if active_samples < n_features {
+        return Err(PricingError::DimensionMismatch(
+            "number of positively weighted samples must be >= features",
+        ));
+    }
+
+    // Standard R glm.fit initialization (mustart): invariant to offsets and whether
+    // column 0 is an intercept.
     let mut mu = vec![0.0; n_samples];
-    let mut w_irls = vec![0.0; n_samples];
-    let mut z = vec![0.0; n_samples]; // working response
+    let mut eta = vec![0.0; n_samples];
+    for i in 0..n_samples {
+        let mu0 = match family {
+            GlmFamily::Poisson | GlmFamily::QuasiPoisson => y[i].max(0.1),
+            GlmFamily::Gamma => y[i].max(1e-6),
+        };
+        mu[i] = mu0;
+        eta[i] = mu0.ln();
+    }
 
+    let mut beta = vec![0.0; n_features];
+    let mut w_irls = vec![0.0; n_samples];
+    let mut z = vec![0.0; n_samples];
     let mut xtwx = vec![0.0; n_features * n_features];
     let mut xtwz = vec![0.0; n_features];
 
@@ -101,49 +150,31 @@ pub fn fit_glm_irls(
     while iter < max_iter {
         iter += 1;
 
-        // 1. Calculate linear predictor eta_i = sum_j X_ij * beta_j + offset_i
         for i in 0..n_samples {
-            let mut line = offsets[i];
-            let row = &design_matrix[i * n_features..(i + 1) * n_features];
-            for j in 0..n_features {
-                line += row[j] * beta[j];
+            let wi = weights[i];
+            if wi <= 0.0 {
+                w_irls[i] = 0.0;
+                z[i] = 0.0;
+                continue;
             }
-            eta[i] = line;
-
-            // Link function: log link -> mu = exp(eta), clamped to avoid float overflow
-            let mu_i = line.clamp(-700.0, 700.0).exp();
-            mu[i] = mu_i.max(1e-12);
-
-            // Working response and weights
-            match family {
-                GlmFamily::Poisson => {
-                    // g'(mu) = 1/mu, V(mu) = mu
-                    // W = w_prior / (V(mu) * [g']^2) = w_prior * mu
-                    // z = eta + (y - mu) * g'(mu) = eta + (y - mu) / mu
-                    let prior_w = weights[i];
-                    w_irls[i] = (prior_w * mu[i]).max(1e-12);
-                    z[i] = (eta[i] - offsets[i]) + (y[i] - mu[i]) / mu[i];
-                }
-                GlmFamily::Gamma => {
-                    // g'(mu) = 1/mu, V(mu) = mu^2
-                    // W = w_prior / (V(mu) * [g']^2) = w_prior
-                    // z = eta + (y - mu) / mu
-                    let prior_w = weights[i];
-                    w_irls[i] = prior_w.max(1e-12);
-                    z[i] = (eta[i] - offsets[i]) + (y[i] - mu[i]) / mu[i];
-                }
-            }
+            let mui = mu[i];
+            w_irls[i] = match family {
+                GlmFamily::Poisson | GlmFamily::QuasiPoisson => wi * mui,
+                GlmFamily::Gamma => wi,
+            };
+            z[i] = (eta[i] - offsets[i]) + (y[i] - mui) / mui;
         }
 
-        // 2. Form normal equations: (X^T W X) beta_new = X^T W z
+        // Form normal equations: (X^T W X) beta_new = X^T W z
         xtwx.fill(0.0);
         xtwz.fill(0.0);
-
         for i in 0..n_samples {
             let wi = w_irls[i];
+            if wi <= 0.0 {
+                continue;
+            }
             let zi = z[i];
             let row = &design_matrix[i * n_features..(i + 1) * n_features];
-
             for j in 0..n_features {
                 let x_ij = row[j];
                 xtwz[j] += wi * x_ij * zi;
@@ -157,15 +188,8 @@ pub fn fit_glm_irls(
             }
         }
 
-        // Small Tikhonov regularization on diagonal for numerical stability (1e-9)
-        for j in 0..n_features {
-            xtwx[j * n_features + j] += 1e-9;
-        }
-
-        // 3. Solve for beta_new
         let beta_new = cholesky_solve(&xtwx, n_features, &xtwz)?;
 
-        // Check convergence
         let mut max_change = 0.0;
         for j in 0..n_features {
             let change = (beta_new[j] - beta[j]).abs();
@@ -175,57 +199,89 @@ pub fn fit_glm_irls(
         }
 
         beta = beta_new;
-        if max_change < tol {
+
+        // Recompute eta and mu at the updated beta so diagnostics & next iteration are exact.
+        for i in 0..n_samples {
+            let mut line = offsets[i];
+            let row = &design_matrix[i * n_features..(i + 1) * n_features];
+            for j in 0..n_features {
+                line += row[j] * beta[j];
+            }
+            eta[i] = line;
+            mu[i] = line.clamp(-700.0, 700.0).exp().max(1e-15);
+        }
+
+        if iter > 1 && max_change <= tol {
             converged = true;
             break;
         }
     }
 
-    if !converged && iter >= max_iter {
+    if !converged {
         return Err(PricingError::NonConvergence(
             "GLM IRLS did not converge within max iterations",
         ));
     }
 
-    // Compute deviance
+    // Recompute final Fisher information X^T W X, deviance, and Pearson chi-squared at converged beta.
+    xtwx.fill(0.0);
     let mut deviance = 0.0;
+    let mut pearson_chi2 = 0.0;
+
     for i in 0..n_samples {
-        let yi = y[i];
-        let mui = mu[i];
         let wi = weights[i];
         if wi <= 0.0 {
             continue;
         }
-        let cell_dev = match family {
-            GlmFamily::Poisson => {
-                if yi > 0.0 {
+        let yi = y[i];
+        let mui = mu[i];
+
+        let w_final = match family {
+            GlmFamily::Poisson | GlmFamily::QuasiPoisson => wi * mui,
+            GlmFamily::Gamma => wi,
+        };
+        let row = &design_matrix[i * n_features..(i + 1) * n_features];
+        for j in 0..n_features {
+            let x_ij = row[j];
+            for k in 0..=j {
+                let val = w_final * x_ij * row[k];
+                xtwx[j * n_features + k] += val;
+                if k != j {
+                    xtwx[k * n_features + j] += val;
+                }
+            }
+        }
+
+        match family {
+            GlmFamily::Poisson | GlmFamily::QuasiPoisson => {
+                deviance += if yi > 0.0 {
                     2.0 * wi * (yi * (yi / mui).ln() - (yi - mui))
                 } else {
                     2.0 * wi * mui
-                }
+                };
+                let diff = yi - mui;
+                pearson_chi2 += wi * (diff * diff) / mui;
             }
             GlmFamily::Gamma => {
-                if yi > 0.0 {
-                    2.0 * wi * (-((yi / mui).ln()) + (yi - mui) / mui)
-                } else {
-                    0.0
-                }
+                deviance += 2.0 * wi * (-((yi / mui).ln()) + (yi - mui) / mui);
+                let rel = (yi - mui) / mui;
+                pearson_chi2 += wi * rel * rel;
             }
-        };
-        deviance += cell_dev;
+        }
     }
 
-    let df_residual = n_samples.saturating_sub(n_features);
-    let dispersion = if df_residual > 0 {
-        match family {
-            GlmFamily::Poisson => (deviance / df_residual as f64).max(1.0), // Pearson/Deviance quasi-dispersion
-            GlmFamily::Gamma => deviance / df_residual as f64,
+    let df_residual = active_samples.saturating_sub(n_features);
+    let dispersion = match family {
+        GlmFamily::Poisson => 1.0,
+        GlmFamily::QuasiPoisson | GlmFamily::Gamma => {
+            if df_residual > 0 {
+                pearson_chi2 / df_residual as f64
+            } else {
+                1.0
+            }
         }
-    } else {
-        1.0
     };
 
-    // Covariance matrix = phi * (X^T W X)^-1
     let inv_xtwx = cholesky_invert(&xtwx, n_features)?;
     let mut standard_errors = vec![0.0; n_features];
     for j in 0..n_features {
