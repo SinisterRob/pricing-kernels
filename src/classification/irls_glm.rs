@@ -5,7 +5,8 @@
 //! Step-halving follows the `glm.fit` / Marschner (2011, *The R Journal* 3(2), "glm2: Fitting
 //! Generalized Linear Models with Convergence Problems") convention: whenever a full IRLS step
 //! yields a non-finite or increased (penalized) deviance, the step is halved toward the previous
-//! iterate up to [`MAX_STEP_HALVINGS`] times before returning [`PricingError::NonConvergence`].
+//! iterate up to [the step-halving cap](crate::classification::irls_glm::MAX_STEP_HALVINGS) times before returning
+//! [a non-convergence error](crate::error::PricingError::NonConvergence).
 
 use super::tweedie::{TweedieSeries, maximize_over_dispersion, tweedie_log_likelihood};
 use crate::error::PricingError;

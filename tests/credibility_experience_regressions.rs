@@ -864,3 +864,25 @@ fn ncci_mod_rounds_half_up_to_two_decimals() {
     let res = calculate_ncci_experience_mod(&spec, &claim).unwrap();
     assert_eq!(res.mod_factor, 0.85);
 }
+
+#[test]
+fn buhlmann_straub_result_round_trips_json_with_infinite_k() {
+    // Identical group means -> VHM = 0 -> K = +inf (no credibility).
+    let losses: [&[f64]; 2] = [&[1.0, 3.0], &[3.0, 1.0]];
+    let weights: [&[f64]; 2] = [&[1.0, 1.0], &[1.0, 1.0]];
+    let res = buhlmann_straub(&losses, &weights).expect("valid");
+    assert!(res.k.is_infinite());
+    let json = serde_json::to_string(&res).expect("serialize");
+    assert!(json.contains("\"k\":null"));
+    let back: pricing_kernels::credibility::BuhlmannStraubResult =
+        serde_json::from_str(&json).expect("round-trip");
+    assert_eq!(back, res);
+
+    // Finite K still round-trips as a number.
+    let losses: [&[f64]; 2] = [&[1.0, 2.0], &[8.0, 9.0]];
+    let res = buhlmann_straub(&losses, &weights).expect("valid");
+    assert!(res.k.is_finite());
+    let back: pricing_kernels::credibility::BuhlmannStraubResult =
+        serde_json::from_str(&serde_json::to_string(&res).expect("serialize")).expect("rt");
+    assert_eq!(back, res);
+}

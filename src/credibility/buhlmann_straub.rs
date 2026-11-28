@@ -145,7 +145,9 @@ impl CredibilityPanel {
 /// Result of non-parametric Bühlmann-Straub credibility estimation.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct BuhlmannStraubResult {
-    /// Credibility parameter `K = s^2 / a = EPV / VHM`.
+    /// Credibility parameter `K = s^2 / a = EPV / VHM` (`+inf` when `VHM = 0`, i.e. no
+    /// credibility). Serialized as JSON `null` when infinite, since JSON has no infinity.
+    #[serde(with = "pos_inf_as_null")]
     pub k: f64,
     /// Expected value of process variance (`s^2` or EPV).
     pub epv: f64,
@@ -306,4 +308,23 @@ pub fn buhlmann_straub(
         credibilities,
         blended_estimates,
     })
+}
+
+/// Serde adapter for a non-negative `f64` that may be `+inf`: written as `null` when
+/// infinite (JSON cannot represent infinity) and read back from `null` as `+inf`.
+mod pos_inf_as_null {
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    #[allow(clippy::trivially_copy_pass_by_ref)] // signature required by `serde(with)`
+    pub(super) fn serialize<S: Serializer>(value: &f64, serializer: S) -> Result<S::Ok, S::Error> {
+        if value.is_infinite() && value.is_sign_positive() {
+            serializer.serialize_none()
+        } else {
+            serializer.serialize_some(value)
+        }
+    }
+
+    pub(super) fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<f64, D::Error> {
+        Ok(Option::<f64>::deserialize(deserializer)?.unwrap_or(f64::INFINITY))
+    }
 }
