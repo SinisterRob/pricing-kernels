@@ -1,12 +1,24 @@
 //! Iteratively Reweighted Least Squares (IRLS) GLM solver with Householder QR WLS,
-//! optional L2 (Ridge) penalization, and Dunn & Smyth (2005) Tweedie power selection.
+//! optional L2 (Ridge) penalization, deviance-monitored step-halving, and Tweedie power
+//! selection by exact Dunn & Smyth (2005) series profile likelihood.
+//!
+//! Step-halving follows the `glm.fit` / Marschner (2011, *The R Journal* 3(2), "glm2: Fitting
+//! Generalized Linear Models with Convergence Problems") convention: whenever a full IRLS step
+//! yields a non-finite or increased (penalized) deviance, the step is halved toward the previous
+//! iterate up to [`MAX_STEP_HALVINGS`] times before returning [`PricingError::NonConvergence`].
 
+use super::tweedie::{TweedieSeries, maximize_over_dispersion, tweedie_log_likelihood};
 use crate::error::PricingError;
 use crate::linalg::{
     QrWorkspace, weighted_least_squares_qr_ridge_cm_beta_into,
     weighted_least_squares_qr_ridge_cm_cov,
 };
 use serde::{Deserialize, Serialize};
+
+/// Maximum number of IRLS step-halvings per iteration before declaring divergence.
+pub const MAX_STEP_HALVINGS: usize = 30;
+/// Relative tolerance on a (penalized) deviance increase that triggers step-halving.
+const DEVIANCE_INCREASE_RTOL: f64 = 1e-10;
 
 /// GLM error family for commercial actuarial pricing kernels.
 ///
@@ -641,6 +653,10 @@ pub fn fit_glm_irls(
 }
 
 /// Fit an unpenalized or L2 (Ridge) penalized GLM via IRLS with configurable [`GlmOptions`].
+///
+/// Each IRLS step is deviance-monitored: a step producing a non-finite or increased
+/// penalized deviance `D(β) + λ Σ β_j²` is halved toward the previous iterate (up to
+/// [`MAX_STEP_HALVINGS`] times), otherwise [`PricingError::NonConvergence`] is returned.
 #[allow(clippy::too_many_arguments)]
 pub fn fit_glm_irls_with_options(
     family: GlmFamily,
@@ -651,6 +667,56 @@ pub fn fit_glm_irls_with_options(
     weights: &[f64],
     offsets: &[f64],
     options: &GlmOptions,
+) -> Result<GlmResult, PricingError> {
+    fit_glm_irls_impl(
+        family,
+        design_matrix,
+        n_samples,
+        n_features,
+        y,
+        weights,
+        offsets,
+        options,
+        None,
+    )
+}
+
+/// Penalized deviance `Σ w_i d(y_i, μ_i) + λ Σ_j β_j²` (intercept excluded unless penalized).
+#[allow(clippy::too_many_arguments)]
+fn penalized_deviance(
+    family: GlmFamily,
+    y: &[f64],
+    weights: &[f64],
+    mu: &[f64],
+    beta: &[f64],
+    ridge_lambda: f64,
+    penalize_intercept: bool,
+) -> f64 {
+    let mut dev = 0.0;
+    for i in 0..y.len() {
+        if weights[i] > 0.0 {
+            dev += weights[i] * family.unit_deviance(y[i], mu[i]);
+        }
+    }
+    if ridge_lambda > 0.0 {
+        let start = usize::from(!penalize_intercept);
+        dev += ridge_lambda * beta.iter().skip(start).map(|b| b * b).sum::<f64>();
+    }
+    dev
+}
+
+/// IRLS core; `deviance_trace` (when `Some`) records the accepted penalized deviance per iteration.
+#[allow(clippy::too_many_arguments)]
+fn fit_glm_irls_impl(
+    family: GlmFamily,
+    design_matrix: &[f64],
+    n_samples: usize,
+    n_features: usize,
+    y: &[f64],
+    weights: &[f64],
+    offsets: &[f64],
+    options: &GlmOptions,
+    mut deviance_trace: Option<&mut Vec<f64>>,
 ) -> Result<GlmResult, PricingError> {
     family.validate()?;
     if n_samples == 0 || n_features == 0 {
@@ -792,6 +858,19 @@ pub fn fit_glm_irls_with_options(
 
     let mut iter = 0;
     let mut converged = false;
+    let mut dev_old = f64::INFINITY;
+
+    let update_linear_predictor = |beta: &[f64], eta: &mut [f64], mu: &mut [f64]| {
+        for i in 0..n_samples {
+            let mut line = offsets[i];
+            let row = &design_matrix[i * n_features..(i + 1) * n_features];
+            for j in 0..n_features {
+                line += row[j] * beta[j];
+            }
+            eta[i] = line;
+            mu[i] = family.inverse_link(line);
+        }
+    };
 
     while iter < options.max_iter {
         iter += 1;
@@ -820,28 +899,60 @@ pub fn fit_glm_irls_with_options(
             &mut beta_new,
         )?;
 
-        let mut max_change = 0.0;
-        for j in 0..n_features {
-            if !beta_new[j].is_finite() {
+        if beta_new.iter().any(|b| !b.is_finite()) {
+            return Err(PricingError::NonConvergence(
+                "GLM IRLS produced non-finite coefficient",
+            ));
+        }
+
+        // Deviance-monitored step-halving (glm.fit / glm2 convention). On the first
+        // iteration only non-finite deviance triggers halving (the start is `mustart`).
+        update_linear_predictor(&beta_new, &mut eta, &mut mu);
+        let mut dev_new = penalized_deviance(
+            family,
+            y,
+            weights,
+            &mu,
+            &beta_new,
+            options.ridge_lambda,
+            options.penalize_intercept,
+        );
+        let mut halvings = 0usize;
+        while !dev_new.is_finite()
+            || (iter > 1 && dev_new > dev_old + DEVIANCE_INCREASE_RTOL * (1.0 + dev_old.abs()))
+        {
+            if halvings == MAX_STEP_HALVINGS {
                 return Err(PricingError::NonConvergence(
-                    "GLM IRLS produced non-finite coefficient",
+                    "GLM IRLS step-halving failed to reduce deviance",
                 ));
             }
+            halvings += 1;
+            for j in 0..n_features {
+                beta_new[j] = f64::midpoint(beta_new[j], beta[j]);
+            }
+            update_linear_predictor(&beta_new, &mut eta, &mut mu);
+            dev_new = penalized_deviance(
+                family,
+                y,
+                weights,
+                &mu,
+                &beta_new,
+                options.ridge_lambda,
+                options.penalize_intercept,
+            );
+        }
+        dev_old = dev_new;
+        if let Some(trace) = deviance_trace.as_deref_mut() {
+            trace.push(dev_new);
+        }
+
+        let mut max_change = 0.0;
+        for j in 0..n_features {
             let change = (beta_new[j] - beta[j]).abs();
             if change > max_change {
                 max_change = change;
             }
             beta[j] = beta_new[j];
-        }
-
-        for i in 0..n_samples {
-            let mut line = offsets[i];
-            let row = &design_matrix[i * n_features..(i + 1) * n_features];
-            for j in 0..n_features {
-                line += row[j] * beta[j];
-            }
-            eta[i] = line;
-            mu[i] = family.inverse_link(line);
         }
 
         if iter > 1 && max_change <= options.tol {
@@ -951,22 +1062,30 @@ pub fn predict_glm(
     Ok(preds)
 }
 
-/// Result of Tweedie power parameter grid search via saddlepoint profile log-likelihood
-/// (Dunn & Smyth 2005 / CAS Monograph No. 5).
+/// Result of Tweedie power grid search by exact profile log-likelihood
+/// (Dunn & Smyth 2005 series density with profile-ML dispersion).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TweediePowerSelection {
-    /// Selected variance power `p in (1, 2)` maximizing saddlepoint profile log-likelihood.
+    /// Selected variance power `p in (1, 2)` maximizing the profile log-likelihood.
     pub best_power: f64,
-    /// Saddlepoint profile log-likelihood at `best_power`.
+    /// Profile log-likelihood `max_φ ℓ(μ̂_p, φ, p)` at `best_power`.
     pub best_log_likelihood: f64,
+    /// Profile maximum-likelihood dispersion `φ̂` at `best_power`.
+    pub best_dispersion: f64,
     /// Fitted GLM result at `best_power`.
     pub best_fit: GlmResult,
-    /// Evaluated `(power, saddlepoint_log_likelihood)` pairs across all candidate powers.
+    /// Evaluated `(power, profile_log_likelihood)` pairs across all candidate powers.
     pub profile: Vec<(f64, f64)>,
 }
 
-/// Select the Tweedie variance power `p in (1, 2)` over `candidate_powers` by maximizing
-/// the Dunn & Smyth (2005) saddlepoint profile log-likelihood.
+/// Select the Tweedie variance power `p in (1, 2)` over `candidate_powers` by maximizing the
+/// exact profile log-likelihood.
+///
+/// For each candidate `p`: fit the IRLS Tweedie GLM for `μ̂_p`, then maximize the exact
+/// Dunn & Smyth (2005) series log-likelihood `Σ ln f(y_i; μ̂_i, φ / w_i, p)` over `φ`
+/// (golden-section on `ln φ`, started at the Pearson estimate). This follows the
+/// `tweedie.profile` procedure of Dunn & Smyth; the saddlepoint approximation is not used
+/// because it is biased for small `y` and can favour boundary powers.
 #[allow(clippy::too_many_arguments)]
 pub fn select_tweedie_power(
     candidate_powers: &[f64],
@@ -985,9 +1104,7 @@ pub fn select_tweedie_power(
     }
 
     let mut profile = Vec::with_capacity(candidate_powers.len());
-    let mut best_power = f64::NAN;
-    let mut best_ll = f64::NEG_INFINITY;
-    let mut best_fit: Option<GlmResult> = None;
+    let mut best: Option<(f64, f64, f64, GlmResult)> = None;
 
     for &p in candidate_powers {
         let family = GlmFamily::Tweedie { power: p };
@@ -1009,34 +1126,23 @@ pub fn select_tweedie_power(
             &fit.coefficients,
             offsets,
         )?;
-        let phi = fit.dispersion.max(1e-12);
-
-        // Dunn & Smyth (2005) saddlepoint log-likelihood approximation
-        let mut ll = 0.0;
-        for i in 0..n_samples {
-            let wi = weights[i];
-            if wi <= 0.0 {
-                continue;
-            }
-            let yi = y[i];
-            let d_i = family.unit_deviance(yi, mu[i]);
-            if yi > 0.0 {
-                let log_norm = (std::f64::consts::TAU * (phi / wi)).ln() + p * yi.ln();
-                ll -= f64::midpoint(log_norm, wi * d_i / phi);
-            } else {
-                ll -= 0.5 * wi * d_i / phi;
-            }
-        }
+        let phi_start = if fit.dispersion.is_finite() && fit.dispersion > 0.0 {
+            fit.dispersion
+        } else {
+            1.0
+        };
+        let mut series = TweedieSeries::new(p)?;
+        let (phi_hat, ll) = maximize_over_dispersion(phi_start, |phi| {
+            tweedie_log_likelihood(&mut series, y, &mu, weights, phi)
+        })?;
 
         profile.push((p, ll));
-        if ll > best_ll {
-            best_ll = ll;
-            best_power = p;
-            best_fit = Some(fit);
+        if best.as_ref().is_none_or(|b| ll > b.1) {
+            best = Some((p, ll, phi_hat, fit));
         }
     }
 
-    let Some(fit) = best_fit else {
+    let Some((best_power, best_log_likelihood, best_dispersion, best_fit)) = best else {
         return Err(PricingError::NonConvergence(
             "no valid Tweedie power converged",
         ));
@@ -1044,8 +1150,58 @@ pub fn select_tweedie_power(
 
     Ok(TweediePowerSelection {
         best_power,
-        best_log_likelihood: best_ll,
-        best_fit: fit,
+        best_log_likelihood,
+        best_dispersion,
+        best_fit,
         profile,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Gamma log-link severity fit with a poor (`mustart = y`) start and widely spread
+    /// responses: the accepted deviance sequence must be non-increasing.
+    #[test]
+    fn irls_step_halving_keeps_deviance_monotone() {
+        let n = 12usize;
+        let mut x = Vec::with_capacity(2 * n);
+        let mut y = Vec::with_capacity(n);
+        for i in 0..n {
+            let xi = i as f64 / 2.0;
+            x.push(1.0);
+            x.push(xi);
+            // Heavily dispersed severities spanning ~8 orders of magnitude.
+            y.push(if i % 3 == 0 { 1e-3 } else { 10f64.powf(xi) });
+        }
+        let w = vec![1.0; n];
+        let off = vec![0.0; n];
+        for family in [
+            GlmFamily::Gamma,
+            GlmFamily::Poisson,
+            GlmFamily::Tweedie { power: 1.5 },
+        ] {
+            let mut trace = Vec::new();
+            let res = fit_glm_irls_impl(
+                family,
+                &x,
+                n,
+                2,
+                &y,
+                &w,
+                &off,
+                &GlmOptions::default().with_max_iter(500),
+                Some(&mut trace),
+            );
+            assert!(trace.len() >= 2, "{family:?}: {res:?}");
+            for pair in trace[1..].windows(2) {
+                assert!(
+                    pair[1] <= pair[0] * (1.0 + 1e-9) + 1e-12,
+                    "{family:?} deviance increased: {trace:?}"
+                );
+            }
+            assert!(res.is_ok(), "{family:?}: {res:?}");
+        }
+    }
 }

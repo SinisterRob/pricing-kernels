@@ -20,6 +20,8 @@ pub mod minimum_bias;
 pub mod regularized_glm;
 /// Zero-allocation multiplicative rating plan scorer.
 pub mod scoring;
+/// Exact Tweedie compound Poisson–Gamma density via the Dunn & Smyth (2005) series.
+pub mod tweedie;
 
 pub use diagnostics::{
     DoubleLiftBucket, GiniResult, InformationCriteria, LorenzCurvePoint, double_lift_chart,
@@ -38,3 +40,4 @@ pub use regularized_glm::{
     fit_regularized_glm, fit_zero_inflated_poisson, natural_cubic_spline_basis,
 };
 pub use scoring::MultiplicativeRater;
+pub use tweedie::tweedie_log_density;
