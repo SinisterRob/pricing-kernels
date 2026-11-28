@@ -22,8 +22,10 @@ pub const MAX_STEP_HALVINGS: usize = 30;
 const DEVIANCE_INCREASE_RTOL: f64 = 1e-10;
 /// Additive constant in the `glm.fit` relative-deviance stop `|D - D_old| / (|D| + 0.1) < tol`.
 const DEVIANCE_RTOL_OFFSET: f64 = 0.1;
-/// If IRLS stops on the deviance criterion while some coefficient still moves by more than
-/// this per iteration, the estimates are drifting to infinity (zero-claim level / separation).
+/// If IRLS stops on the deviance criterion while some fitted linear predictor `eta_i = x_i^T beta`
+/// still moves by more than this per iteration, the estimates are drifting to infinity
+/// (zero-claim level / separation). Measured on `eta` (dimensionless on the link scale), not on
+/// raw coefficients, so the flag is invariant to rescaling any covariate.
 const SEPARATION_STEP_THRESHOLD: f64 = 1e-2;
 /// Binomial fitted means within this distance of 0 or 1 are numerically on the boundary
 /// (`10 ×` the inverse-link clamp, as in R `glm.fit`'s "fitted probabilities 0 or 1").
@@ -286,8 +288,9 @@ pub struct GlmResult {
     pub df_residual: usize,
     /// Number of IRLS iterations until convergence.
     pub iterations: usize,
-    /// Potentially infinite estimates: the fit stopped on the deviance criterion while a
-    /// coefficient was still drifting (`> 1e-2` per iteration), or some fitted mean is
+    /// Potentially infinite estimates: the fit stopped on the deviance criterion while some
+    /// linear predictor `eta_i` was still drifting (`> 1e-2` per iteration on the link scale,
+    /// hence invariant to covariate units), or some fitted mean is
     /// numerically on the boundary (`μ ≈ 0`, or `μ ≈ 1` for Binomial). Typical causes are a
     /// rating level with zero claims (log link) or complete / quasi-complete separation
     /// (Binomial); the affected relativities are effectively `0` (or `∞`) and their standard
@@ -495,7 +498,9 @@ impl DesignMatrix {
     }
 
     /// Fit an Elastic Net / Ridge / LASSO penalized GLM directly on this [`DesignMatrix`]
-    /// (treat columns as predictor features; intercept is added automatically).
+    /// (treat columns as predictor features; intercept is added automatically and any
+    /// constant column — such as the explicit intercept column used by [`GlmFit`] — is
+    /// dropped, with coefficient `0.0`).
     pub fn fit_regularized(
         &self,
         y: &[f64],
@@ -515,6 +520,10 @@ impl DesignMatrix {
     }
 
     /// Fit a Laplace-approximated Poisson random-intercept GLMM directly on this [`DesignMatrix`].
+    ///
+    /// The model intercept is added automatically; a constant column (such as the explicit
+    /// intercept column used by [`GlmFit`]) is dropped exactly as in
+    /// [`DesignMatrix::fit_regularized`] and reported with fixed effect `0.0`.
     pub fn fit_random_intercept_glmm(
         &self,
         y: &[f64],
@@ -852,7 +861,7 @@ fn fit_glm_irls_impl(
     let mut iter = 0;
     let mut converged = false;
     let mut dev_old = f64::INFINITY;
-    let mut last_step = 0.0_f64;
+    let mut last_eta_step = 0.0_f64;
 
     let update_linear_predictor = |beta: &[f64], eta: &mut [f64], mu: &mut [f64]| {
         for i in 0..n_samples {
@@ -948,14 +957,26 @@ fn fit_glm_irls_impl(
             if change > max_change {
                 max_change = change;
             }
-            beta[j] = beta_new[j];
         }
 
         if iter > 1 && (dev_rel_change < options.tol || max_change <= options.tol) {
             converged = true;
-            last_step = max_change;
+            // Scale-free drift measure: largest per-iteration change of an active eta_i.
+            last_eta_step = (0..n_samples)
+                .filter(|&i| weights[i] > 0.0)
+                .map(|i| {
+                    let row = &design_matrix[i * n_features..(i + 1) * n_features];
+                    row.iter()
+                        .zip(beta_new.iter().zip(beta.iter()))
+                        .map(|(&x, (&bn, &bo))| x * (bn - bo))
+                        .sum::<f64>()
+                        .abs()
+                })
+                .fold(0.0_f64, f64::max);
+            beta.copy_from_slice(&beta_new);
             break;
         }
+        beta.copy_from_slice(&beta_new);
     }
 
     if !converged {
@@ -991,7 +1012,7 @@ fn fit_glm_irls_impl(
                 _ => mu[i] <= LOG_LINK_BOUNDARY_MU,
             }
     });
-    let separation_suspected = mu_on_boundary || last_step > SEPARATION_STEP_THRESHOLD;
+    let separation_suspected = mu_on_boundary || last_eta_step > SEPARATION_STEP_THRESHOLD;
 
     let df_residual = active_samples.saturating_sub(n_features);
     let dispersion = if family.has_free_dispersion() && df_residual > 0 {

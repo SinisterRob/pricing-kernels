@@ -8,10 +8,10 @@
 //! All simulations use a local SplitMix64 PRNG seeded with `SEED = 42069`.
 
 use pricing_kernels::classification::{
-    GlmFamily, GlmOptions, MultiplicativeRater, RegularizedGlmFamily, RegularizedGlmOptions,
-    bspline_basis, double_lift_chart, fit_glm_irls, fit_hurdle_poisson, fit_random_intercept_glmm,
-    fit_regularized_glm, fit_zero_inflated_poisson, glm_information_criteria, predict_glm,
-    select_tweedie_power, tweedie_log_density,
+    DesignMatrix, GlmFamily, GlmOptions, MultiplicativeRater, RegularizedGlmFamily,
+    RegularizedGlmOptions, bspline_basis, double_lift_chart, fit_glm_irls, fit_hurdle_poisson,
+    fit_random_intercept_glmm, fit_regularized_glm, fit_zero_inflated_poisson,
+    glm_information_criteria, predict_glm, select_tweedie_power, tweedie_log_density,
 };
 use pricing_kernels::error::{PricingError, SolverOptions};
 
@@ -937,4 +937,159 @@ fn double_lift_rejects_too_many_buckets_and_never_returns_empty_ones() {
     );
     let total: f64 = d.iter().map(|b| b.exposure).sum();
     assert!((total - 104.0).abs() < 1e-12);
+}
+
+// ---------------------------------------------------------------------------
+// Round 3: scale-free separation flag, scale-invariant QR rank test, GLMM intercept column
+// ---------------------------------------------------------------------------
+
+/// Covariate rescaling factors spanning the unit-dependence that broke the absolute rules.
+const COVARIATE_SCALES: [f64; 3] = [1e-7, 1.0, 1e7];
+
+/// Well-posed Poisson design `[1, x1, x2]` with a smooth continuous `x1`; `x2` is a dummy.
+fn well_posed_poisson(scale_x1: f64) -> (Vec<f64>, Vec<f64>, Vec<f64>) {
+    let mut rng = SplitMix64(SEED);
+    let n = 60usize;
+    let mut x = Vec::with_capacity(3 * n);
+    let mut y = Vec::with_capacity(n);
+    let mut off = Vec::with_capacity(n);
+    for i in 0..n {
+        let x1 = (i as f64) / (n as f64);
+        let x2 = f64::from(u8::from(i % 3 == 0));
+        x.extend_from_slice(&[1.0, x1 * scale_x1, x2]);
+        let exposure = 1.0 + rng.uniform();
+        off.push(exposure.ln());
+        y.push(rng.poisson(exposure * (0.4 + 0.8 * x1 - 0.3 * x2).exp()) as f64);
+    }
+    (x, y, off)
+}
+
+#[test]
+fn separation_flag_is_invariant_to_covariate_scale() {
+    let opts = GlmOptions::default();
+    for &c in &COVARIATE_SCALES {
+        // Well-posed fit: never flagged, at any covariate scale.
+        let (x, y, off) = well_posed_poisson(c);
+        let n = y.len();
+        let fit =
+            fit_glm_irls(GlmFamily::Poisson, &x, n, 3, &y, &vec![1.0; n], &off, &opts).unwrap();
+        assert!(!fit.separation_suspected, "scale {c}: {fit:?}");
+
+        // Zero-claim level (dummy column rescaled by c): flagged at every scale.
+        let (mut xz, yz) = zero_claim_design();
+        for row in xz.chunks_mut(3) {
+            row[2] *= c;
+        }
+        let w = vec![1.0; 30];
+        let off0 = vec![0.0; 30];
+        let fz = fit_glm_irls(GlmFamily::Poisson, &xz, 30, 3, &yz, &w, &off0, &opts).unwrap();
+        assert!(fz.separation_suspected, "zero-claim, scale {c}");
+
+        // Complete separation of a Binomial on a rescaled continuous covariate.
+        let xs: Vec<f64> = (0..20)
+            .flat_map(|i| [1.0, c * f64::from(i) / 19.0])
+            .collect();
+        let ys: Vec<f64> = (0..20).map(|i| f64::from(u8::from(i >= 10))).collect();
+        let fs = fit_glm_irls(
+            GlmFamily::Binomial,
+            &xs,
+            20,
+            2,
+            &ys,
+            &[1.0; 20],
+            &[0.0; 20],
+            &opts,
+        )
+        .unwrap();
+        assert!(fs.separation_suspected, "separated binomial, scale {c}");
+    }
+}
+
+#[test]
+fn qr_rank_test_is_invariant_to_column_scale() {
+    let opts = GlmOptions::default().with_tol(1e-14).with_max_iter(100);
+    let (x, y, off) = well_posed_poisson(1.0);
+    let n = y.len();
+    let w = vec![1.0; n];
+    let base = fit_glm_irls(GlmFamily::Poisson, &x, n, 3, &y, &w, &off, &opts).unwrap();
+    let mu_base = predict_glm(GlmFamily::Poisson, &x, n, 3, &base.coefficients, &off).unwrap();
+    for c in [1e12, 1e-13] {
+        let mut xs = x.clone();
+        for row in xs.chunks_mut(3) {
+            row[1] *= c;
+        }
+        let fit = fit_glm_irls(GlmFamily::Poisson, &xs, n, 3, &y, &w, &off, &opts)
+            .unwrap_or_else(|e| panic!("scale {c}: {e:?}"));
+        // Coefficient of the rescaled column scales exactly inversely; the rest are unchanged.
+        let rel = |a: f64, b: f64| (a - b).abs() / b.abs().max(1e-300);
+        assert!(
+            rel(fit.coefficients[1] * c, base.coefficients[1]) < 1e-9,
+            "scale {c}"
+        );
+        assert!(rel(fit.coefficients[0], base.coefficients[0]) < 1e-9);
+        assert!(rel(fit.coefficients[2], base.coefficients[2]) < 1e-9);
+        assert!(rel(fit.standard_errors[1] * c, base.standard_errors[1]) < 1e-8);
+        let mu = predict_glm(GlmFamily::Poisson, &xs, n, 3, &fit.coefficients, &off).unwrap();
+        for (a, b) in mu.iter().zip(&mu_base) {
+            assert!(rel(*a, *b) < 1e-10, "scale {c}: {a} vs {b}");
+        }
+
+        // A genuinely collinear design (x3 = scaled x1 + x2) is still rejected.
+        let xc: Vec<f64> = xs
+            .chunks(3)
+            .flat_map(|r| [r[0], r[1], r[2], r[1] + c * r[2]])
+            .collect();
+        assert!(matches!(
+            fit_glm_irls(GlmFamily::Poisson, &xc, n, 4, &y, &w, &off, &opts),
+            Err(PricingError::SingularMatrix(_))
+        ));
+    }
+}
+
+#[test]
+fn design_matrix_glmm_drops_explicit_intercept_column_like_fit_regularized() {
+    let mut rng = SplitMix64(SEED);
+    let n = 240usize;
+    let n_groups = 6usize;
+    let mut x = Vec::with_capacity(n);
+    let mut rows = Vec::with_capacity(n);
+    let mut y = Vec::with_capacity(n);
+    let mut groups = Vec::with_capacity(n);
+    let effects = [-0.4, -0.1, 0.0, 0.1, 0.25, 0.4];
+    for i in 0..n {
+        let xi = f64::from(u8::from(rng.uniform() < 0.5));
+        let g = i % n_groups;
+        x.push(xi);
+        rows.push([1.0, xi]);
+        y.push(rng.poisson((0.3 + 0.5 * xi + effects[g]).exp()) as f64);
+        groups.push(g);
+    }
+    let opts = SolverOptions::default().with_max_iter(50);
+    let direct =
+        fit_random_intercept_glmm(&x, n, 1, &y, &groups, n_groups, None, None, &opts).unwrap();
+    // DesignMatrix carries the explicit intercept column (GlmFit convention).
+    let dm = DesignMatrix::try_from_rows(&rows).unwrap();
+    let via_dm = dm
+        .fit_random_intercept_glmm(&y, &groups, n_groups, None, None, &opts)
+        .unwrap();
+    assert_eq!(via_dm.fixed_effects.len(), 2);
+    assert_eq!(via_dm.fixed_effects[0], 0.0);
+    assert!((via_dm.fixed_effects[1] - direct.fixed_effects[0]).abs() < 1e-10);
+    assert!((via_dm.intercept - direct.intercept).abs() < 1e-10);
+    assert!((via_dm.tau_squared - direct.tau_squared).abs() < 1e-10 * direct.tau_squared);
+    assert!(via_dm.converged && direct.converged);
+
+    // Same convention as DesignMatrix::fit_regularized (constant column -> coefficient 0).
+    let reg = dm
+        .fit_regularized(
+            &y,
+            None,
+            None,
+            RegularizedGlmOptions {
+                family: RegularizedGlmFamily::Poisson,
+                ..RegularizedGlmOptions::default()
+            },
+        )
+        .unwrap();
+    assert_eq!(reg.coefficients[0], 0.0);
 }
