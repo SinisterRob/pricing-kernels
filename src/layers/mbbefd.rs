@@ -7,6 +7,37 @@
 use crate::error::PricingError;
 use serde::{Deserialize, Serialize};
 
+/// Lower edge of the interval on which `b - 1` is exact (Sterbenz lemma).
+const STERBENZ_LOWER: f64 = 0.5;
+/// Upper edge of the interval on which `b - 1` is exact (Sterbenz lemma).
+const STERBENZ_UPPER: f64 = 2.0;
+
+/// `q(d) = (1 - b^d) / (1 - b) = expm1(d beta) / expm1(beta)` with `beta = ln b`;
+/// equals `d` at `beta = 0` (`b = 1`).
+#[inline]
+fn mbbefd_q(d: f64, beta: f64) -> f64 {
+    if beta == 0.0 {
+        d
+    } else if beta < 0.0 {
+        (d * beta).exp_m1() / beta.exp_m1()
+    } else {
+        // Overflow-safe form for large b: b^(d - 1) (1 - b^-d) / (1 - b^-1).
+        (beta * (d - 1.0)).exp() * (-d * beta).exp_m1() / (-beta).exp_m1()
+    }
+}
+
+/// `expm1(x) / x`, equal to `1` at `x = 0`.
+#[inline]
+fn exprel(x: f64) -> f64 {
+    if x == 0.0 { 1.0 } else { x.exp_m1() / x }
+}
+
+/// `ln(1 + x) / x`, equal to `1` at `x = 0`.
+#[inline]
+fn log1p_rel(x: f64) -> f64 {
+    if x == 0.0 { 1.0 } else { x.ln_1p() / x }
+}
+
 /// Canonical Swiss Re property exposure curve presets (Bernegger 1997).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SwissReCurve {
@@ -101,6 +132,23 @@ impl MbbefdCurve {
         Self { b, g }
     }
 
+    /// Cancellation-free coordinates `(u, beta) = (b g - 1, ln b)`; `None` for the
+    /// total-loss-only member (`g == 1` or `b == 0`).
+    fn stable_coordinates(&self) -> Option<(f64, f64)> {
+        let (b, g) = (self.b, self.g);
+        if g == 1.0 || b == 0.0 {
+            return None;
+        }
+        // `b - 1` is exact (Sterbenz) on [1/2, 2], so `ln_1p` gives full relative accuracy
+        // of `ln b` arbitrarily close to `b = 1`.
+        let beta = if (STERBENZ_LOWER..=STERBENZ_UPPER).contains(&b) {
+            (b - 1.0).ln_1p()
+        } else {
+            b.ln()
+        };
+        Some((b.mul_add(g, -1.0), beta))
+    }
+
     /// Validate curve parameters.
     pub fn validate(&self) -> Result<(), PricingError> {
         Self::new(self.b, self.g).map(|_| ())
@@ -124,34 +172,25 @@ impl MbbefdCurve {
             return Ok(1.0);
         }
 
-        let b = self.b;
-        let g = self.g;
-
-        // Limiting case 1: total-loss-only (g == 1 or b == 0)
-        if (g - 1.0).abs() <= 1e-14 || b == 0.0 {
+        let Some((u, beta)) = self.stable_coordinates() else {
+            // Total-loss-only (g == 1 or b == 0): G(d) = d.
             return Ok(d);
-        }
-
-        // Limiting case 2: b == 1 (g > 1)
-        if (b - 1.0).abs() <= 1e-12 {
-            return Ok(((g - 1.0) * d).ln_1p() / g.ln());
-        }
-
-        // Limiting case 3: b * g == 1 (g > 1)
-        let bg = b * g;
-        if (bg - 1.0).abs() <= 1e-12 {
-            return Ok((1.0 - b.powf(d)) / (1.0 - b));
-        }
-
-        // General MBBEFD formula (Bernegger 1997, eq. 3.3)
-        let num = (g - 1.0) * b + (1.0 - bg) * b.powf(d);
-        let ratio = num / (1.0 - b);
-        if !(ratio > 0.0) || !ratio.is_finite() {
+        };
+        // Bernegger (1997) eq. 3.3 rewritten without cancellation:
+        // G(d) = ln(1 + u q(d)) / ln(1 + u), u = b g - 1, q(d) = (1 - b^d) / (1 - b).
+        // The b = 1 (q = d) and b g = 1 (G = q) limits are continuous members.
+        let q = mbbefd_q(d, beta);
+        let curve = if u == 0.0 {
+            q
+        } else {
+            (u * q).ln_1p() / u.ln_1p()
+        };
+        if !curve.is_finite() {
             return Err(PricingError::OutOfBounds(
-                "MBBEFD exposure curve ratio underflowed or became non-positive",
+                "MBBEFD exposure curve became non-finite",
             ));
         }
-        Ok((ratio.ln() / bg.ln()).clamp(0.0, 1.0))
+        Ok(curve.clamp(0.0, 1.0))
     }
 
     /// Evaluate the implied severity survival function `S(x) = P(X > x)` on `[0, 1)`.
@@ -172,23 +211,12 @@ impl MbbefdCurve {
             return Ok(0.0);
         }
 
-        let b = self.b;
-        let g = self.g;
-
-        if (g - 1.0).abs() <= 1e-14 || b == 0.0 {
+        let Some((u, beta)) = self.stable_coordinates() else {
             return Ok(1.0);
-        }
-        if (b - 1.0).abs() <= 1e-12 {
-            return Ok(1.0 / (1.0 + (g - 1.0) * x));
-        }
-        let bg = b * g;
-        if (bg - 1.0).abs() <= 1e-12 {
-            return Ok(b.powf(x));
-        }
-
-        let bx = b.powf(x);
-        let denom = (g - 1.0) * b + (1.0 - bg) * bx;
-        let s = (1.0 - b) * bx / denom;
+        };
+        // S(x) = b^x / (1 + u q(x)), algebraically identical to Bernegger (1997)
+        // `(1 - b) b^x / ((g - 1) b + (1 - b g) b^x)` but free of 0/0 at b = 1.
+        let s = ((beta * x) - (u * mbbefd_q(x, beta)).ln_1p()).exp();
         if !s.is_finite() {
             return Err(PricingError::OutOfBounds(
                 "MBBEFD survival calculation overflowed or became undefined",
@@ -200,20 +228,12 @@ impl MbbefdCurve {
     /// Expected normalized loss `E[X] = 1 / G'(0)` on `[0, 1]`.
     pub fn mean_loss_ratio(&self) -> Result<f64, PricingError> {
         self.validate()?;
-        let b = self.b;
-        let g = self.g;
-
-        if (g - 1.0).abs() <= 1e-14 || b == 0.0 {
+        let Some((u, beta)) = self.stable_coordinates() else {
             return Ok(1.0);
-        }
-        if (b - 1.0).abs() <= 1e-12 {
-            return Ok(g.ln() / (g - 1.0));
-        }
-        let bg = b * g;
-        if (bg - 1.0).abs() <= 1e-12 {
-            return Ok((b - 1.0) / b.ln());
-        }
-        let mean = ((1.0 - b) * bg.ln()) / ((1.0 - bg) * b.ln());
+        };
+        // E[X] = 1 / G'(0) = [(b - 1) / ln b] * [ln(b g) / (b g - 1)], each factor
+        // evaluated as a relative `expm1`/`ln_1p` ratio that is exactly 1 at its limit.
+        let mean = exprel(beta) * log1p_rel(u);
         if !mean.is_finite() {
             return Err(PricingError::OutOfBounds(
                 "MBBEFD mean loss ratio overflowed or became undefined",

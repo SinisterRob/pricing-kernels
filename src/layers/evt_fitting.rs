@@ -10,8 +10,21 @@
 //! * Method-of-Moments (MoM) starting-value initializers.
 //! * Deterministic L-BFGS (`m = 7`) + Nelder–Mead fallback optimizer.
 //! * Observed Fisher information & delta-method standard errors.
-//! * AIC, BIC, Kaplan–Meier Kolmogorov–Smirnov (`D_n`), PIT Anderson–Darling (`A^2`),
-//!   and empirical mean-excess `e_n(u)`.
+//! * AIC, BIC (with `n = Σ w_i`), weighted Lynden-Bell / Kaplan–Meier product-limit
+//!   Kolmogorov–Smirnov (`D_n`, delayed entry at each deductible), weighted PIT
+//!   Anderson–Darling (`A^2`), and empirical mean-excess `e_n(u)`.
+//!
+//! # Parameter constraints
+//!
+//! * GPD shape (stand-alone and spliced tail) is constrained to `xi > -1`: for `xi < -1`
+//!   the likelihood is unbounded (Smith 1985). Fits ending within `1e-3` of the bound are
+//!   reported with `converged = false`. For `-1 < xi < -0.5` the MLE exists but is
+//!   non-regular, so the reported standard errors are not asymptotically valid.
+//! * Burr XII is optimized in `(ln alpha, ln gamma, ln theta)` with `lambda = theta^gamma`
+//!   (scale-equivariant) and started from a log-logistic fit at the sample median.
+//! * Any fit whose optimizer iterate lies within `1` unit of the internal `|phi| <= 30`
+//!   parameter box, or whose standard errors are not finite, is reported with
+//!   `converged = false`.
 
 use crate::error::{PricingError, SolverOptions};
 use crate::layers::alae_ilf::gauss_kronrod_integrate;
@@ -158,11 +171,13 @@ pub enum FittedEvtDistribution {
 pub struct GoodnessOfFitDiagnostics {
     /// Akaike Information Criterion `2p - 2 * ll`.
     pub aic: f64,
-    /// Bayesian Information Criterion `p * ln(n) - 2 * ll`.
+    /// Bayesian Information Criterion `p * ln(n) - 2 * ll` with `n = Σ w_i`.
     pub bic: f64,
-    /// Kaplan–Meier (or empirical) Kolmogorov–Smirnov statistic `D_n`.
+    /// Weighted product-limit (Lynden-Bell / Kaplan–Meier with delayed entry) Kolmogorov–Smirnov
+    /// statistic `D_n` against the model conditional on `X > min_i d_i`.
     pub ks_statistic: f64,
-    /// PIT Anderson–Darling statistic `A^2` (`None` if censored observations are present).
+    /// Weighted PIT Anderson–Darling statistic `A^2` with `n = Σ w_i`, using per-observation
+    /// conditional PITs `1 - S(x_i)/S(d_i)` (`None` if censored observations are present).
     pub anderson_darling: Option<f64>,
 }
 
@@ -173,8 +188,10 @@ pub struct EvtFitResult {
     pub distribution: FittedEvtDistribution,
     /// Maximized left-truncated, right-censored log-likelihood.
     pub log_likelihood: f64,
-    /// Delta-method standard errors for the free parameters (in the order listed
-    /// on the corresponding [`FittedEvtDistribution`] variant).
+    /// Delta-method standard errors of every estimated numeric field of the fitted
+    /// [`FittedEvtDistribution`] variant, in declaration order, excluding fixed inputs
+    /// (`threshold`, `body`, `continuity`). Derived fields (`body_weight`, and `beta` under
+    /// $C^1$) are included via the full Jacobian. Names: [`FittedEvtDistribution::parameter_names`].
     pub standard_errors: Vec<f64>,
     /// Goodness-of-fit statistics (`AIC`, `BIC`, `KS`, `AD`).
     pub diagnostics: GoodnessOfFitDiagnostics,
@@ -182,8 +199,12 @@ pub struct EvtFitResult {
     pub n_observations: usize,
     /// Number of right-censored observations.
     pub n_censored: usize,
-    /// Whether the optimizer met the convergence tolerance.
+    /// Whether the optimizer met the convergence tolerance at an interior point with
+    /// finite standard errors (see module docs for boundary rules).
     pub converged: bool,
+    /// Total optimizer iterations (L-BFGS + Nelder–Mead + polish).
+    #[serde(default)]
+    pub iterations: usize,
 }
 
 // ===========================================================================
@@ -196,6 +217,16 @@ fn log_diff_exp(a: f64, b: f64) -> f64 {
         return f64::NEG_INFINITY;
     }
     a + (-(b - a).exp()).ln_1p()
+}
+
+/// Numerically stable `ln(1 + e^t)`.
+#[inline]
+fn softplus(t: f64) -> f64 {
+    if t > 0.0 {
+        t + (-t).exp().ln_1p()
+    } else {
+        t.exp().ln_1p()
+    }
 }
 
 #[inline]
@@ -248,13 +279,11 @@ impl FittedEvtDistribution {
                 gamma,
                 lambda,
             } => {
+                // ln(lambda + x^gamma) = ln lambda + softplus(gamma ln x - ln lambda).
                 let lx = x.ln();
-                let xg = (gamma * lx).exp();
-                if !xg.is_finite() {
-                    return f64::NEG_INFINITY;
-                }
-                (alpha * gamma).ln() + alpha * lambda.ln() + (gamma - 1.0) * lx
-                    - (alpha + 1.0) * (lambda + xg).ln()
+                let ln_lambda = lambda.ln();
+                (alpha * gamma).ln() - ln_lambda + (gamma - 1.0) * lx
+                    - (alpha + 1.0) * softplus(gamma.mul_add(lx, -ln_lambda))
             }
             Self::Weibull { k, lambda } => {
                 let r = x / lambda;
@@ -335,13 +364,7 @@ impl FittedEvtDistribution {
                 alpha,
                 gamma,
                 lambda,
-            } => {
-                let xg = x.powf(gamma);
-                if !xg.is_finite() {
-                    return f64::NEG_INFINITY;
-                }
-                alpha * (lambda / (lambda + xg)).ln()
-            }
+            } => -alpha * softplus(gamma.mul_add(x.ln(), -lambda.ln())),
             Self::Weibull { k, lambda } => -(x / lambda).powf(k),
             Self::Gamma { alpha, beta } => log_gamma_q(alpha, beta * x),
             Self::InverseGaussian { mu, lambda } => {
@@ -466,6 +489,50 @@ impl FittedEvtDistribution {
     }
 }
 
+impl FittedEvtDistribution {
+    /// Names of the estimated numeric fields, in the order used by
+    /// [`EvtFitResult::standard_errors`].
+    pub const fn parameter_names(&self) -> &'static [&'static str] {
+        match self {
+            Self::Lognormal { .. } => &["mu", "sigma"],
+            Self::ParetoII { .. } => &["alpha", "lambda"],
+            Self::Gpd { .. } => &["xi", "beta"],
+            Self::BurrXii { .. } => &["alpha", "gamma", "lambda"],
+            Self::Weibull { .. } => &["k", "lambda"],
+            Self::Gamma { .. } => &["alpha", "beta"],
+            Self::InverseGaussian { .. } => &["mu", "lambda"],
+            Self::SplicedBodyGpd { .. } => {
+                &["body_param1", "body_param2", "body_weight", "xi", "beta"]
+            }
+        }
+    }
+
+    /// Values of the estimated numeric fields (same order as [`Self::parameter_names`]).
+    fn estimated_values(&self) -> Vec<f64> {
+        match *self {
+            Self::Lognormal { mu, sigma } => vec![mu, sigma],
+            Self::ParetoII { alpha, lambda } => vec![alpha, lambda],
+            Self::Gpd { xi, beta, .. } => vec![xi, beta],
+            Self::BurrXii {
+                alpha,
+                gamma,
+                lambda,
+            } => vec![alpha, gamma, lambda],
+            Self::Weibull { k, lambda } => vec![k, lambda],
+            Self::Gamma { alpha, beta } => vec![alpha, beta],
+            Self::InverseGaussian { mu, lambda } => vec![mu, lambda],
+            Self::SplicedBodyGpd {
+                body_param1,
+                body_param2,
+                body_weight,
+                xi,
+                beta,
+                ..
+            } => vec![body_param1, body_param2, body_weight, xi, beta],
+        }
+    }
+}
+
 impl TryFrom<FittedEvtDistribution> for SeverityDistribution {
     type Error = PricingError;
 
@@ -503,82 +570,72 @@ impl TryFrom<FittedEvtDistribution> for SeverityDistribution {
 // Unconstrained Parameterization φ -> FittedEvtDistribution & Jacobian
 // ===========================================================================
 
-fn unpack_params(family: EvtFamily, phi: &[f64]) -> Option<(FittedEvtDistribution, Vec<f64>)> {
-    if phi.iter().any(|v| !v.is_finite() || v.abs() > 30.0) {
+/// Internal box on every unconstrained coordinate `|phi_j| <= PHI_BOUND`.
+const PHI_BOUND: f64 = 30.0;
+/// An optimum within this distance of [`PHI_BOUND`] is treated as a boundary (non-converged) fit.
+const PHI_BOUND_MARGIN: f64 = 1.0;
+/// GPD shape lower bound: the likelihood is unbounded for `xi < -1` (Smith 1985).
+const GPD_XI_MIN: f64 = -1.0;
+/// A GPD shape estimate within this distance of [`GPD_XI_MIN`] is a boundary (non-converged) fit.
+const GPD_XI_BOUNDARY_TOL: f64 = 1e-3;
+/// Relative central-difference step for the parameter-map Jacobian.
+const JACOBIAN_REL_STEP: f64 = 1e-6;
+
+fn unpack_params(family: EvtFamily, phi: &[f64]) -> Option<FittedEvtDistribution> {
+    if phi.iter().any(|v| !v.is_finite() || v.abs() > PHI_BOUND) {
         return None;
     }
     match family {
-        EvtFamily::Lognormal => {
-            let mu = phi[0];
-            let sigma = phi[1].exp();
-            Some((
-                FittedEvtDistribution::Lognormal { mu, sigma },
-                vec![1.0, sigma],
-            ))
-        }
-        EvtFamily::ParetoII => {
-            let alpha = phi[0].exp();
-            let lambda = phi[1].exp();
-            Some((
-                FittedEvtDistribution::ParetoII { alpha, lambda },
-                vec![alpha, lambda],
-            ))
-        }
+        EvtFamily::Lognormal => Some(FittedEvtDistribution::Lognormal {
+            mu: phi[0],
+            sigma: phi[1].exp(),
+        }),
+        EvtFamily::ParetoII => Some(FittedEvtDistribution::ParetoII {
+            alpha: phi[0].exp(),
+            lambda: phi[1].exp(),
+        }),
         EvtFamily::Gpd { threshold } => {
             let xi = phi[0];
-            let beta = phi[1].exp();
-            Some((
-                FittedEvtDistribution::Gpd {
-                    threshold,
-                    xi,
-                    beta,
-                },
-                vec![1.0, beta],
-            ))
+            if !(xi > GPD_XI_MIN) {
+                return None;
+            }
+            Some(FittedEvtDistribution::Gpd {
+                threshold,
+                xi,
+                beta: phi[1].exp(),
+            })
         }
         EvtFamily::BurrXii => {
-            let alpha = phi[0].exp();
+            // phi = (ln alpha, ln gamma, ln theta), lambda = theta^gamma.
             let gamma = phi[1].exp();
-            let lambda = phi[2].exp();
-            Some((
-                FittedEvtDistribution::BurrXii {
-                    alpha,
-                    gamma,
-                    lambda,
-                },
-                vec![alpha, gamma, lambda],
-            ))
+            let lambda = (gamma * phi[2]).exp();
+            if !(lambda > 0.0) || !lambda.is_finite() {
+                return None;
+            }
+            Some(FittedEvtDistribution::BurrXii {
+                alpha: phi[0].exp(),
+                gamma,
+                lambda,
+            })
         }
-        EvtFamily::Weibull => {
-            let k = phi[0].exp();
-            let lambda = phi[1].exp();
-            Some((
-                FittedEvtDistribution::Weibull { k, lambda },
-                vec![k, lambda],
-            ))
-        }
-        EvtFamily::Gamma => {
-            let alpha = phi[0].exp();
-            let beta = phi[1].exp();
-            Some((
-                FittedEvtDistribution::Gamma { alpha, beta },
-                vec![alpha, beta],
-            ))
-        }
-        EvtFamily::InverseGaussian => {
-            let mu = phi[0].exp();
-            let lambda = phi[1].exp();
-            Some((
-                FittedEvtDistribution::InverseGaussian { mu, lambda },
-                vec![mu, lambda],
-            ))
-        }
+        EvtFamily::Weibull => Some(FittedEvtDistribution::Weibull {
+            k: phi[0].exp(),
+            lambda: phi[1].exp(),
+        }),
+        EvtFamily::Gamma => Some(FittedEvtDistribution::Gamma {
+            alpha: phi[0].exp(),
+            beta: phi[1].exp(),
+        }),
+        EvtFamily::InverseGaussian => Some(FittedEvtDistribution::InverseGaussian {
+            mu: phi[0].exp(),
+            lambda: phi[1].exp(),
+        }),
         EvtFamily::SplicedBodyGpd {
             body,
             threshold,
             continuity,
         } => {
-            let (p1, p2, j1, j2, d_log_f1, f1_u, pdf1_u) = match body {
+            let (p1, p2, d_log_f1, f1_u, pdf1_u) = match body {
                 SpliceBodyFamily::Lognormal => {
                     let mu = phi[0];
                     let sigma = phi[1].exp();
@@ -586,7 +643,7 @@ fn unpack_params(family: EvtFamily, phi: &[f64]) -> Option<(FittedEvtDistributio
                     let f1 = d.cdf(threshold);
                     let pdf1 = d.log_pdf(threshold).exp();
                     let d_lf = -(1.0 + (threshold.ln() - mu) / (sigma * sigma)) / threshold;
-                    (mu, sigma, 1.0, sigma, d_lf, f1, pdf1)
+                    (mu, sigma, d_lf, f1, pdf1)
                 }
                 SpliceBodyFamily::Weibull => {
                     let k = phi[0].exp();
@@ -596,48 +653,65 @@ fn unpack_params(family: EvtFamily, phi: &[f64]) -> Option<(FittedEvtDistributio
                     let pdf1 = d.log_pdf(threshold).exp();
                     let d_lf =
                         (k - 1.0) / threshold - (k / lambda) * (threshold / lambda).powf(k - 1.0);
-                    (k, lambda, k, lambda, d_lf, f1, pdf1)
+                    (k, lambda, d_lf, f1, pdf1)
                 }
             };
             if !(f1_u > 1e-12) || !(pdf1_u > 0.0) || !f1_u.is_finite() || !pdf1_u.is_finite() {
                 return None;
             }
             let xi = phi[2];
-            let (beta, jac) = match continuity {
-                SpliceContinuity::C0Continuous => {
-                    let beta = phi[3].exp();
-                    (beta, vec![j1, j2, 1.0, beta])
-                }
+            if !(xi > GPD_XI_MIN) {
+                return None;
+            }
+            let beta = match continuity {
+                SpliceContinuity::C0Continuous => phi[3].exp(),
                 SpliceContinuity::C1Differentiable => {
-                    if !(d_log_f1 < -1e-12) || !(xi > -1.0 + 1e-6) {
+                    if !(d_log_f1 < -1e-12) || !(xi > GPD_XI_MIN + 1e-6) {
                         return None;
                     }
                     let beta = -(1.0 + xi) / d_log_f1;
                     if !(beta > 0.0) || !beta.is_finite() {
                         return None;
                     }
-                    (beta, vec![j1, j2, 1.0])
+                    beta
                 }
             };
             let w = f1_u / (f1_u + beta * pdf1_u);
             if !(w > 1e-12 && w < 1.0 - 1e-12) {
                 return None;
             }
-            Some((
-                FittedEvtDistribution::SplicedBodyGpd {
-                    body,
-                    threshold,
-                    continuity,
-                    body_param1: p1,
-                    body_param2: p2,
-                    body_weight: w,
-                    xi,
-                    beta,
-                },
-                jac,
-            ))
+            Some(FittedEvtDistribution::SplicedBodyGpd {
+                body,
+                threshold,
+                continuity,
+                body_param1: p1,
+                body_param2: p2,
+                body_weight: w,
+                xi,
+                beta,
+            })
         }
     }
+}
+
+/// Central-difference Jacobian `d(estimated_values) / d(phi)` (row-major `q x p`).
+fn parameter_jacobian(family: EvtFamily, phi: &[f64]) -> Option<(Vec<f64>, usize)> {
+    let p = phi.len();
+    let q = unpack_params(family, phi)?.estimated_values().len();
+    let mut jac = vec![0.0; q * p];
+    let mut work = phi.to_vec();
+    for j in 0..p {
+        let h = JACOBIAN_REL_STEP * (1.0 + phi[j].abs());
+        work[j] = phi[j] + h;
+        let up = unpack_params(family, &work)?.estimated_values();
+        work[j] = phi[j] - h;
+        let dn = unpack_params(family, &work)?.estimated_values();
+        work[j] = phi[j];
+        for i in 0..q {
+            jac[i * p + j] = (up[i] - dn[i]) / (2.0 * h);
+        }
+    }
+    Some((jac, q))
 }
 
 fn eval_log_likelihood(dist: &FittedEvtDistribution, obs: &[SeverityObservation]) -> f64 {
@@ -664,6 +738,11 @@ fn eval_log_likelihood(dist: &FittedEvtDistribution, obs: &[SeverityObservation]
 // ===========================================================================
 // 1.4 Method-of-Moments Starting-Value Initializers
 // ===========================================================================
+
+/// Clamp range for the log-logistic Burr XII starting `gamma`.
+const BURR_GAMMA_START_MIN: f64 = 0.1;
+/// Clamp range for the log-logistic Burr XII starting `gamma`.
+const BURR_GAMMA_START_MAX: f64 = 50.0;
 
 fn mom_initial_phi(family: EvtFamily, obs: &[SeverityObservation]) -> Vec<f64> {
     let unc: Vec<f64> = obs
@@ -725,13 +804,19 @@ fn mom_initial_phi(family: EvtFamily, obs: &[SeverityObservation]) -> Vec<f64> {
             vec![xi, beta.ln()]
         }
         EvtFamily::BurrXii => {
-            let (alpha, lambda) = if var > mean * mean {
-                let a = (2.0 * var / (var - mean * mean)).clamp(2.05, 50.0);
-                (a, (mean * (a - 1.0)).max(1e-6))
+            // Log-logistic start (alpha = 1): theta = sample median, and ln X logistic with
+            // SD pi / (gamma sqrt(3)).
+            let mut sorted = sample.clone();
+            sorted.sort_by(f64::total_cmp);
+            let mid = sorted.len() / 2;
+            let median = if sorted.len() % 2 == 0 {
+                f64::midpoint(sorted[mid - 1], sorted[mid])
             } else {
-                (5.0, (4.0 * mean).max(1e-6))
+                sorted[mid]
             };
-            vec![alpha.ln(), 0.0, lambda.ln()]
+            let gamma = (std::f64::consts::PI / (3.0_f64.sqrt() * log_var.sqrt()))
+                .clamp(BURR_GAMMA_START_MIN, BURR_GAMMA_START_MAX);
+            vec![0.0, gamma.ln(), median.max(f64::MIN_POSITIVE).ln()]
         }
         EvtFamily::Weibull => {
             let k = (std::f64::consts::PI / (6.0_f64.sqrt() * log_var.sqrt())).clamp(0.1, 20.0);
@@ -792,7 +877,9 @@ fn central_gradient<F: Fn(&[f64]) -> f64>(f: &F, x: &[f64]) -> Vec<f64> {
     let mut g = vec![0.0; p];
     let mut work = x.to_vec();
     for j in 0..p {
-        let h = eps_cbrt * (1.0 + x[j].abs());
+        // Absolute step: every coordinate of phi is O(1)-scaled (logs, xi, mu), and a
+        // |phi|-proportional step inflates truncation error on log-scale coordinates.
+        let h = eps_cbrt;
         work[j] = x[j] + h;
         let fp = f(&work);
         work[j] = x[j] - h;
@@ -807,17 +894,54 @@ fn central_gradient<F: Fn(&[f64]) -> f64>(f: &F, x: &[f64]) -> Vec<f64> {
     g
 }
 
+/// L-BFGS gradient tolerance: `||g||_inf < tol * LBFGS_GRAD_FACTOR` (floored at the
+/// finite-difference noise level, see [`gradient_tolerance`]).
+const LBFGS_GRAD_FACTOR: f64 = 1.0;
+/// L-BFGS relative objective-change tolerance: `|Δf| <= tol * LBFGS_REL_F_FACTOR * (1 + |f|)`.
+const LBFGS_REL_F_FACTOR: f64 = 1e-4;
+/// Gradient bound accompanying the objective-change test: `||g||_inf < tol * LBFGS_LOOSE_GRAD_FACTOR`.
+const LBFGS_LOOSE_GRAD_FACTOR: f64 = 1e2;
+/// Nelder–Mead simplex-diameter tolerance factor (`tol * NM_X_FACTOR`).
+const NM_X_FACTOR: f64 = 0.1;
+/// Nelder–Mead relative objective-spread tolerance factor (`tol * NM_F_FACTOR`).
+const NM_F_FACTOR: f64 = 1e-3;
+
+/// Multiple of the central-difference noise floor `eps^(2/3) (1 + |f|)` below which a
+/// gradient is indistinguishable from zero.
+const GRAD_NOISE_FACTOR: f64 = 10.0;
+
+/// Gradient stopping threshold: `requested`, floored at the finite-difference noise level
+/// (large-sample log-likelihoods cannot resolve gradients below `~eps^(2/3) |f|`).
+fn gradient_tolerance(requested: f64, fx: f64) -> f64 {
+    let noise = GRAD_NOISE_FACTOR * f64::EPSILON.powf(2.0 / 3.0) * (1.0 + fx.abs());
+    requested.max(noise)
+}
+
+struct OptimOutcome {
+    x: Vec<f64>,
+    fx: f64,
+    converged: bool,
+    iterations: usize,
+}
+
 fn lbfgs_minimize<F: Fn(&[f64]) -> f64>(
     f: &F,
     mut x: Vec<f64>,
     max_iter: usize,
-) -> (Vec<f64>, f64, bool) {
+    tol: f64,
+) -> OptimOutcome {
     let p = x.len();
     let m = 7usize;
     let mut fx = f(&x);
     if !fx.is_finite() {
-        return (x, fx, false);
+        return OptimOutcome {
+            x,
+            fx,
+            converged: false,
+            iterations: 0,
+        };
     }
+    let mut iterations = 0usize;
     let mut gx = central_gradient(f, &x);
     let mut s_hist: Vec<Vec<f64>> = Vec::with_capacity(m);
     let mut y_hist: Vec<Vec<f64>> = Vec::with_capacity(m);
@@ -826,10 +950,11 @@ fn lbfgs_minimize<F: Fn(&[f64]) -> f64>(
 
     for _ in 0..max_iter {
         let g_inf = gx.iter().map(|v| v.abs()).fold(0.0_f64, f64::max);
-        if g_inf < 1e-8 {
+        if g_inf < gradient_tolerance(tol * LBFGS_GRAD_FACTOR, fx) {
             converged = true;
             break;
         }
+        iterations += 1;
 
         let mut q = gx.clone();
         let h_len = s_hist.len();
@@ -907,22 +1032,29 @@ fn lbfgs_minimize<F: Fn(&[f64]) -> f64>(
         x = x_next;
         fx = f_next;
         gx = g_next;
-        if df <= 1e-12 * (1.0 + fx.abs())
-            && gx.iter().map(|v| v.abs()).fold(0.0_f64, f64::max) < 1e-6
+        if df <= tol * LBFGS_REL_F_FACTOR * (1.0 + fx.abs())
+            && gx.iter().map(|v| v.abs()).fold(0.0_f64, f64::max)
+                < gradient_tolerance(tol * LBFGS_LOOSE_GRAD_FACTOR, fx)
         {
             converged = true;
             break;
         }
     }
 
-    (x, fx, converged)
+    OptimOutcome {
+        x,
+        fx,
+        converged,
+        iterations,
+    }
 }
 
 fn nelder_mead_minimize<F: Fn(&[f64]) -> f64>(
     f: &F,
     x0: &[f64],
     max_iter: usize,
-) -> (Vec<f64>, f64, bool) {
+    tol: f64,
+) -> OptimOutcome {
     let p = x0.len();
     let mut simplex: Vec<(Vec<f64>, f64)> = Vec::with_capacity(p + 1);
     simplex.push((x0.to_vec(), f(x0)));
@@ -934,6 +1066,7 @@ fn nelder_mead_minimize<F: Fn(&[f64]) -> f64>(
     }
 
     let mut converged = false;
+    let mut iterations = 0usize;
     for _ in 0..max_iter {
         simplex.sort_by(|a, b| a.1.total_cmp(&b.1));
         let spread_f = (simplex[p].1 - simplex[0].1).abs();
@@ -943,10 +1076,12 @@ fn nelder_mead_minimize<F: Fn(&[f64]) -> f64>(
                 spread_x = spread_x.max((simplex[i].0[j] - simplex[0].0[j]).abs());
             }
         }
-        if spread_x < 1e-9 && spread_f < 1e-11 * (1.0 + simplex[0].1.abs()) {
+        if spread_x < tol * NM_X_FACTOR && spread_f < tol * NM_F_FACTOR * (1.0 + simplex[0].1.abs())
+        {
             converged = true;
             break;
         }
+        iterations += 1;
 
         let mut centroid = vec![0.0; p];
         for item in simplex.iter().take(p) {
@@ -994,13 +1129,21 @@ fn nelder_mead_minimize<F: Fn(&[f64]) -> f64>(
     }
 
     simplex.sort_by(|a, b| a.1.total_cmp(&b.1));
-    (simplex[0].0.clone(), simplex[0].1, converged)
+    let (x, fx) = simplex.swap_remove(0);
+    OptimOutcome {
+        x,
+        fx,
+        converged,
+        iterations,
+    }
 }
 
+/// Delta-method SEs `sqrt(diag(J H^{-1} J^T))` of the estimated fields (NaN where undefined).
 fn delta_method_standard_errors<F: Fn(&[f64]) -> f64>(
     neg_ll: &F,
+    family: EvtFamily,
     phi_hat: &[f64],
-    diag_jac: &[f64],
+    n_out: usize,
 ) -> Vec<f64> {
     let p = phi_hat.len();
     let mut hess = vec![0.0; p * p];
@@ -1024,19 +1167,27 @@ fn delta_method_standard_errors<F: Fn(&[f64]) -> f64>(
         }
     }
 
-    match cholesky_invert(&hess, p) {
-        Ok(cov_phi) => (0..p)
-            .map(|j| {
-                let v = cov_phi[j * p + j];
-                if v.is_finite() && v >= 0.0 {
-                    diag_jac[j].abs() * v.sqrt()
-                } else {
-                    f64::NAN
+    let (Ok(cov_phi), Some((jac, q))) = (
+        cholesky_invert(&hess, p),
+        parameter_jacobian(family, phi_hat),
+    ) else {
+        return vec![f64::NAN; n_out];
+    };
+    (0..q)
+        .map(|r| {
+            let mut v = 0.0;
+            for a in 0..p {
+                for b in 0..p {
+                    v += jac[r * p + a] * cov_phi[a * p + b] * jac[r * p + b];
                 }
-            })
-            .collect(),
-        Err(_) => vec![f64::NAN; p],
-    }
+            }
+            if v.is_finite() && v >= 0.0 {
+                v.sqrt()
+            } else {
+                f64::NAN
+            }
+        })
+        .collect()
 }
 
 // ===========================================================================
@@ -1073,8 +1224,36 @@ pub fn empirical_mean_excess(losses: &[f64], threshold: f64) -> Result<f64, Pric
     Ok(sum / count as f64)
 }
 
-/// Compute AIC, BIC, Kaplan–Meier / empirical KS statistic `D_n`, and PIT
-/// Anderson–Darling statistic `A^2` (when uncensored).
+/// Lower/upper clamp applied to PIT values before the Anderson–Darling logarithms.
+const PIT_CLAMP: f64 = 1e-15;
+
+/// `∫_a^b (c - u)^2 / (u (1 - u)) du = -(b - a) + c^2 ln(b / a) + (1 - c)^2 ln((1 - a) / (1 - b))`
+/// for a constant EDF level `c` on `[a, b] ⊂ [0, 1]` (terms with zero coefficient dropped).
+fn ad_segment(a: f64, b: f64, c: f64) -> f64 {
+    if !(b > a) {
+        return 0.0;
+    }
+    let mut v = -(b - a);
+    if c > 0.0 {
+        v += c * c * (b.ln() - a.ln());
+    }
+    if c < 1.0 {
+        v += (1.0 - c) * (1.0 - c) * ((-a).ln_1p() - (-b).ln_1p());
+    }
+    v
+}
+
+/// Compute AIC, BIC (`n = Σ w_i`), weighted product-limit KS statistic `D_n`, and weighted
+/// PIT Anderson–Darling statistic `A^2` (when uncensored).
+///
+/// * **KS:** Lynden-Bell / Kaplan–Meier product-limit estimator with delayed entry — the
+///   risk set at `t` is `Σ w_i 1{d_i < t <= x_i}` — compared with the model conditional on
+///   `X > min_i d_i`, i.e. `1 - S(t) / S(min_i d_i)`.
+/// * **AD:** exact integral `W ∫ (F_W(u) - u)^2 / (u (1 - u)) du` of the weighted EDF `F_W`
+///   of the conditional PITs `u_i = 1 - S(x_i) / S(d_i)`, `W = Σ w_i`; with unit weights this
+///   is the classical `-n - (1/n) Σ (2i - 1) [ln u_(i) + ln(1 - u_(n+1-i))]`.
+///
+/// Integer weights are therefore equivalent to replicated rows for all statistics.
 pub fn goodness_of_fit(
     dist: &FittedEvtDistribution,
     observations: &[SeverityObservation],
@@ -1083,7 +1262,8 @@ pub fn goodness_of_fit(
 ) -> GoodnessOfFitDiagnostics {
     let n = observations.len();
     let aic = 2.0 * n_params as f64 - 2.0 * log_likelihood;
-    if n == 0 {
+    let total_w: f64 = observations.iter().map(|o| o.weight).sum();
+    if n == 0 || !(total_w > 0.0) {
         return GoodnessOfFitDiagnostics {
             aic,
             bic: f64::NAN,
@@ -1091,65 +1271,82 @@ pub fn goodness_of_fit(
             anderson_darling: None,
         };
     }
-    let n_f = n as f64;
-    let bic = (n_params as f64) * n_f.ln() - 2.0 * log_likelihood;
+    let bic = (n_params as f64) * total_w.ln() - 2.0 * log_likelihood;
 
     let has_censored = observations.iter().any(|o| o.is_censored);
     let d_min = observations
         .iter()
         .map(|o| o.deductible)
         .fold(f64::INFINITY, f64::min);
+    let ls_dmin = dist.log_survival(d_min);
 
-    // Kaplan–Meier product-limit survival curve for KS.
-    let mut sorted: Vec<SeverityObservation> = observations.to_vec();
-    sorted.sort_by(|a, b| a.loss.total_cmp(&b.loss));
+    // Product-limit with delayed entry (Lynden-Bell 1971; Tsai, Jewell & Wang 1987).
+    let mut by_loss: Vec<&SeverityObservation> = observations.iter().collect();
+    by_loss.sort_by(|a, b| a.loss.total_cmp(&b.loss));
+    let mut by_ded: Vec<(f64, f64)> = observations
+        .iter()
+        .map(|o| (o.deductible, o.weight))
+        .collect();
+    by_ded.sort_by(|a, b| a.0.total_cmp(&b.0));
 
-    let s_dmin = dist.log_survival(d_min).exp().max(1e-300);
     let mut km_s = 1.0_f64;
-    let mut at_risk = n_f;
+    let mut entered_w = 0.0_f64;
+    let mut exited_w = 0.0_f64;
+    let mut ded_idx = 0usize;
     let mut ks = 0.0_f64;
     let mut idx = 0usize;
     while idx < n {
-        let x = sorted[idx].loss;
+        let x = by_loss[idx].loss;
+        while ded_idx < n && by_ded[ded_idx].0 < x {
+            entered_w += by_ded[ded_idx].1;
+            ded_idx += 1;
+        }
+        let at_risk = entered_w - exited_w;
         let mut events = 0.0;
         let mut total_at_x = 0.0;
-        while idx < n && (sorted[idx].loss - x).abs() <= 1e-15 {
-            total_at_x += 1.0;
-            if !sorted[idx].is_censored {
-                events += 1.0;
+        while idx < n && by_loss[idx].loss == x {
+            total_at_x += by_loss[idx].weight;
+            if !by_loss[idx].is_censored {
+                events += by_loss[idx].weight;
             }
             idx += 1;
         }
         let f_prev = 1.0 - km_s;
         if events > 0.0 && at_risk > 0.0 {
-            km_s *= 1.0 - events / at_risk;
+            km_s *= (1.0 - events / at_risk).max(0.0);
         }
         let f_curr = 1.0 - km_s;
-        let f_model = (1.0 - (dist.log_survival(x).exp() / s_dmin)).clamp(0.0, 1.0);
+        let f_model = (-(dist.log_survival(x) - ls_dmin).exp_m1()).clamp(0.0, 1.0);
         ks = ks
             .max((f_prev - f_model).abs())
             .max((f_curr - f_model).abs());
-        at_risk -= total_at_x;
+        exited_w += total_at_x;
     }
 
     let anderson_darling = if has_censored {
         None
     } else {
-        let mut u: Vec<f64> = observations
+        let mut u: Vec<(f64, f64)> = observations
             .iter()
             .map(|o| {
-                let fd = dist.cdf(o.deductible);
-                let fx = dist.cdf(o.loss);
-                ((fx - fd) / (1.0 - fd).max(1e-300)).clamp(1e-15, 1.0 - 1e-15)
+                let log_ratio = dist.log_survival(o.loss) - dist.log_survival(o.deductible);
+                let pit = (-log_ratio.exp_m1()).clamp(PIT_CLAMP, 1.0 - PIT_CLAMP);
+                (pit, o.weight)
             })
             .collect();
-        u.sort_by(f64::total_cmp);
-        let mut sum = 0.0;
-        for i in 0..n {
-            let coef = (2 * i + 1) as f64;
-            sum += coef * (u[i].ln() + (-u[n - 1 - i]).ln_1p());
+        u.sort_by(|a, b| a.0.total_cmp(&b.0));
+        let mut integral = 0.0;
+        let mut level = 0.0_f64;
+        let mut prev = 0.0_f64;
+        let mut cum_w = 0.0_f64;
+        for &(ui, wi) in &u {
+            integral += ad_segment(prev, ui, level);
+            cum_w += wi;
+            level = (cum_w / total_w).min(1.0);
+            prev = ui;
         }
-        Some(-n_f - sum / n_f)
+        integral += ad_segment(prev, 1.0, 1.0);
+        Some(total_w * integral)
     };
 
     GoodnessOfFitDiagnostics {
@@ -1184,6 +1381,11 @@ pub fn fit_evt_mle(
 /// Fit any of the 7 parametric severity/EVT distributions or a $C^0$/$C^1$
 /// spliced body + GPD tail model via left-truncated, right-censored MLE
 /// with explicit [`SolverOptions`].
+///
+/// `options.tol` drives every stopping rule: L-BFGS stops when `||∇(-ll)||_inf < tol` or when
+/// `|Δll| <= 1e-4 tol (1 + |ll|)` with `||∇||_inf < 1e2 tol`; the Nelder–Mead fallback stops when
+/// the simplex diameter is `< 0.1 tol` and its objective spread `< 1e-3 tol (1 + |ll|)`
+/// (the [`fit_evt_mle`] default `tol = 1e-8` reproduces the historical constants).
 pub fn fit_evt_mle_with_options(
     family: EvtFamily,
     observations: &[SeverityObservation],
@@ -1271,7 +1473,7 @@ pub fn fit_evt_mle_with_options(
     let phi0 = mom_initial_phi(family, &filtered);
     let neg_ll = |phi: &[f64]| -> f64 {
         match unpack_params(family, phi) {
-            Some((dist, _)) => {
+            Some(dist) => {
                 let ll = eval_log_likelihood(&dist, &filtered);
                 if ll.is_finite() { -ll } else { f64::INFINITY }
             }
@@ -1279,8 +1481,10 @@ pub fn fit_evt_mle_with_options(
         }
     };
 
-    let (mut best_phi, mut best_nll, mut converged) =
-        lbfgs_minimize(&neg_ll, phi0.clone(), options.max_iter);
+    let tol = options.tol;
+    let first = lbfgs_minimize(&neg_ll, phi0.clone(), options.max_iter, tol);
+    let mut iterations = first.iterations;
+    let (mut best_phi, mut best_nll, mut converged) = (first.x, first.fx, first.converged);
     if !converged || !best_nll.is_finite() {
         let start = if best_nll.is_finite() {
             best_phi.as_slice()
@@ -1288,26 +1492,28 @@ pub fn fit_evt_mle_with_options(
             phi0.as_slice()
         };
         let nm_iters = options.max_iter.saturating_mul(3).max(500);
-        let (nm_phi, nm_nll, nm_conv) = nelder_mead_minimize(&neg_ll, start, nm_iters);
-        if nm_nll < best_nll || !best_nll.is_finite() {
-            best_phi = nm_phi;
-            best_nll = nm_nll;
-            converged = nm_conv;
+        let nm = nelder_mead_minimize(&neg_ll, start, nm_iters, tol);
+        iterations += nm.iterations;
+        if nm.fx <= best_nll || !best_nll.is_finite() {
+            best_phi = nm.x;
+            best_nll = nm.fx;
+            converged = nm.converged;
         }
     }
 
     // One L-BFGS polish pass if Nelder–Mead improved the point.
     if best_nll.is_finite() {
         let polish_iters = (options.max_iter / 2).max(50);
-        let (pol_phi, pol_nll, pol_conv) = lbfgs_minimize(&neg_ll, best_phi.clone(), polish_iters);
-        if pol_nll <= best_nll {
-            best_phi = pol_phi;
-            best_nll = pol_nll;
-            converged = converged || pol_conv;
+        let pol = lbfgs_minimize(&neg_ll, best_phi.clone(), polish_iters, tol);
+        iterations += pol.iterations;
+        if pol.fx <= best_nll {
+            best_phi = pol.x;
+            best_nll = pol.fx;
+            converged = converged || pol.converged;
         }
     }
 
-    let Some((distribution, diag_jac)) = unpack_params(family, &best_phi) else {
+    let Some(distribution) = unpack_params(family, &best_phi) else {
         return Err(PricingError::NonConvergence(
             "MLE failed to locate valid parameters",
         ));
@@ -1319,8 +1525,22 @@ pub fn fit_evt_mle_with_options(
     }
 
     let log_likelihood = -best_nll;
-    let standard_errors = delta_method_standard_errors(&neg_ll, &best_phi, &diag_jac);
+    let n_out = distribution.parameter_names().len();
+    let standard_errors = delta_method_standard_errors(&neg_ll, family, &best_phi, n_out);
     let diagnostics = goodness_of_fit(&distribution, &filtered, log_likelihood, best_phi.len());
+
+    // Boundary / degeneracy rules: never report convergence on the internal box, at the
+    // GPD `xi -> -1` boundary (Smith 1985), or with undefined standard errors.
+    let on_box = best_phi
+        .iter()
+        .any(|v| v.abs() > PHI_BOUND - PHI_BOUND_MARGIN);
+    let on_xi_boundary = match distribution {
+        FittedEvtDistribution::Gpd { xi, .. }
+        | FittedEvtDistribution::SplicedBodyGpd { xi, .. } => xi < GPD_XI_MIN + GPD_XI_BOUNDARY_TOL,
+        _ => false,
+    };
+    let se_ok = standard_errors.iter().all(|v| v.is_finite());
+    let converged = converged && !on_box && !on_xi_boundary && se_ok;
 
     Ok(EvtFitResult {
         distribution,
@@ -1330,6 +1550,7 @@ pub fn fit_evt_mle_with_options(
         n_observations: filtered.len(),
         n_censored,
         converged,
+        iterations,
     })
 }
 

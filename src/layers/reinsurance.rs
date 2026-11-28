@@ -364,7 +364,13 @@ pub fn burning_cost_xl(
 pub enum ReinstatementBasis {
     /// Pro-rata as to amount only (standard property catastrophe / per-occurrence XL).
     ProRataAmount,
-    /// Pro-rata as to amount and time (uniform occurrence assumption scales reinstatement by `0.5`).
+    /// Pro-rata as to amount and time: each reinstated amount is charged for the unexpired
+    /// fraction `1 - t` of the term at its loss date `t`.
+    ///
+    /// The expected premium depends on *when* each aggregate slice is eroded, so it needs a
+    /// timing model: use [`price_reinstatements_compound_poisson`] (exact under Poisson arrivals
+    /// uniform over the term) or [`price_reinstatements_time_weighted`] (caller-supplied
+    /// time-weighted slice losses). [`price_reinstatements`] rejects this basis.
     ProRataAmountAndTime,
 }
 
@@ -385,27 +391,16 @@ pub struct ReinstatementPricingResult {
     pub effective_rate_on_line: f64,
 }
 
-/// Price an excess-of-loss treaty with `K` reinstatements using Sundt (1991) exact balance.
-///
-/// - `layer_limit`: Occurrence layer limit `L > 0`.
-/// - `expected_layer_losses`: Expected ceded loss in each aggregate layer slice `[E[S_0], E[S_1], ..., E[S_K]]`
-///   where `S_0` is the initial layer (`0..L`) and `S_k` is the `k`-th reinstated layer (`k*L..(k+1)*L`).
-///   Length is `K + 1` (at least 1).
-/// - `reinstatement_rates`: Reinstatement premium percentage `c_k >= 0` for each reinstatement `k = 1..=K`
-///   (e.g. `1.0` for 100% pro-rata, `0.0` for free reinstatement). Must have length `expected_layer_losses.len() - 1`.
-/// - `expense_ratio`: Reinsurer expense + brokerage ratio `e in [0, 1)`.
-/// - `basis`: Pro-rata by amount vs. pro-rata by amount and time.
-///
-/// Under Sundt (1991) actuarial balance:
-/// `P_0 = (sum_{k=0}^K E[S_k]) / ((1 - e) * (1 + tau * sum_{k=1}^K c_k * E[S_{k-1}] / L))`
-/// where `tau = 1.0` for `ProRataAmount` and `tau = 0.5` for `ProRataAmountAndTime`.
-pub fn price_reinstatements(
+/// Absolute tolerance (in currency units) allowed when checking slice expectations
+/// against `layer_limit` and against each other.
+const SLICE_BOUND_TOL: f64 = 1e-9;
+
+fn validate_reinstatement_inputs(
     layer_limit: f64,
     expected_layer_losses: &[f64],
     reinstatement_rates: &[f64],
     expense_ratio: f64,
-    basis: ReinstatementBasis,
-) -> Result<ReinstatementPricingResult, PricingError> {
+) -> Result<f64, PricingError> {
     if expected_layer_losses.is_empty() {
         return Err(PricingError::EmptyInput(
             "expected_layer_losses must contain at least the initial layer E[S_0]",
@@ -426,45 +421,382 @@ pub fn price_reinstatements(
             "expense_ratio must be finite and in [0, 1)",
         ));
     }
-
     let mut total_expected_loss = 0.0;
     for &s in expected_layer_losses {
-        if !s.is_finite() || !(s >= 0.0) || s > layer_limit + 1e-9 {
+        if !s.is_finite() || !(s >= 0.0) || s > layer_limit + SLICE_BOUND_TOL {
             return Err(PricingError::InvalidParameter(
                 "each expected layer loss must be finite and in [0, layer_limit]",
             ));
         }
         total_expected_loss += s;
     }
-
-    let time_factor = match basis {
-        ReinstatementBasis::ProRataAmount => 1.0,
-        ReinstatementBasis::ProRataAmountAndTime => 0.5,
-    };
-
-    let mut reinst_multiplier = 0.0;
-    for (k, &c_k) in reinstatement_rates.iter().enumerate() {
+    for &c_k in reinstatement_rates {
         if !c_k.is_finite() || !(c_k >= 0.0) {
             return Err(PricingError::InvalidParameter(
                 "reinstatement rates must be finite and non-negative",
             ));
         }
-        // Reinstatement k+1 is consumed by losses in aggregate layer k.
-        reinst_multiplier += time_factor * c_k * (expected_layer_losses[k] / layer_limit);
     }
+    Ok(total_expected_loss)
+}
 
+/// Sundt (1991) balance `P_0 (1 - e) (1 + sum_k c_k R_{k-1} / L) = sum_k E[S_k]`, where
+/// `R_{k-1}` is the premium-relevant measure of slice `k - 1` (`E[S_{k-1}]` for pro-rata
+/// as to amount, `E[∫(1 - t) dS_{k-1}(t)]` for pro-rata as to amount and time).
+fn sundt_balance(
+    layer_limit: f64,
+    total_expected_loss: f64,
+    premium_slice_measure: &[f64],
+    reinstatement_rates: &[f64],
+    expense_ratio: f64,
+) -> ReinstatementPricingResult {
+    // Reinstatement k+1 is consumed by losses in aggregate layer k.
+    let reinst_multiplier: f64 = reinstatement_rates
+        .iter()
+        .zip(premium_slice_measure)
+        .map(|(&c_k, &r_k)| c_k * r_k / layer_limit)
+        .sum();
     let initial_premium = total_expected_loss / ((1.0 - expense_ratio) * (1.0 + reinst_multiplier));
     let expected_reinstatement_premium = initial_premium * reinst_multiplier;
     let total_expected_premium = initial_premium + expected_reinstatement_premium;
-
-    Ok(ReinstatementPricingResult {
+    ReinstatementPricingResult {
         total_expected_ceded_loss: total_expected_loss,
         initial_premium,
         expected_reinstatement_premium,
         total_expected_premium,
         initial_rate_on_line: initial_premium / layer_limit,
         effective_rate_on_line: total_expected_premium / layer_limit,
+    }
+}
+
+/// Price an excess-of-loss treaty with `K` reinstatements pro-rata as to amount using
+/// Sundt (1991) exact balance.
+///
+/// - `layer_limit`: Occurrence layer limit `L > 0`.
+/// - `expected_layer_losses`: Expected ceded loss in each aggregate layer slice `[E[S_0], E[S_1], ..., E[S_K]]`
+///   where `S_0` is the initial layer (`0..L`) and `S_k` is the `k`-th reinstated layer (`k*L..(k+1)*L`).
+///   Length is `K + 1` (at least 1).
+/// - `reinstatement_rates`: Reinstatement premium percentage `c_k >= 0` for each reinstatement `k = 1..=K`
+///   (e.g. `1.0` for 100% pro-rata, `0.0` for free reinstatement). Must have length `expected_layer_losses.len() - 1`.
+/// - `expense_ratio`: Reinsurer expense + brokerage ratio `e in [0, 1)`.
+/// - `basis`: must be [`ReinstatementBasis::ProRataAmount`]; slice expectations alone carry no
+///   timing information, so [`ReinstatementBasis::ProRataAmountAndTime`] returns
+///   [`PricingError::InvalidParameter`] (use [`price_reinstatements_compound_poisson`] or
+///   [`price_reinstatements_time_weighted`]).
+///
+/// Under Sundt (1991) actuarial balance:
+/// `P_0 = (sum_{k=0}^K E[S_k]) / ((1 - e) * (1 + sum_{k=1}^K c_k * E[S_{k-1}] / L))`.
+pub fn price_reinstatements(
+    layer_limit: f64,
+    expected_layer_losses: &[f64],
+    reinstatement_rates: &[f64],
+    expense_ratio: f64,
+    basis: ReinstatementBasis,
+) -> Result<ReinstatementPricingResult, PricingError> {
+    let total_expected_loss = validate_reinstatement_inputs(
+        layer_limit,
+        expected_layer_losses,
+        reinstatement_rates,
+        expense_ratio,
+    )?;
+    if basis == ReinstatementBasis::ProRataAmountAndTime {
+        return Err(PricingError::InvalidParameter(
+            "pro-rata as to time needs a loss-timing model; use price_reinstatements_compound_poisson or price_reinstatements_time_weighted",
+        ));
+    }
+    Ok(sundt_balance(
+        layer_limit,
+        total_expected_loss,
+        expected_layer_losses,
+        reinstatement_rates,
+        expense_ratio,
+    ))
+}
+
+/// Price an excess-of-loss treaty with `K` reinstatements pro-rata as to amount **and time**
+/// from caller-supplied time-weighted slice losses (Sundt 1991 balance).
+///
+/// - `time_weighted_layer_losses[k] = E[∫_0^1 (1 - t) dS_k(t)] = ∫_0^1 E[S_k(t)] dt`, where
+///   `S_k(t)` is the loss eroded from slice `k` by time `t` (term normalized to `[0, 1]`).
+///   Must satisfy `0 <= time_weighted_layer_losses[k] <= expected_layer_losses[k]`.
+///   Obtain it from [`compound_poisson_reinstatement_slices`] or a simulation.
+///
+/// `P_0 = (sum_k E[S_k]) / ((1 - e) * (1 + sum_{k=1}^K c_k * T_{k-1} / L))`.
+pub fn price_reinstatements_time_weighted(
+    layer_limit: f64,
+    expected_layer_losses: &[f64],
+    time_weighted_layer_losses: &[f64],
+    reinstatement_rates: &[f64],
+    expense_ratio: f64,
+) -> Result<ReinstatementPricingResult, PricingError> {
+    let total_expected_loss = validate_reinstatement_inputs(
+        layer_limit,
+        expected_layer_losses,
+        reinstatement_rates,
+        expense_ratio,
+    )?;
+    if time_weighted_layer_losses.len() != expected_layer_losses.len() {
+        return Err(PricingError::DimensionMismatch(
+            "time_weighted_layer_losses must have the same length as expected_layer_losses",
+        ));
+    }
+    for (&t_k, &s_k) in time_weighted_layer_losses.iter().zip(expected_layer_losses) {
+        if !t_k.is_finite() || !(t_k >= 0.0) || t_k > s_k + SLICE_BOUND_TOL {
+            return Err(PricingError::InvalidParameter(
+                "time-weighted slice loss must be finite and in [0, expected slice loss]",
+            ));
+        }
+    }
+    Ok(sundt_balance(
+        layer_limit,
+        total_expected_loss,
+        time_weighted_layer_losses,
+        reinstatement_rates,
+        expense_ratio,
+    ))
+}
+
+/// Expected and time-weighted aggregate slice losses from
+/// [`compound_poisson_reinstatement_slices`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ReinstatementSliceExpectations {
+    /// `E[S_k]` for slices `k = 0..n_slices` (slice `k` covers aggregate `[kL, (k+1)L]`).
+    pub expected_layer_losses: Vec<f64>,
+    /// `T_k = E[∫_0^1 (1 - t) dS_k(t)] = ∫_0^1 E[S_k(t)] dt` (pro-rata-as-to-time exposure).
+    pub time_weighted_layer_losses: Vec<f64>,
+}
+
+/// Tolerance on `sum(pmf) == 1` for the per-occurrence layer-loss pmf.
+const PMF_SUM_TOL: f64 = 1e-9;
+/// Relative tolerance for `layer_limit / step` to be an integer.
+const GRID_ALIGNMENT_TOL: f64 = 1e-9;
+/// Poisson count truncation: `n_max = λ + POISSON_TAIL_SD * sqrt(λ) + POISSON_TAIL_PAD`
+/// (neglected tail mass far below `f64::EPSILON`).
+const POISSON_TAIL_SD: f64 = 40.0;
+/// Additive pad on the Poisson truncation point (see [`POISSON_TAIL_SD`]).
+const POISSON_TAIL_PAD: f64 = 40.0;
+/// Upper bound on `grid_points * pmf_support * count_terms` convolution work.
+const MAX_CONVOLUTION_WORK: f64 = 2e10;
+
+/// Exact expected and time-weighted aggregate slice losses for an occurrence XL layer under
+/// a compound Poisson model with arrivals uniform over the (unit) term
+/// (Sundt 1991; Mata 2000).
+///
+/// - `layer_limit`: occurrence layer limit `L > 0`; must be an integer multiple of `step`.
+/// - `poisson_frequency`: expected number of occurrences per term `λ >= 0` (ground-up or
+///   layer-hitting; occurrences with zero layer loss are thinned out exactly).
+/// - `step`: grid span `h > 0` of the per-occurrence layer loss pmf.
+/// - `occurrence_layer_pmf[j] = P(Y = j h)`, `Y = min((X - R)+, L)`; sums to 1, support `<= L`.
+/// - `n_slices`: number of aggregate slices `K + 1 >= 1`.
+///
+/// With `S(t)` compound Poisson with intensity `λ t` and `g_k(s) = min((s - kL)+, L)`:
+/// `E[S_k] = Σ_n p_n(λ) E[g_k(Y^{*n})]` and, since `∫_0^1 e^{-λt}(λt)^n/n! dt = P(N_λ > n)/λ`,
+/// `T_k = Σ_n [P(N_λ > n)/λ] E[g_k(Y^{*n})]`. Both are evaluated by truncated convolution powers;
+/// mass beyond `n_slices * L` is tracked exactly (it erodes every slice fully).
+pub fn compound_poisson_reinstatement_slices(
+    layer_limit: f64,
+    poisson_frequency: f64,
+    step: f64,
+    occurrence_layer_pmf: &[f64],
+    n_slices: usize,
+) -> Result<ReinstatementSliceExpectations, PricingError> {
+    if !layer_limit.is_finite() || !(layer_limit > 0.0) {
+        return Err(PricingError::NonPositiveValue(
+            "layer_limit must be finite and positive",
+        ));
+    }
+    if !poisson_frequency.is_finite() || !(poisson_frequency >= 0.0) {
+        return Err(PricingError::InvalidParameter(
+            "poisson_frequency must be finite and non-negative",
+        ));
+    }
+    if !step.is_finite() || !(step > 0.0) {
+        return Err(PricingError::NonPositiveValue(
+            "step must be finite and positive",
+        ));
+    }
+    if occurrence_layer_pmf.is_empty() {
+        return Err(PricingError::EmptyInput(
+            "occurrence_layer_pmf must not be empty",
+        ));
+    }
+    if n_slices == 0 {
+        return Err(PricingError::InvalidParameter("n_slices must be >= 1"));
+    }
+    let cells_f = layer_limit / step;
+    let cells_rounded = cells_f.round();
+    if !(cells_rounded >= 1.0)
+        || (cells_f - cells_rounded).abs() > GRID_ALIGNMENT_TOL * cells_rounded
+    {
+        return Err(PricingError::InvalidParameter(
+            "layer_limit must be a positive integer multiple of step",
+        ));
+    }
+    let cells = cells_rounded as usize;
+    if occurrence_layer_pmf.len() > cells + 1 {
+        return Err(PricingError::OutOfBounds(
+            "occurrence_layer_pmf support exceeds layer_limit",
+        ));
+    }
+    let mut total = 0.0;
+    for &p in occurrence_layer_pmf {
+        if !p.is_finite() || !(p >= 0.0) {
+            return Err(PricingError::InvalidParameter(
+                "occurrence_layer_pmf entries must be finite and non-negative",
+            ));
+        }
+        total += p;
+    }
+    if (total - 1.0).abs() > PMF_SUM_TOL {
+        return Err(PricingError::InvalidParameter(
+            "occurrence_layer_pmf must sum to 1",
+        ));
+    }
+
+    let mut expected = vec![0.0; n_slices];
+    let mut time_weighted = vec![0.0; n_slices];
+    // Thin to layer-hitting occurrences: λ' = λ P(Y > 0), Y | Y > 0 has f_0 = 0.
+    let hit_mass: f64 = occurrence_layer_pmf[1..].iter().sum();
+    let lambda = poisson_frequency * hit_mass / total;
+    if !(lambda > 0.0) || !(hit_mass > 0.0) {
+        return Ok(ReinstatementSliceExpectations {
+            expected_layer_losses: expected,
+            time_weighted_layer_losses: time_weighted,
+        });
+    }
+    let sev: Vec<f64> = occurrence_layer_pmf.iter().map(|&p| p / hit_mass).collect();
+    let sev_support = sev.len() - 1;
+
+    // Poisson pmf p_n (log-recursive, underflow-safe) and survival P(N > n) by backward sums.
+    let n_max = (lambda + POISSON_TAIL_SD * lambda.sqrt() + POISSON_TAIL_PAD).ceil() as usize;
+    let grid_max = n_slices * cells;
+    let count_terms = n_max.min(grid_max) + 1;
+    let work = (grid_max + 1) as f64 * sev_support as f64 * count_terms as f64;
+    if work > MAX_CONVOLUTION_WORK {
+        return Err(PricingError::OutOfBounds(
+            "convolution grid too large; coarsen step or reduce n_slices",
+        ));
+    }
+    let ln_lambda = lambda.ln();
+    let mut log_p = -lambda;
+    let mut pois = Vec::with_capacity(n_max + 1);
+    for n in 0..=n_max {
+        if n > 0 {
+            log_p += ln_lambda - (n as f64).ln();
+        }
+        pois.push(log_p.exp());
+    }
+    // surv[n] = P(N > n); time weights w_n = surv[n] / λ.
+    let mut surv = vec![0.0; n_max + 1];
+    for n in (0..n_max).rev() {
+        surv[n] = surv[n + 1] + pois[n + 1];
+    }
+    // Tail sums beyond index n for both weight sets.
+    let mut pois_tail = vec![0.0; n_max + 1];
+    let mut time_tail = vec![0.0; n_max + 1];
+    for n in (0..n_max).rev() {
+        pois_tail[n] = pois_tail[n + 1] + pois[n + 1];
+        time_tail[n] = time_tail[n + 1] + surv[n + 1] / lambda;
+    }
+
+    // conv[s] = P(Y_1 + ... + Y_n = s h) for s <= grid_max; overflow = P(sum > grid_max h).
+    let mut conv = vec![0.0; grid_max + 1];
+    conv[0] = 1.0;
+    let mut overflow = 0.0;
+    let mut next = vec![0.0; grid_max + 1];
+    for n in 1..=n_max {
+        next.fill(0.0);
+        let mut pushed = 0.0;
+        for (s, &c) in conv.iter().enumerate() {
+            if c == 0.0 {
+                continue;
+            }
+            for (j, &f) in sev.iter().enumerate().skip(1) {
+                let idx = s + j;
+                if idx <= grid_max {
+                    next[idx] += c * f;
+                } else {
+                    pushed += c * f;
+                }
+            }
+        }
+        std::mem::swap(&mut conv, &mut next);
+        overflow += pushed;
+
+        let w_pois = pois[n];
+        let w_time = surv[n] / lambda;
+        let mut in_range = 0.0;
+        for k in 0..n_slices {
+            let lo = k * cells;
+            let mut e_gk = overflow * layer_limit;
+            for (s, &c) in conv.iter().enumerate().skip(lo + 1) {
+                e_gk += c * step * ((s - lo).min(cells) as f64);
+            }
+            expected[k] += w_pois * e_gk;
+            time_weighted[k] += w_time * e_gk;
+        }
+        for &c in &conv {
+            in_range += c;
+        }
+        if in_range == 0.0 {
+            // Every later convolution power lies wholly beyond the top slice.
+            for k in 0..n_slices {
+                expected[k] += pois_tail[n] * layer_limit;
+                time_weighted[k] += time_tail[n] * layer_limit;
+            }
+            break;
+        }
+    }
+    for k in 0..n_slices {
+        expected[k] = expected[k].clamp(0.0, layer_limit);
+        time_weighted[k] = time_weighted[k].clamp(0.0, expected[k]);
+    }
+    Ok(ReinstatementSliceExpectations {
+        expected_layer_losses: expected,
+        time_weighted_layer_losses: time_weighted,
     })
+}
+
+/// Price an excess-of-loss treaty with `K = reinstatement_rates.len()` reinstatements under
+/// a compound Poisson occurrence model with arrivals uniform over the term (Sundt 1991
+/// balance; exact pro-rata-as-to-time expectation per Mata 2000).
+///
+/// See [`compound_poisson_reinstatement_slices`] for the frequency/severity inputs. For
+/// `basis = ProRataAmount` this equals [`price_reinstatements`] on the exact `E[S_k]`; for
+/// `ProRataAmountAndTime` the reinstatement premium uses `T_k = ∫_0^1 E[S_k(t)] dt`
+/// (e.g. total losses with `λ = 1` give `T_0 / L = e^{-1}`).
+pub fn price_reinstatements_compound_poisson(
+    layer_limit: f64,
+    poisson_frequency: f64,
+    step: f64,
+    occurrence_layer_pmf: &[f64],
+    reinstatement_rates: &[f64],
+    expense_ratio: f64,
+    basis: ReinstatementBasis,
+) -> Result<ReinstatementPricingResult, PricingError> {
+    let slices = compound_poisson_reinstatement_slices(
+        layer_limit,
+        poisson_frequency,
+        step,
+        occurrence_layer_pmf,
+        reinstatement_rates.len() + 1,
+    )?;
+    match basis {
+        ReinstatementBasis::ProRataAmount => price_reinstatements(
+            layer_limit,
+            &slices.expected_layer_losses,
+            reinstatement_rates,
+            expense_ratio,
+            basis,
+        ),
+        ReinstatementBasis::ProRataAmountAndTime => price_reinstatements_time_weighted(
+            layer_limit,
+            &slices.expected_layer_losses,
+            &slices.time_weighted_layer_losses,
+            reinstatement_rates,
+            expense_ratio,
+        ),
+    }
 }
 
 /// Specification for a proportional treaty sliding-scale ceding commission (Clark 2014).

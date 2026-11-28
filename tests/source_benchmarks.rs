@@ -703,12 +703,13 @@ fn test_clark_2014_reinsurance_burning_cost_reinstatements_and_proportional_term
     ));
 
     // Pro-rata by time reduces reinstatement premium collection -> higher initial premium P0
-    let reinst_time = price_reinstatements(
+    // (time-weighted slice losses T_k <= E[S_k] must now be supplied explicitly)
+    let reinst_time = pricing_kernels::layers::price_reinstatements_time_weighted(
         1_000_000.0,
         &[200_000.0, 50_000.0],
+        &[100_000.0, 25_000.0],
         &[1.0],
         0.10,
-        ReinstatementBasis::ProRataAmountAndTime,
     )
     .unwrap();
     assert!(reinst_time.initial_premium > reinst.initial_premium);
