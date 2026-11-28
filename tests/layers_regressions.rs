@@ -1119,3 +1119,228 @@ fn gauss_kronrod_public_api_is_scale_aware_and_reports_errors() {
     // A divergent integral is reported, not silently truncated.
     assert!(gauss_kronrod_integrate_semi_infinite(|x| 1.0 / (1.0 + x), 0.0, 1.0).is_err());
 }
+
+// ---------------------------------------------------------------------------
+// layers::fitting: scale-equivariant severity MLE with boundary flags
+// ---------------------------------------------------------------------------
+
+use pricing_kernels::layers::{SeverityFamily, fit_best_severity, fit_severity_mle};
+
+fn gamma_params(d: SeverityDistribution) -> (f64, f64) {
+    match d {
+        SeverityDistribution::Gamma { shape, scale } => (shape, scale),
+        other => panic!("expected Gamma, got {other:?}"),
+    }
+}
+
+fn lomax_params(d: SeverityDistribution) -> (f64, f64) {
+    match d {
+        SeverityDistribution::Lomax { alpha, theta } => (alpha, theta),
+        other => panic!("expected Lomax, got {other:?}"),
+    }
+}
+
+#[test]
+fn gamma_large_shape_recovers_evt_mle() {
+    // Normal approximation to Gamma(5000, 200) is adequate: both engines see the same data.
+    let (shape, scale) = (5000.0_f64, 200.0);
+    let mut rng = SplitMix64(SEED);
+    let obs: Vec<SeverityObservation> = (0..2000)
+        .map(|_| SeverityObservation::exact(shape * scale + rng.normal() * shape.sqrt() * scale))
+        .collect();
+    let fit = fit_severity_mle(SeverityFamily::Gamma, &obs, &SolverOptions::default()).unwrap();
+    let evt = fit_evt_mle(EvtFamily::Gamma, &obs).unwrap();
+    assert!(fit.converged && !fit.at_bound);
+    assert!(
+        rel(fit.log_likelihood, evt.log_likelihood) < 1e-6,
+        "ll={} evt={}",
+        fit.log_likelihood,
+        evt.log_likelihood
+    );
+    assert!(fit.log_likelihood >= evt.log_likelihood - 1e-6);
+    let (k, s) = gamma_params(fit.distribution);
+    let FittedEvtDistribution::Gamma { alpha, beta } = evt.distribution else {
+        panic!("expected Gamma");
+    };
+    assert!(rel(k, alpha) < 1e-2, "shape={k} evt={alpha}");
+    assert!(rel(k * s, alpha / beta) < 1e-6);
+    assert!(k > 4000.0 && k < 6000.0, "shape={k}");
+}
+
+#[test]
+fn lomax_on_exponential_data_at_dollar_scale_prefers_exponential() {
+    let mean = 1e10;
+    let mut rng = SplitMix64(SEED);
+    let obs: Vec<SeverityObservation> = (0..2000)
+        .map(|_| SeverityObservation::exact(-mean * rng.uniform().ln()))
+        .collect();
+    let opts = SolverOptions::default();
+    let exp = fit_severity_mle(SeverityFamily::Exponential, &obs, &opts).unwrap();
+    let lomax = fit_severity_mle(SeverityFamily::Lomax, &obs, &opts).unwrap();
+    let (alpha, theta) = lomax_params(lomax.distribution);
+    // Lomax nests the Exponential as alpha -> inf, so its supremum is never worse.
+    assert!(
+        lomax.log_likelihood >= exp.log_likelihood - 1e-6,
+        "lomax ll={} exp ll={} alpha={alpha} theta={theta}",
+        lomax.log_likelihood,
+        exp.log_likelihood
+    );
+    assert!(alpha > 20.0, "alpha={alpha}");
+    if lomax.converged {
+        let evt = fit_evt_mle(EvtFamily::ParetoII, &obs).unwrap();
+        assert!(rel(lomax.log_likelihood, evt.log_likelihood) < 1e-9);
+    }
+    let ranked = fit_best_severity(
+        &[SeverityFamily::Lomax, SeverityFamily::Exponential],
+        &obs,
+        &opts,
+    )
+    .unwrap();
+    assert!(matches!(
+        ranked[0].distribution,
+        SeverityDistribution::Exponential { .. }
+    ));
+}
+
+#[test]
+fn lomax_light_tailed_sample_reports_bound_and_is_excluded_from_ranking() {
+    // CV < 1: the Lomax likelihood increases monotonically towards the exponential limit.
+    let obs: Vec<SeverityObservation> = [100.0, 200.0, 400.0, 800.0]
+        .into_iter()
+        .map(SeverityObservation::exact)
+        .collect();
+    let opts = SolverOptions::default();
+    let lomax = fit_severity_mle(SeverityFamily::Lomax, &obs, &opts).unwrap();
+    assert!(lomax.at_bound && !lomax.converged);
+    let exp = fit_severity_mle(SeverityFamily::Exponential, &obs, &opts).unwrap();
+    assert!(exp.converged && !exp.at_bound);
+    assert!(lomax.log_likelihood >= exp.log_likelihood - 1e-6);
+    let ranked = fit_best_severity(
+        &[SeverityFamily::Lomax, SeverityFamily::Exponential],
+        &obs,
+        &opts,
+    )
+    .unwrap();
+    assert_eq!(ranked.len(), 1);
+    assert!(ranked.iter().all(|f| f.converged));
+    assert!(matches!(
+        fit_best_severity(&[SeverityFamily::Lomax], &obs, &opts),
+        Err(PricingError::NonConvergence(_))
+    ));
+}
+
+#[test]
+fn severity_mle_is_scale_equivariant() {
+    let mut rng = SplitMix64(SEED);
+    let base: Vec<SeverityObservation> = (0..400)
+        .map(|_| {
+            // Lognormal(8, 1.2) excess over a 500 deductible, censored at 20_000 (interior MLE
+            // for all three families; a Pareto-tailed sample drives Gamma to shape -> 0).
+            let x = 500.0 + (8.0 + 1.2 * rng.normal()).exp();
+            if x >= 20_000.0 {
+                SeverityObservation::censored(20_000.0, 500.0)
+            } else {
+                SeverityObservation::truncated(x, 500.0)
+            }
+        })
+        .collect();
+    let c = 1e6;
+    let scaled: Vec<SeverityObservation> = base
+        .iter()
+        .map(|o| SeverityObservation {
+            loss: o.loss * c,
+            deductible: o.deductible * c,
+            ..*o
+        })
+        .collect();
+    let opts = SolverOptions::default();
+    for family in [
+        SeverityFamily::Lomax,
+        SeverityFamily::Gamma,
+        SeverityFamily::Lognormal,
+    ] {
+        let a = fit_severity_mle(family, &base, &opts).unwrap();
+        let b = fit_severity_mle(family, &scaled, &opts).unwrap();
+        assert!(a.converged && b.converged, "{family:?}");
+        // ll shifts by -(uncensored weight) * ln c under x -> c x.
+        let n_unc = base.iter().filter(|o| !o.is_censored).count() as f64;
+        assert!(
+            rel(b.log_likelihood, a.log_likelihood - n_unc * c.ln()) < 1e-9,
+            "{family:?}"
+        );
+        match (a.distribution, b.distribution) {
+            (
+                SeverityDistribution::Lomax {
+                    alpha: a1,
+                    theta: t1,
+                },
+                SeverityDistribution::Lomax {
+                    alpha: a2,
+                    theta: t2,
+                },
+            ) => {
+                assert!(rel(a1, a2) < 1e-6 && rel(t1 * c, t2) < 1e-6);
+            }
+            (
+                SeverityDistribution::Gamma {
+                    shape: k1,
+                    scale: s1,
+                },
+                SeverityDistribution::Gamma {
+                    shape: k2,
+                    scale: s2,
+                },
+            ) => {
+                assert!(rel(k1, k2) < 1e-6 && rel(s1 * c, s2) < 1e-6);
+            }
+            (
+                SeverityDistribution::Lognormal { mu: m1, sigma: s1 },
+                SeverityDistribution::Lognormal { mu: m2, sigma: s2 },
+            ) => {
+                assert!((m1 + c.ln() - m2).abs() < 1e-6 && rel(s1, s2) < 1e-6);
+            }
+            other => panic!("unexpected pair {other:?}"),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Reinstatement slice bounds are relative to the layer scale
+// ---------------------------------------------------------------------------
+
+#[test]
+fn reinstatement_slice_bounds_scale_with_layer_limit() {
+    use pricing_kernels::layers::price_reinstatements_time_weighted;
+    for limit in [1e8_f64, 1e10] {
+        // A full-limit slice EL computed with a couple of ulps of round-off.
+        let el = limit * (1.0 + 2.0 * f64::EPSILON);
+        assert!(el > limit);
+        let res = price_reinstatements(
+            limit,
+            &[el, 0.5 * limit],
+            &[1.0],
+            0.0,
+            ReinstatementBasis::ProRataAmount,
+        );
+        assert!(res.is_ok(), "limit={limit}: {res:?}");
+        let tw = price_reinstatements_time_weighted(
+            limit,
+            &[0.5 * limit, 0.25 * limit],
+            &[0.5 * limit * (1.0 + 2.0 * f64::EPSILON), 0.1 * limit],
+            &[1.0],
+            0.0,
+        );
+        assert!(tw.is_ok(), "limit={limit}: {tw:?}");
+        // Genuine violations are still rejected.
+        assert!(
+            price_reinstatements(
+                limit,
+                &[limit * (1.0 + 1e-6)],
+                &[],
+                0.0,
+                ReinstatementBasis::ProRataAmount,
+            )
+            .is_err()
+        );
+    }
+}

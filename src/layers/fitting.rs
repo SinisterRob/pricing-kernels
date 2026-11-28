@@ -101,7 +101,33 @@ pub struct SeverityFitResult {
     pub n_censored: usize,
     /// Number of optimizer iterations (`1` for closed-form solutions).
     pub iterations: usize,
+    /// Whether the optimizer converged at an interior point (`true` for closed forms).
+    /// `false` exactly when [`Self::at_bound`] is set; interior non-convergence is an error.
+    pub converged: bool,
+    /// Whether the optimum lies on the internal overflow guard `|p_j| <= LOG_PARAM_BOUND` of the
+    /// scale-normalized log coordinates, i.e. the likelihood supremum is approached at a
+    /// degenerate limit (e.g. Lomax `alpha -> inf` on a sample with CV < 1) and the reported
+    /// parameters are not an MLE.
+    pub at_bound: bool,
 }
+
+/// Overflow guard on every scale-normalized log coordinate of the iterative fits
+/// (`e^30 ≈ 1.1e13` relative to the data scale); not a modelling constraint.
+pub const LOG_PARAM_BOUND: f64 = 30.0;
+/// An optimum within this distance of [`LOG_PARAM_BOUND`] is reported with `at_bound = true`.
+pub const LOG_PARAM_BOUND_MARGIN: f64 = 1.0;
+/// Lower clamp on the starting squared coefficient of variation.
+const MIN_START_CV2: f64 = 1e-12;
+/// Upper clamp on the starting squared coefficient of variation.
+const MAX_START_CV2: f64 = 1e12;
+/// Lower clamp on the starting log-variance for Lognormal.
+const MIN_START_LOG_VARIANCE: f64 = 0.04;
+/// Minimum CV² for the Lomax method-of-moments start `alpha = 2 CV² / (CV² - 1)`.
+const LOMAX_MOM_MIN_CV2: f64 = 1.05;
+/// Lomax starting `alpha` for light-tailed samples (CV² ≤ `LOMAX_MOM_MIN_CV2`).
+const LOMAX_LIGHT_TAIL_START_ALPHA: f64 = 10.0;
+/// Floor on `alpha - 1` in the Lomax starting scale.
+const LOMAX_MIN_START_EXCESS: f64 = 0.05;
 
 fn validate_observations(
     observations: &[SeverityObservation],
@@ -216,6 +242,8 @@ fn eval_log_likelihood(dist: &SeverityDistribution, observations: &[SeverityObse
 }
 
 /// Deterministic 2D Nelder–Mead minimizer for smooth unconstrained log-parameter objectives.
+/// Stops when the objective spread is `<= tol (1 + |f_best|)` and the simplex diameter is
+/// `<= sqrt(tol)`.
 /// Returns `(best_point, best_value, iterations, converged)`.
 fn nelder_mead_2d<F>(
     start: [f64; 2],
@@ -258,7 +286,9 @@ where
             .max((pts[1][1] - pts[0][1]).abs())
             .max((pts[2][0] - pts[0][0]).abs())
             .max((pts[2][1] - pts[0][1]).abs());
-        if spread_f <= tol && spread_x <= tol.sqrt().max(tol) {
+        // Relative objective spread: the summed log-likelihood carries O(n·ulp·|ll|) round-off,
+        // so an absolute `tol` is unreachable for large samples.
+        if spread_f <= tol * (1.0 + vals[0].abs()) && spread_x <= tol.sqrt().max(tol) {
             converged = true;
             break;
         }
@@ -341,6 +371,7 @@ fn make_fit_result(
     total_weight: f64,
     n_censored: usize,
     iterations: usize,
+    at_bound: bool,
 ) -> Result<SeverityFitResult, PricingError> {
     distribution.validate()?;
     if !log_likelihood.is_finite() {
@@ -359,6 +390,8 @@ fn make_fit_result(
         total_weight,
         n_censored,
         iterations,
+        converged: !at_bound,
+        at_bound,
     })
 }
 
@@ -394,12 +427,28 @@ pub fn fit_severity_mle(
             sum_lnx2 += obs.weight * lnx * lnx;
         }
     }
-    let mean_x = (sum_x / uncensored_w).max(1e-6);
-    let var_x = (sum_x2 / uncensored_w - mean_x * mean_x).max(mean_x * mean_x * 0.1);
+    // Data scale for scale-equivariant optimizer coordinates (weighted mean of uncensored losses).
+    let scale_ref = sum_x / uncensored_w;
+    if !scale_ref.is_finite() || !(scale_ref > 0.0) {
+        return Err(PricingError::InvalidParameter(
+            "severity sample mean must be finite and positive",
+        ));
+    }
+    let ln_scale = scale_ref.ln();
+    let mean_x = scale_ref;
+    let var_x = (sum_x2 / uncensored_w - mean_x * mean_x)
+        .max(MIN_START_CV2 * mean_x * mean_x)
+        .min(MAX_START_CV2 * mean_x * mean_x);
     let mu0 = sum_lnx / uncensored_w;
-    let sigma0 = (sum_lnx2 / uncensored_w - mu0 * mu0).max(0.04).sqrt();
-
-    let max_iter = options.max_iter;
+    let sigma0 = (sum_lnx2 / uncensored_w - mu0 * mu0)
+        .max(MIN_START_LOG_VARIANCE)
+        .sqrt();
+    let fit_ctx = FitContext {
+        observations,
+        options,
+        total_w,
+        n_censored,
+    };
 
     match family {
         SeverityFamily::Exponential => {
@@ -412,7 +461,7 @@ pub fn fit_severity_mle(
             let lambda = uncensored_w / denom;
             let dist = SeverityDistribution::Exponential { lambda };
             let ll = eval_log_likelihood(&dist, observations);
-            make_fit_result(dist, 1, ll, total_w, n_censored, 1)
+            make_fit_result(dist, 1, ll, total_w, n_censored, 1, false)
         }
         SeverityFamily::SingleParameterPareto { threshold } => {
             if !threshold.is_finite() || !(threshold > 0.0) {
@@ -441,7 +490,7 @@ pub fn fit_severity_mle(
                 x_m: threshold,
             };
             let ll = eval_log_likelihood(&dist, observations);
-            make_fit_result(dist, 1, ll, total_w, n_censored, 1)
+            make_fit_result(dist, 1, ll, total_w, n_censored, 1, false)
         }
         SeverityFamily::Lognormal => {
             if n_censored == 0 && !has_trunc && uncensored_w > 1.0 {
@@ -451,95 +500,144 @@ pub fn fit_severity_mle(
                     sigma: var_ln.sqrt(),
                 };
                 let ll = eval_log_likelihood(&dist, observations);
-                return make_fit_result(dist, 2, ll, total_w, n_censored, 1);
+                return make_fit_result(dist, 2, ll, total_w, n_censored, 1, false);
             }
-            let obj = |p: [f64; 2]| {
-                let mu = p[0];
-                let sigma = p[1].clamp(-12.0, 6.0).exp();
-                let dist = SeverityDistribution::Lognormal { mu, sigma };
-                let ll = eval_log_likelihood(&dist, observations);
-                if ll.is_finite() { -ll } else { 1e30 }
+            // p = (mu - ln m, ln sigma)
+            let unpack = |p: [f64; 2]| SeverityDistribution::Lognormal {
+                mu: p[0] + ln_scale,
+                sigma: p[1].exp(),
             };
-            let (best, neg_ll, iters, converged) =
-                nelder_mead_2d([mu0, sigma0.ln()], [0.5, 0.3], max_iter, options.tol, obj);
-            if !converged {
-                return Err(PricingError::NonConvergence(
-                    "Lognormal severity MLE did not converge within max_iter",
-                ));
-            }
-            let dist = SeverityDistribution::Lognormal {
-                mu: best[0],
-                sigma: best[1].clamp(-12.0, 6.0).exp(),
-            };
-            make_fit_result(dist, 2, -neg_ll, total_w, n_censored, iters)
+            fit_ctx.optimize(
+                [mu0 - ln_scale, sigma0.ln()],
+                [0.5, 0.3],
+                unpack,
+                "Lognormal severity MLE did not converge within max_iter",
+            )
         }
         SeverityFamily::Lomax => {
-            // Method-of-moments starting guess (if CV > 1) or sensible heavy-tail default.
+            // Method-of-moments starting guess (if CV > 1) or a near-exponential default.
+            // p = (ln alpha, ln(theta / alpha) - ln m): the second coordinate is the scale of
+            // the exponential limit (alpha -> inf, theta / alpha fixed), so the objective stays
+            // well conditioned for light-tailed samples and is invariant to rescaling the data.
             let cv2 = var_x / (mean_x * mean_x);
-            let alpha0 = if cv2 > 1.05 {
-                (2.0 * cv2 / (cv2 - 1.0)).clamp(1.2, 20.0)
+            let alpha0 = if cv2 > LOMAX_MOM_MIN_CV2 {
+                2.0 * cv2 / (cv2 - 1.0)
             } else {
-                2.5
+                LOMAX_LIGHT_TAIL_START_ALPHA
             };
-            let theta0 = (mean_x * (alpha0 - 1.0)).max(1e-3);
-            let obj = |p: [f64; 2]| {
-                let alpha = p[0].clamp(-8.0, 10.0).exp();
-                let theta = p[1].clamp(-10.0, 25.0).exp();
-                let dist = SeverityDistribution::Lomax { alpha, theta };
-                let ll = eval_log_likelihood(&dist, observations);
-                if ll.is_finite() { -ll } else { 1e30 }
+            let theta_over_alpha0 = mean_x * (alpha0 - 1.0).max(LOMAX_MIN_START_EXCESS) / alpha0;
+            let unpack = |p: [f64; 2]| {
+                let alpha = p[0].exp();
+                SeverityDistribution::Lomax {
+                    alpha,
+                    theta: alpha * (p[1] + ln_scale).exp(),
+                }
             };
-            let (best, neg_ll, iters, converged) = nelder_mead_2d(
-                [alpha0.ln(), theta0.ln()],
+            fit_ctx.optimize(
+                [alpha0.ln(), theta_over_alpha0.ln() - ln_scale],
                 [0.4, 0.6],
-                max_iter,
-                options.tol,
-                obj,
-            );
-            if !converged {
-                return Err(PricingError::NonConvergence(
-                    "Lomax severity MLE did not converge within max_iter",
-                ));
-            }
-            let dist = SeverityDistribution::Lomax {
-                alpha: best[0].clamp(-8.0, 10.0).exp(),
-                theta: best[1].clamp(-10.0, 25.0).exp(),
-            };
-            make_fit_result(dist, 2, -neg_ll, total_w, n_censored, iters)
+                unpack,
+                "Lomax severity MLE did not converge within max_iter",
+            )
         }
         SeverityFamily::Gamma => {
-            let shape0 = (mean_x * mean_x / var_x).clamp(0.1, 100.0);
-            let scale0 = (var_x / mean_x).max(1e-6);
-            let obj = |p: [f64; 2]| {
-                let shape = p[0].clamp(-6.0, 8.0).exp();
-                let scale = p[1].clamp(-10.0, 25.0).exp();
-                let dist = SeverityDistribution::Gamma { shape, scale };
-                let ll = eval_log_likelihood(&dist, observations);
-                if ll.is_finite() { -ll } else { 1e30 }
+            // p = (ln shape, ln(shape * scale) - ln m): the mean coordinate is nearly
+            // orthogonal to the shape (exactly so for uncensored data) and scale-equivariant.
+            let shape0 = mean_x * mean_x / var_x;
+            let unpack = |p: [f64; 2]| {
+                let shape = p[0].exp();
+                SeverityDistribution::Gamma {
+                    shape,
+                    scale: (p[1] + ln_scale).exp() / shape,
+                }
             };
-            let (best, neg_ll, iters, converged) = nelder_mead_2d(
-                [shape0.ln(), scale0.ln()],
-                [0.35, 0.5],
-                max_iter,
-                options.tol,
-                obj,
-            );
-            if !converged {
-                return Err(PricingError::NonConvergence(
-                    "Gamma severity MLE did not converge within max_iter",
-                ));
-            }
-            let dist = SeverityDistribution::Gamma {
-                shape: best[0].clamp(-6.0, 8.0).exp(),
-                scale: best[1].clamp(-10.0, 25.0).exp(),
-            };
-            make_fit_result(dist, 2, -neg_ll, total_w, n_censored, iters)
+            fit_ctx.optimize(
+                [shape0.ln(), 0.0],
+                [0.35, 0.2],
+                unpack,
+                "Gamma severity MLE did not converge within max_iter",
+            )
         }
     }
 }
 
-/// Fit multiple candidate [`SeverityFamily`] models and return them ranked from best to worst
-/// by Akaike Information Criterion (`AIC`).
+/// Shared inputs of the iterative two-parameter fits.
+struct FitContext<'a> {
+    observations: &'a [SeverityObservation],
+    options: &'a SolverOptions,
+    total_w: f64,
+    n_censored: usize,
+}
+
+impl FitContext<'_> {
+    /// Minimize `-ll` over scale-normalized log coordinates `p` with `|p_j| <= LOG_PARAM_BOUND`
+    /// (an overflow guard far beyond realistic parameters, not a modelling constraint), then
+    /// restart once from the optimum to guard against simplex collapse.
+    ///
+    /// An optimum within [`LOG_PARAM_BOUND_MARGIN`] of the guard is returned as `Ok` with
+    /// `at_bound = true` and `converged = false` (the MLE does not exist in the interior, e.g.
+    /// Lomax on a sample with CV < 1, whose supremum is the exponential limit). An interior
+    /// point that fails to converge within `max_iter` is an error.
+    fn optimize<U>(
+        &self,
+        start: [f64; 2],
+        step: [f64; 2],
+        unpack: U,
+        non_convergence: &'static str,
+    ) -> Result<SeverityFitResult, PricingError>
+    where
+        U: Fn([f64; 2]) -> SeverityDistribution,
+    {
+        let obj = |p: [f64; 2]| {
+            if p.iter()
+                .any(|v| !v.is_finite() || v.abs() > LOG_PARAM_BOUND)
+            {
+                return f64::INFINITY;
+            }
+            let ll = eval_log_likelihood(&unpack(p), self.observations);
+            if ll.is_finite() { -ll } else { f64::INFINITY }
+        };
+        let start = start.map(|v| v.clamp(-LOG_PARAM_BOUND, LOG_PARAM_BOUND));
+        let (tol, max_iter) = (self.options.tol, self.options.max_iter);
+        let (first, f_first, it_first, conv_first) =
+            nelder_mead_2d(start, step, max_iter, tol, obj);
+        let (best, neg_ll, iters, converged) = if conv_first {
+            let (second, f_second, it_second, conv_second) =
+                nelder_mead_2d(first, step, max_iter, tol, obj);
+            if f_second <= f_first {
+                (second, f_second, it_first + it_second, conv_second)
+            } else {
+                (first, f_first, it_first + it_second, conv_first)
+            }
+        } else {
+            (first, f_first, it_first, false)
+        };
+        let at_bound = best
+            .iter()
+            .any(|v| v.abs() > LOG_PARAM_BOUND - LOG_PARAM_BOUND_MARGIN);
+        if !converged && !at_bound {
+            return Err(PricingError::NonConvergence(non_convergence));
+        }
+        make_fit_result(
+            unpack(best),
+            2,
+            -neg_ll,
+            self.total_w,
+            self.n_censored,
+            iters,
+            at_bound,
+        )
+    }
+}
+
+/// Fit multiple candidate [`SeverityFamily`] models and return the converged fits ranked from
+/// best to worst by Akaike Information Criterion (`AIC`).
+///
+/// Fits with `converged == false` (optimum on the overflow guard, see
+/// [`SeverityFitResult::at_bound`]) are excluded from the ranking: their parameters are not an
+/// MLE and a degenerate limit (e.g. Lomax → Exponential) would be double-counted with a
+/// spurious extra parameter. Errors with [`PricingError::NonConvergence`] if no candidate
+/// converges; any other per-family error is propagated.
 pub fn fit_best_severity(
     families: &[SeverityFamily],
     observations: &[SeverityObservation],
@@ -552,7 +650,15 @@ pub fn fit_best_severity(
     }
     let mut results = Vec::with_capacity(families.len());
     for &family in families {
-        results.push(fit_severity_mle(family, observations, options)?);
+        let fit = fit_severity_mle(family, observations, options)?;
+        if fit.converged {
+            results.push(fit);
+        }
+    }
+    if results.is_empty() {
+        return Err(PricingError::NonConvergence(
+            "no candidate severity family converged to an interior MLE",
+        ));
     }
     results.sort_by(|a, b| a.aic.total_cmp(&b.aic));
     Ok(results)

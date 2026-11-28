@@ -1157,11 +1157,30 @@ fn test_wang_ph_kreps_and_rmk_risk_loads() {
     let exact_wang = (mu + 0.5 * sigma * sigma + lambda * sigma).exp();
     assert!(close_rel(wang_res.risk_adjusted_price, exact_wang, 1e-3));
 
-    // Kreps (1990) marginal surplus risk load
-    let kreps = kreps_marginal_risk_load(1_000.0, 200.0, 10_000.0, 20_000.0, 3.0, 0.15).unwrap();
-    let expected_sd_after = (1_000_000.0 + 10_000.0 + 40_000.0_f64).sqrt();
-    let expected_rl = (0.15 / 1.15) * 3.0 * (expected_sd_after - 1_000.0);
-    assert!(close_rel(kreps.risk_load, expected_rl, 1e-12));
+    // Kreps (1990), "Reinsurer Risk Loads from Marginal Surplus Requirements" (PCAS LXXVII),
+    // hand-computed with zero risk-free yield. Definitions from the paper:
+    //   * required surplus is z standard deviations: S = z·σ, so the marginal surplus for
+    //     adding X to portfolio S is ΔS = z·(σ_{S+X} − σ_S), σ²_{S+X} = σ²_S + Var X + 2 Cov;
+    //   * the risk load R is held with the surplus, so investors supply ΔS − R and demand
+    //     yield y on it: R = y·(ΔS − R)  ⇒  R = y·ΔS / (1 + y).
+    // Inputs: σ_S = 300, E[X] = 200, Var X = 1_600 (σ_X = 40), Cov = 7_012.5 (ρ ≈ 0.584),
+    // z = 3, y = 0.15.
+    //   σ²_{S+X} = 90_000 + 1_600 + 14_025 = 105_625  ⇒  σ_{S+X} = 325 exactly
+    //   ΔS = 3 · (325 − 300) = 75
+    //   R = 0.15 · 75 / 1.15 = 11.25 / 1.15 = 225/23 ≈ 9.782_608_695_652_174
+    //   P = E[X] + R = 200 + 225/23 = 4_825/23
+    // Kreps' first-order (small-contract) approximation σ_{S+X} − σ_S ≈ (Var X + 2 Cov)/(2σ_S):
+    //   R_lin = (0.15/1.15) · 3 · 15_625 / 600 = (3/23) · 78.125 = 234.375/23 ≈ 10.190_217
+    let kreps = kreps_marginal_risk_load(300.0, 200.0, 1_600.0, 7_012.5, 3.0, 0.15).unwrap();
+    assert!(close_rel(kreps.portfolio_std_dev_after, 325.0, 1e-15));
+    assert!(close_rel(kreps.marginal_surplus, 75.0, 1e-14));
+    assert!(close_rel(kreps.risk_load, 9.782_608_695_652_174, 1e-14));
+    assert!(close_rel(kreps.risk_adjusted_price, 4_825.0 / 23.0, 1e-14));
+    assert!(close_rel(
+        kreps.linearized_risk_load,
+        10.190_217_391_304_348,
+        1e-14
+    ));
     assert!(kreps_marginal_risk_load(100.0, 50.0, 100.0, 5_000.0, 3.0, 0.15).is_err());
 
     // Ruhm-Mango-Kreps exact portfolio additivity and permutation invariance under ties
@@ -2031,11 +2050,75 @@ fn test_censored_truncated_severity_mle() {
         other => panic!("unexpected distribution: {other:?}"),
     }
 
-    // 3. Lognormal exact uncensored MLE + censored/truncated Lomax & Gamma convergence + AIC ranking
-    let ln_obs: Vec<SeverityObservation> = [100.0, 200.0, 400.0, 800.0]
-        .into_iter()
-        .map(SeverityObservation::exact)
+    // 3. Censored/truncated Lomax & Gamma MLE on Klugman–Panjer–Willmot Data Set B
+    // (*Loss Models*, the 20-claim Data Set B used in Ch. 13 examples): left-truncated at d = 100, right-censored at u = 2_000.
+    // The two independent optimizers (Nelder–Mead in scale-normalized log coordinates vs the
+    // EVT L-BFGS engine) must agree on the MLE.
+    let kpw_data_b: [f64; 20] = [
+        27.0, 82.0, 115.0, 126.0, 155.0, 161.0, 243.0, 294.0, 340.0, 384.0, 457.0, 680.0, 855.0,
+        877.0, 974.0, 1193.0, 1340.0, 1884.0, 2558.0, 15743.0,
+    ];
+    let (d, u) = (100.0, 2_000.0);
+    let ct_obs: Vec<SeverityObservation> = kpw_data_b
+        .iter()
+        .filter(|&&x| x > d)
+        .map(|&x| {
+            if x >= u {
+                SeverityObservation::censored(u, d)
+            } else {
+                SeverityObservation::truncated(x, d)
+            }
+        })
         .collect();
+    assert_eq!(ct_obs.len(), 18);
+    let opts = SolverOptions::default();
+    let lomax = fit_severity_mle(SeverityFamily::Lomax, &ct_obs, &opts).unwrap();
+    let evt_lomax = fit_evt_mle(EvtFamily::ParetoII, &ct_obs).unwrap();
+    assert_eq!(lomax.n_censored, 2);
+    assert!(lomax.converged && !lomax.at_bound && evt_lomax.converged);
+    let (
+        SeverityDistribution::Lomax { alpha, theta },
+        FittedEvtDistribution::ParetoII {
+            alpha: ea,
+            lambda: el,
+        },
+    ) = (lomax.distribution, evt_lomax.distribution)
+    else {
+        panic!("unexpected Lomax/ParetoII variants");
+    };
+    assert!(close_rel(alpha, ea, 1e-4), "alpha={alpha} evt={ea}");
+    assert!(close_rel(theta, el, 1e-4), "theta={theta} evt={el}");
+    assert!(close_rel(
+        lomax.log_likelihood,
+        evt_lomax.log_likelihood,
+        1e-9
+    ));
+
+    let gamma = fit_severity_mle(SeverityFamily::Gamma, &ct_obs, &opts).unwrap();
+    let evt_gamma = fit_evt_mle(EvtFamily::Gamma, &ct_obs).unwrap();
+    assert!(gamma.converged && !gamma.at_bound && evt_gamma.converged);
+    let (
+        SeverityDistribution::Gamma { shape, scale },
+        FittedEvtDistribution::Gamma {
+            alpha: ga,
+            beta: gb,
+        },
+    ) = (gamma.distribution, evt_gamma.distribution)
+    else {
+        panic!("unexpected Gamma variants");
+    };
+    assert!(close_rel(shape, ga, 1e-4), "shape={shape} evt={ga}");
+    assert!(
+        close_rel(scale, 1.0 / gb, 1e-4),
+        "scale={scale} evt={}",
+        1.0 / gb
+    );
+    assert!(close_rel(
+        gamma.log_likelihood,
+        evt_gamma.log_likelihood,
+        1e-9
+    ));
+
     let ranked = fit_best_severity(
         &[
             SeverityFamily::Lognormal,
@@ -2043,14 +2126,12 @@ fn test_censored_truncated_severity_mle() {
             SeverityFamily::Gamma,
             SeverityFamily::Exponential,
         ],
-        &ln_obs,
-        &SolverOptions::default(),
+        &ct_obs,
+        &opts,
     )
     .unwrap();
-    assert_eq!(ranked.len(), 4);
-    assert!(ranked[0].aic <= ranked[1].aic);
-    assert!(ranked[1].aic <= ranked[2].aic);
-    assert!(ranked[2].aic <= ranked[3].aic);
+    assert!(ranked.iter().all(|f| f.converged));
+    assert!(ranked.windows(2).all(|w| w[0].aic <= w[1].aic));
     // All fitted distributions produce valid positive ILFs
     for fit in &ranked {
         let ilf = fit

@@ -11,7 +11,9 @@
 //!   *PCAS*, Vol. LXXVII, pp. 196–203.
 //! - D. Ruhm, D. Mango & R. Kreps (2005), *"Risk-Adjusted Pricing and Capital Allocation"*.
 
-use super::aggregate::AggregateLossDistribution;
+use super::aggregate::{
+    AGGREGATE_GRID_TOLERANCE, AggregateLossDistribution, TVAR_MAX_LOST_TAIL_FRACTION,
+};
 use crate::error::PricingError;
 use crate::special::{normal_cdf_exact, normal_inv_cdf};
 use serde::{Deserialize, Serialize};
@@ -118,6 +120,9 @@ pub struct DistortionPricingResult {
 
 /// Price a discrete loss distribution `(losses, probs)` using a concave distortion operator
 /// via the exact Choquet integral `sum_k (g(S_{k-1}) - g(S_k)) * x_k`.
+///
+/// `probabilities` must sum to `1` within [`AGGREGATE_GRID_TOLERANCE`] (`InvalidParameter`
+/// otherwise; previously `1e-4`) and are renormalized to unit mass.
 pub fn distortion_price_discrete(
     losses: &[f64],
     probabilities: &[f64],
@@ -140,10 +145,14 @@ pub fn distortion_price_discrete(
         sum_p += p;
         pairs.push((x, p));
     }
-    if (sum_p - 1.0).abs() > 1e-4 {
+    if (sum_p - 1.0).abs() > AGGREGATE_GRID_TOLERANCE {
         return Err(PricingError::InvalidParameter(
-            "probabilities must sum to 1.0",
+            "probabilities must sum to 1.0 within AGGREGATE_GRID_TOLERANCE",
         ));
+    }
+    // Renormalize the accepted round-off so g(1) = 1 is attained exactly.
+    for pair in &mut pairs {
+        pair.1 /= sum_p;
     }
 
     pairs.sort_by(|a, b| a.0.total_cmp(&b.0));
@@ -181,10 +190,30 @@ pub fn distortion_price_discrete(
 }
 
 /// Price an [`AggregateLossDistribution`] using a concave distortion operator.
+///
+/// Uses the same grid-coverage rules as [`AggregateLossDistribution::tvar`]: errors with
+/// [`PricingError::OutOfBounds`] when `|1 - total_mass()| > AGGREGATE_GRID_TOLERANCE`, or when
+/// the distorted weight `g(m)` of the mass `m = 1 - total_mass()` lost beyond the grid exceeds
+/// [`TVAR_MAX_LOST_TAIL_FRACTION`] (for [`DistortionOperator::Tvar`] this is exactly
+/// `m > TVAR_MAX_LOST_TAIL_FRACTION * (1 - alpha)`, the `tvar` rule). Accepted grids are
+/// renormalized to unit mass.
 pub fn distortion_price_aggregate(
     dist: &AggregateLossDistribution,
     distortion: DistortionOperator,
 ) -> Result<DistortionPricingResult, PricingError> {
+    distortion.validate()?;
+    let mass = dist.total_mass();
+    if (1.0 - mass).abs() > AGGREGATE_GRID_TOLERANCE {
+        return Err(PricingError::OutOfBounds(
+            "distortion price undefined: aggregate grid total mass differs from 1 by more than AGGREGATE_GRID_TOLERANCE",
+        ));
+    }
+    let lost_mass = (1.0 - mass).max(0.0);
+    if distortion.evaluate(lost_mass)? > TVAR_MAX_LOST_TAIL_FRACTION {
+        return Err(PricingError::OutOfBounds(
+            "distortion price undefined: distorted weight of the mass lost beyond the grid exceeds TVAR_MAX_LOST_TAIL_FRACTION; extend the grid",
+        ));
+    }
     let losses: Vec<f64> = (0..dist.pmf().len())
         .map(|k| (k as f64) * dist.step())
         .collect();
