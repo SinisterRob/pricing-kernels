@@ -561,6 +561,54 @@ pub fn fit_severity_mle(
     }
 }
 
+/// Directions probed by [`boundary_ray_probe`]: coordinate axes and diagonals. In the
+/// normalized coordinates the known degenerate limits are axis or diagonal rays (Lomax
+/// `alpha -> inf` at fixed `theta / alpha` is `+e_0`; Gamma `shape -> 0` at fixed scale is
+/// `-(e_0 + e_1)`).
+const BOUNDARY_RAY_DIRECTIONS: [[f64; 2]; 8] = [
+    [1.0, 0.0],
+    [-1.0, 0.0],
+    [0.0, 1.0],
+    [0.0, -1.0],
+    [1.0, 1.0],
+    [-1.0, -1.0],
+    [1.0, -1.0],
+    [-1.0, 1.0],
+];
+
+/// Boundary-ray test for degenerate optima: a flat objective can stop Nelder–Mead well inside
+/// the guard while the supremum lies at a limit (Gamma `shape -> 0` on Pareto-tailed truncated
+/// data, Lomax `alpha -> inf` on light-tailed data). Along each of
+/// [`BOUNDARY_RAY_DIRECTIONS`], evaluate the objective where the ray from the optimum meets the
+/// guard face `max_j |p_j| = LOG_PARAM_BOUND`; if that is no worse than the optimum within
+/// `tol (1 + |f|)`, the best such face point is returned so the fit is reported `at_bound`.
+fn boundary_ray_probe<F>(best: [f64; 2], neg_ll: f64, tol: f64, obj: F) -> ([f64; 2], f64)
+where
+    F: Fn([f64; 2]) -> f64,
+{
+    let accept = neg_ll + tol * (1.0 + neg_ll.abs());
+    let mut face_hit: Option<([f64; 2], f64)> = None;
+    for d in BOUNDARY_RAY_DIRECTIONS {
+        // Largest t >= 0 with |best_j + t d_j| <= LOG_PARAM_BOUND for all j.
+        let t = (0..2)
+            .filter(|&j| d[j] != 0.0)
+            .map(|j| (LOG_PARAM_BOUND * d[j].signum() - best[j]) / d[j])
+            .fold(f64::INFINITY, f64::min);
+        if !(t > 0.0) || !t.is_finite() {
+            continue;
+        }
+        let face = [
+            (best[0] + t * d[0]).clamp(-LOG_PARAM_BOUND, LOG_PARAM_BOUND),
+            (best[1] + t * d[1]).clamp(-LOG_PARAM_BOUND, LOG_PARAM_BOUND),
+        ];
+        let f_face = obj(face);
+        if f_face <= accept && face_hit.is_none_or(|(_, f)| f_face < f) {
+            face_hit = Some((face, f_face));
+        }
+    }
+    face_hit.unwrap_or((best, neg_ll))
+}
+
 /// Shared inputs of the iterative two-parameter fits.
 struct FitContext<'a> {
     observations: &'a [SeverityObservation],
@@ -612,6 +660,7 @@ impl FitContext<'_> {
         } else {
             (first, f_first, it_first, false)
         };
+        let (best, neg_ll) = boundary_ray_probe(best, neg_ll, tol, obj);
         let at_bound = best
             .iter()
             .any(|v| v.abs() > LOG_PARAM_BOUND - LOG_PARAM_BOUND_MARGIN);

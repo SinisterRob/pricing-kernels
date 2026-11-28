@@ -23,8 +23,9 @@
 //! * Burr XII is optimized in `(ln alpha, ln gamma, ln theta)` with `lambda = theta^gamma`
 //!   (scale-equivariant) and started from a log-logistic fit at the sample median.
 //! * Any fit whose optimizer iterate lies within `1` unit of the internal `|phi| <= 30`
-//!   parameter box, or whose standard errors are not finite, is reported with
-//!   `converged = false`.
+//!   parameter box, whose standard errors are not finite, or whose likelihood is no worse at
+//!   the box face along an axis / pairwise-diagonal ray (a degenerate limit such as Gamma
+//!   `alpha -> 0`), is reported with `converged = false`.
 
 use crate::error::{PricingError, SolverOptions};
 use crate::layers::fitting::SeverityObservation;
@@ -1517,6 +1518,48 @@ pub fn goodness_of_fit(
     }
 }
 
+/// Degenerate-limit test: `true` when, along some coordinate axis or pairwise diagonal ray from
+/// `phi`, the objective at the [`PHI_BOUND`] face is no worse than `f_best + tol (1 + |f_best|)`,
+/// i.e. the likelihood supremum is approached at a parameter limit (e.g. Gamma `alpha -> 0` on
+/// Pareto-tailed left-truncated data) and the optimizer merely stopped on a flat region.
+fn supremum_on_box_face<F: Fn(&[f64]) -> f64>(f: &F, phi: &[f64], f_best: f64, tol: f64) -> bool {
+    let accept = f_best + tol * (1.0 + f_best.abs());
+    let p = phi.len();
+    let mut dirs: Vec<Vec<f64>> = Vec::with_capacity(2 * p * p);
+    for i in 0..p {
+        for sign in [1.0, -1.0] {
+            let mut d = vec![0.0; p];
+            d[i] = sign;
+            dirs.push(d);
+        }
+        for j in (i + 1)..p {
+            for (si, sj) in [(1.0, 1.0), (-1.0, -1.0), (1.0, -1.0), (-1.0, 1.0)] {
+                let mut d = vec![0.0; p];
+                d[i] = si;
+                d[j] = sj;
+                dirs.push(d);
+            }
+        }
+    }
+    let mut face = vec![0.0; p];
+    for d in &dirs {
+        let t = (0..p)
+            .filter(|&j| d[j] != 0.0)
+            .map(|j| (PHI_BOUND * d[j].signum() - phi[j]) / d[j])
+            .fold(f64::INFINITY, f64::min);
+        if !(t > 0.0) || !t.is_finite() {
+            continue;
+        }
+        for j in 0..p {
+            face[j] = (phi[j] + t * d[j]).clamp(-PHI_BOUND, PHI_BOUND);
+        }
+        if f(&face) <= accept {
+            return true;
+        }
+    }
+    false
+}
+
 // ===========================================================================
 // Main Entry Point: fit_evt_mle
 // ===========================================================================
@@ -1700,7 +1743,8 @@ pub fn fit_evt_mle_with_options(
         _ => false,
     };
     let se_ok = standard_errors.iter().all(|v| v.is_finite());
-    let converged = converged && !on_box && !on_xi_boundary && se_ok;
+    let degenerate = supremum_on_box_face(&neg_ll, &best_phi, best_nll, tol);
+    let converged = converged && !on_box && !on_xi_boundary && se_ok && !degenerate;
 
     Ok(EvtFitResult {
         distribution,

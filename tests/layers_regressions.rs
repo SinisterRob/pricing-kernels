@@ -1235,7 +1235,8 @@ fn severity_mle_is_scale_equivariant() {
     let base: Vec<SeverityObservation> = (0..400)
         .map(|_| {
             // Lognormal(8, 1.2) excess over a 500 deductible, censored at 20_000 (interior MLE
-            // for all three families; a Pareto-tailed sample drives Gamma to shape -> 0).
+            // for all three families; a Pareto-tailed sample drives Gamma to the shape -> 0
+            // limit, covered by `gamma_shape_to_zero_limit_is_flagged_and_not_selected`).
             let x = 500.0 + (8.0 + 1.2 * rng.normal()).exp();
             if x >= 20_000.0 {
                 SeverityObservation::censored(20_000.0, 500.0)
@@ -1343,4 +1344,68 @@ fn reinstatement_slice_bounds_scale_with_layer_limit() {
             .is_err()
         );
     }
+}
+
+fn pareto_tailed_truncated_sample() -> Vec<SeverityObservation> {
+    // Lomax(2.5, 1000) shifted above a 100 deductible, censored at 20_000.
+    let mut rng = SplitMix64(SEED);
+    (0..400)
+        .map(|_| {
+            let x = 1000.0 * (rng.uniform().powf(-1.0 / 2.5) - 1.0) + 100.0;
+            if x >= 20_000.0 {
+                SeverityObservation::censored(20_000.0, 100.0)
+            } else {
+                SeverityObservation::truncated(x, 100.0)
+            }
+        })
+        .collect()
+}
+
+#[test]
+fn gamma_shape_to_zero_limit_is_flagged_and_not_selected() {
+    // Left-truncated Pareto-tailed data: the Gamma likelihood supremum is the shape -> 0 limit.
+    // Previously `ln Q(a, x)` = ln(1 - P) cancelled for small `a` and the EVT engine returned
+    // ll = +262_570 for this sample.
+    let obs = pareto_tailed_truncated_sample();
+    let opts = SolverOptions::default();
+    let gamma = fit_severity_mle(SeverityFamily::Gamma, &obs, &opts).unwrap();
+    assert!(gamma.at_bound && !gamma.converged, "{gamma:?}");
+    let (k, _) = gamma_params(gamma.distribution.clone());
+    assert!(k < 1e-6, "shape={k}");
+
+    let evt_gamma = fit_evt_mle(EvtFamily::Gamma, &obs).unwrap();
+    assert!(!evt_gamma.converged);
+    let evt_lomax = fit_evt_mle(EvtFamily::ParetoII, &obs).unwrap();
+    assert!(evt_lomax.converged);
+    // Both engines report the genuine limit likelihood, which is finite, matches an
+    // independent re-evaluation, and is below the Pareto II optimum.
+    assert!(gamma.log_likelihood.is_finite() && evt_gamma.log_likelihood.is_finite());
+    assert!(rel(gamma.log_likelihood, evt_gamma.log_likelihood) < 1e-6);
+    let reeval = total_ll(&evt_gamma.distribution, &obs);
+    assert!(rel(reeval, evt_gamma.log_likelihood) < 1e-12);
+    assert!(evt_gamma.log_likelihood < evt_lomax.log_likelihood);
+    assert!(evt_gamma.diagnostics.aic > evt_lomax.diagnostics.aic);
+
+    let ranked =
+        fit_best_severity(&[SeverityFamily::Gamma, SeverityFamily::Lomax], &obs, &opts).unwrap();
+    assert_eq!(ranked.len(), 1);
+    assert!(matches!(
+        ranked[0].distribution,
+        SeverityDistribution::Lomax { .. }
+    ));
+
+    // The flagged limit is still scale-equivariant (ll shifts by -n_uncensored ln c).
+    let c = 1e6_f64;
+    let scaled: Vec<SeverityObservation> = obs
+        .iter()
+        .map(|o| SeverityObservation {
+            loss: o.loss * c,
+            deductible: o.deductible * c,
+            ..*o
+        })
+        .collect();
+    let g2 = fit_severity_mle(SeverityFamily::Gamma, &scaled, &opts).unwrap();
+    let n_unc = obs.iter().filter(|o| !o.is_censored).count() as f64;
+    assert!(g2.at_bound, "{g2:?} vs {gamma:?}");
+    assert!(rel(g2.log_likelihood, gamma.log_likelihood - n_unc * c.ln()) < 1e-9);
 }

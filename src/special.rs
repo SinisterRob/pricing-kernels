@@ -37,7 +37,9 @@ pub(crate) fn gamma_q(a: f64, x: f64) -> f64 {
     if x == 0.0 {
         return 1.0;
     }
-    if x >= a + 1.0 {
+    if a < 1.0 && x <= SMALL_SHAPE_MAX_X {
+        gamma_q_small_shape(a, x).clamp(0.0, 1.0)
+    } else if x >= a + 1.0 {
         gamma_q_cf_log(a, x).exp().clamp(0.0, 1.0)
     } else {
         (1.0 - gamma_p(a, x)).clamp(0.0, 1.0)
@@ -53,11 +55,94 @@ pub(crate) fn log_gamma_q(a: f64, x: f64) -> f64 {
     if x == 0.0 {
         return 0.0;
     }
-    if x >= a + 1.0 {
+    if a < 1.0 && x <= SMALL_SHAPE_MAX_X {
+        gamma_q_small_shape(a, x).clamp(f64::MIN_POSITIVE, 1.0).ln()
+    } else if x >= a + 1.0 {
         gamma_q_cf_log(a, x).min(0.0)
     } else {
         (1.0 - gamma_p(a, x)).clamp(1e-300, 1.0).ln()
     }
+}
+
+/// Upper end of the `x` range handled by [`gamma_q_small_shape`] for `a < 1`
+/// (DiDonato & Morris 1986 use the analogous series for `x <= 1.5`).
+const SMALL_SHAPE_MAX_X: f64 = 1.5;
+/// Largest `a` for which `ln Γ(1 + a)` uses the zeta Taylor series (`0.2^k` truncation
+/// `< 1e-17` after [`LN_GAMMA_1P_TERMS`] terms).
+const LN_GAMMA_1P_SERIES_MAX: f64 = 0.2;
+/// Number of Taylor terms in [`ln_gamma_1p`].
+const LN_GAMMA_1P_TERMS: usize = 26;
+/// Relative truncation of the alternating series in [`gamma_q_small_shape`].
+const SMALL_SHAPE_SERIES_EPS: f64 = 1e-17;
+/// Hard cap on series terms (`x <= 1.5` converges in < 30 terms).
+const SMALL_SHAPE_SERIES_MAX_TERMS: usize = 200;
+
+/// Riemann zeta `ζ(k)` for integer `k >= 2` (closed forms / tabulated odd values for `k < 10`,
+/// direct summation, which converges geometrically fast, for `k >= 10`).
+fn zeta_int(k: usize) -> f64 {
+    use std::f64::consts::PI;
+    match k {
+        2 => PI * PI / 6.0,
+        3 => 1.202_056_903_159_594_3,
+        4 => PI.powi(4) / 90.0,
+        5 => 1.036_927_755_143_37,
+        6 => PI.powi(6) / 945.0,
+        7 => 1.008_349_277_381_922_8,
+        8 => PI.powi(8) / 9450.0,
+        9 => 1.002_008_392_826_082_2,
+        _ => {
+            #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+            let e = k as i32;
+            let mut sum = 0.0;
+            // n^-k < 1e-18 for n >= 64 when k >= 10; sum small terms first.
+            for n in (2..=64_u32).rev() {
+                sum += f64::from(n).powi(-e);
+            }
+            1.0 + sum
+        }
+    }
+}
+
+/// `ln Γ(1 + a)` with full *relative* accuracy as `a -> 0`, for `0 <= a < 1`.
+///
+/// For `a <= LN_GAMMA_1P_SERIES_MAX`: `ln Γ(1 + a) = -γ a + sum_{k>=2} (-a)^k ζ(k) / k`
+/// (Abramowitz & Stegun 6.1.33). Otherwise the Lanczos value, whose magnitude there is
+/// `>= 0.08`, has no damaging cancellation.
+fn ln_gamma_1p(a: f64) -> f64 {
+    if a > LN_GAMMA_1P_SERIES_MAX {
+        return ln_gamma(1.0 + a);
+    }
+    let mut acc = 0.0;
+    for k in (2..=LN_GAMMA_1P_TERMS).rev() {
+        let sign = if k % 2 == 0 { 1.0 } else { -1.0 };
+        #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+        let term = sign * a.powi(k as i32) * zeta_int(k) / k as f64;
+        acc += term;
+    }
+    -std::f64::consts::EULER_GAMMA * a + acc
+}
+
+/// `Q(a, x)` for `0 < a < 1`, `0 < x <= SMALL_SHAPE_MAX_X` without the `1 - P` cancellation
+/// (`Q ≈ a E1(x)` as `a -> 0`; DiDonato & Morris 1986, *ACM TOMS* 12(4), small-`a` branch).
+///
+/// From `P = x^a / Γ(1 + a) · (1 - J)` with `J = -a sum_{n>=1} (-x)^n / (n! (a + n))`:
+/// `Q = -expm1(L) + e^L J`, `L = a ln x - ln Γ(1 + a)`, with `ln Γ(1 + a)` from
+/// [`ln_gamma_1p`] so `L = O(a)` keeps full relative accuracy.
+fn gamma_q_small_shape(a: f64, x: f64) -> f64 {
+    let l = a * x.ln() - ln_gamma_1p(a);
+    let mut sum = 0.0;
+    let mut pow = 1.0; // (-x)^n / n!
+    for n in 1..=SMALL_SHAPE_SERIES_MAX_TERMS {
+        let nf = n as f64;
+        pow *= -x / nf;
+        let term = pow / (a + nf);
+        sum += term;
+        if term.abs() <= SMALL_SHAPE_SERIES_EPS * sum.abs() {
+            break;
+        }
+    }
+    let j = -a * sum;
+    -l.exp_m1() + l.exp() * j
 }
 
 /// Digamma function `ψ(x) = d/dx ln Γ(x)` for `x > 0` via recurrence shift and
@@ -227,7 +312,8 @@ pub(crate) fn normal_inv_cdf(p: f64) -> f64 {
     x
 }
 
-/// High-accuracy `ln Γ(z)` for `z > 0` via the 9-term Lanczos approximation (`g = 7`).
+/// High-accuracy `ln Γ(z)` for `z > 0` via the 9-term Lanczos approximation (`g = 7`) for
+/// `z >= 1`, and `ln Γ(1 + z) - ln z` (series near 0) for `z < 1`.
 pub(crate) fn ln_gamma(z: f64) -> f64 {
     const COEFFS: [f64; 9] = [
         0.999_999_999_999_809_9,
@@ -242,6 +328,11 @@ pub(crate) fn ln_gamma(z: f64) -> f64 {
     ];
     if !z.is_finite() || z <= 0.0 {
         return f64::NAN;
+    }
+    if z < 1.0 {
+        // Lanczos loses relative accuracy as z -> 0 (5e-9 in P(a, x) at a = 1e-8);
+        // ln Γ(z) = ln Γ(1 + z) - ln z with the small-argument series.
+        return ln_gamma_1p(z) - z.ln();
     }
     let z = z - 1.0;
     let mut x = COEFFS[0];
@@ -608,6 +699,73 @@ mod tests {
             }
         }
         (upper, sum + comp)
+    }
+
+    /// Independent `Γ(a, x) = ∫_x^∞ t^(a-1) e^(-t) dt` by Romberg quadrature in `t = x e^s`
+    /// (`dt = t ds`, smooth integrand `exp(a ln t - t)`), Neumaier-summed over unit panels.
+    fn ref_upper_gamma_integral(a: f64, x: f64) -> f64 {
+        const PANEL: f64 = 0.25;
+        const DEPTH: usize = 9;
+        let f = |s: f64| {
+            let t = x * s.exp();
+            (a * t.ln() - t).exp() * 1.0
+        };
+        let s_max = ((x + 60.0) / x).ln();
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let n_panels = (s_max / PANEL).ceil() as usize;
+        let (mut sum, mut comp) = (0.0_f64, 0.0_f64);
+        for p in 0..n_panels {
+            let lo = p as f64 * PANEL;
+            let hi = (lo + PANEL).min(s_max);
+            let mut r = [[0.0_f64; DEPTH]; DEPTH];
+            let mut h = hi - lo;
+            r[0][0] = 0.5 * h * (f(lo) + f(hi));
+            for i in 1..DEPTH {
+                h *= 0.5;
+                let n_new = 1_usize << (i - 1);
+                let mid: f64 = (0..n_new).map(|k| f(lo + (2 * k + 1) as f64 * h)).sum();
+                r[i][0] = 0.5 * r[i - 1][0] + h * mid;
+                let mut pow4 = 1.0;
+                for j in 1..=i {
+                    pow4 *= 4.0;
+                    r[i][j] = r[i][j - 1] + (r[i][j - 1] - r[i - 1][j - 1]) / (pow4 - 1.0);
+                }
+            }
+            let v = r[DEPTH - 1][DEPTH - 1];
+            let t = sum + v;
+            comp += if sum.abs() >= v.abs() {
+                (sum - t) + v
+            } else {
+                (v - t) + sum
+            };
+            sum = t;
+        }
+        sum + comp
+    }
+
+    #[test]
+    fn small_shape_upper_gamma_matches_independent_quadrature() {
+        for &a in &[1e-8_f64, 1e-4, 0.01, 0.1, 0.5] {
+            // Q = a Γ(a, x) / Γ(1 + a); Γ(1 + a) ∈ [0.88, 1] carries no cancellation.
+            let gamma_1p = ln_gamma(1.0 + a).exp();
+            for &x in &[1e-6_f64, 0.01, 0.5, 1.0, 2.0] {
+                let exact = a * ref_upper_gamma_integral(a, x) / gamma_1p;
+                let got = gamma_q(a, x);
+                let rel = (got - exact).abs() / exact;
+                assert!(
+                    rel <= 1e-12,
+                    "a={a} x={x}: Q={got:e} ref={exact:e} rel={rel:e}"
+                );
+                let lq = log_gamma_q(a, x);
+                let lrel = (lq - exact.ln()).abs() / exact.ln().abs().max(1.0);
+                assert!(lrel <= 1e-12, "a={a} x={x}: lnQ={lq} ref={} ", exact.ln());
+                // Complement stays consistent.
+                let pq = gamma_p(a, x) + got - 1.0;
+                assert!(pq.abs() <= 1e-13, "a={a} x={x}: P+Q-1={pq:e}");
+            }
+        }
+        // a = 1/2: Q(1/2, x) = erfc(sqrt x) (tabulated erfc(1) = 0.157_299_207_050_285_13).
+        assert!((gamma_q(0.5, 1.0) - 0.157_299_207_050_285_13).abs() <= 1e-15);
     }
 
     #[test]
