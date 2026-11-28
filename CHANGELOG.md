@@ -32,6 +32,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Quadrature (`layers`)**: Gauss–Kronrod is globally adaptive with scale-aware initial subdivision (geometric grading to both endpoints and around natural scale points); a first panel with both rules ≈ 0 is no longer accepted. **Breaking:** `gauss_kronrod_integrate*` return `Result` (no silent NaN/0) and `gauss_kronrod_integrate_semi_infinite` takes a `scale` argument.
 - **EVT LEVs**: `FittedEvtDistribution::limited_expected_value` uses closed forms for Weibull (incomplete gamma), Burr XII with αγ > 1 (incomplete beta), Inverse Gaussian (normal CDF), shifted GPD and spliced body + GPD (integrating only to the support end u + β/|ξ| when ξ < 0). Previously Weibull/Burr/IG LEV(1e7–1e9) returned ≈ 0 and GPD ξ < 0 was 25% low.
 - **Power-law ALAE**: Pro-Rata, In-Addition and Included (cv = 0) use closed-form truncated power moments per family (was a unit-scale semi-infinite map: In-Addition −20.8% at Lognormal(15, 1), E[A] = 0 for SPP(1.5, 1e5)); In-Addition errors when E[X^γ] is infinite (Lomax/SPP γ ≥ α, GPD ξγ ≥ 1); exact densities replace finite differences in the fallback quadrature.
+- **Hurdle Poisson exposure**: zero part is now a complementary log-log GLM with the `ln E` offset, $P(Y>0)=1-e^{-E e^{x^T\gamma}}$ (previously logit without offset: $P(Y>0)$ exposure-independent, fitted means 4.1× off at low exposure).
+- **GLMM**: `fit_random_intercept_glmm` solves the joint conditional mode $(\hat\beta, \hat u)$ by penalized Newton (Schur complement; `glmer(nAGQ = 0)`) instead of alternating fixed/random updates that stopped ~0.15 nats from the optimum (τ²=9: b̂₀ = 2.51 vs ≈ −1.5); Σû = 0 holds exactly; scale-free Newton-decrement / relative-step stops; `ln τ²` search expands up to τ² = 1e4 instead of silently capping at e² ≈ 7.39.
+- **IRLS convergence** (`fit_glm_irls*`): R `glm.fit` relative-deviance stop $|D-D_{old}|/(|D|+0.1)<$ `tol` (|Δβ| ≤ `tol` kept as secondary); zero-claim levels and separated Binomial fits now return `Ok` (were `NonConvergence` even at 2000 iterations).
+- **`select_tweedie_power`**: a failing candidate no longer aborts the grid; failures are skipped and recorded, error only if none succeed.
+- **`double_lift_chart`**: never drops empty buckets silently; each bucket receives ≥ 1 observation.
 
 ### Changed (breaking)
 - YLT `oep_pml`/`aep_pml` default to the rank convention $T = N/r$ and error when $T > N$; `EmpiricalPmlConvention::LowerQuantile` restores the old behaviour.
@@ -48,6 +53,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `ClassicalCredibility::credibility` and `blend` return `Result<f64, PricingError>` (FFI `pk_classical_credibility` still returns NaN on error).
 - New fields: `TweediePowerSelection.best_dispersion`, `InformationCriteria.{log_likelihood, ml_dispersion}`, `converged` on `ZeroModifiedPoissonResult` and `RandomInterceptGlmmResult`; new variant `RegularizedGlmFamily::ZeroTruncatedPoisson`.
 - `glm_information_criteria` rejects `QuasiPoisson` (no likelihood); AIC/BIC values change.
+- New fields `GlmResult.separation_suspected`, `TweediePowerSelection.failed_powers`, `RandomInterceptGlmmResult.{tau_squared_at_lower_bound, tau_squared_at_upper_bound}`; new variant `RegularizedGlmFamily::BinomialCloglog`. `ZeroModifiedPoissonResult.zero_part` from `fit_hurdle_poisson` is a cloglog fit (predict with `BinomialCloglog` and `ln E` offsets); Hurdle fitted values change whenever offsets are supplied.
+- `fit_random_intercept_glmm`: `max_iter` now bounds Newton iterations per joint-mode solve; `iterations` counts profiled-likelihood (τ²) evaluations; `laplace_log_likelihood` includes $-\ln y!$; GLMM estimates change; rank-deficient `[1, x]` returns `SingularMatrix`.
+- `GlmOptions::tol` also drives the relative-deviance stop, so IRLS may stop earlier (results agree to within the tolerance).
+- `double_lift_chart` errors when `n_buckets > n` (previously returned fewer buckets).
 - `bspline_basis` errors outside $[t_d, t_{M-d}]$ and requires `knots.len() >= 2·degree + 2`; `batch_score_into` rejects NaN/negative inputs and min > max.
 
 ### Added

@@ -19,6 +19,16 @@ use serde::{Deserialize, Serialize};
 pub const MAX_STEP_HALVINGS: usize = 30;
 /// Relative tolerance on a (penalized) deviance increase that triggers step-halving.
 const DEVIANCE_INCREASE_RTOL: f64 = 1e-10;
+/// Additive constant in the `glm.fit` relative-deviance stop `|D - D_old| / (|D| + 0.1) < tol`.
+const DEVIANCE_RTOL_OFFSET: f64 = 0.1;
+/// If IRLS stops on the deviance criterion while some coefficient still moves by more than
+/// this per iteration, the estimates are drifting to infinity (zero-claim level / separation).
+const SEPARATION_STEP_THRESHOLD: f64 = 1e-2;
+/// Binomial fitted means within this distance of 0 or 1 are numerically on the boundary
+/// (`10 ×` the inverse-link clamp, as in R `glm.fit`'s "fitted probabilities 0 or 1").
+const BINOMIAL_BOUNDARY_EPS: f64 = 1e-11;
+/// Log-link fitted means below this are numerically zero (`10 ×` the inverse-link floor).
+const LOG_LINK_BOUNDARY_MU: f64 = 1e-14;
 
 /// GLM error family for commercial actuarial pricing kernels.
 ///
@@ -190,7 +200,9 @@ impl GlmFamily {
 pub struct GlmOptions {
     /// Maximum IRLS iterations (default `100`).
     pub max_iter: usize,
-    /// Absolute convergence threshold on `max_j |beta_new[j] - beta[j]|` (default `1e-9`).
+    /// Convergence tolerance (default `1e-9`). IRLS stops when the relative change in
+    /// (penalized) deviance `|D - D_old| / (|D| + 0.1) < tol` (R `glm.fit`) or, secondarily,
+    /// when `max_j |beta_new[j] - beta[j]| <= tol`.
     pub tol: f64,
     /// Optional L2 (Ridge) penalty `lambda >= 0` added to `(X^T W X)` diagonal for
     /// credibility-shrunk commercial relativities (default `0.0`).
@@ -217,7 +229,7 @@ impl GlmOptions {
         self
     }
 
-    /// Set absolute convergence tolerance on coefficients.
+    /// Set the convergence tolerance (relative deviance change / absolute coefficient change).
     pub const fn with_tol(mut self, tol: f64) -> Self {
         self.tol = tol;
         self
@@ -273,6 +285,14 @@ pub struct GlmResult {
     pub df_residual: usize,
     /// Number of IRLS iterations until convergence.
     pub iterations: usize,
+    /// Potentially infinite estimates: the fit stopped on the deviance criterion while a
+    /// coefficient was still drifting (`> 1e-2` per iteration), or some fitted mean is
+    /// numerically on the boundary (`μ ≈ 0`, or `μ ≈ 1` for Binomial). Typical causes are a
+    /// rating level with zero claims (log link) or complete / quasi-complete separation
+    /// (Binomial); the affected relativities are effectively `0` (or `∞`) and their standard
+    /// errors are meaningless (Hauck–Donner). Mirrors R `glm.fit`'s boundary warnings.
+    #[serde(default)]
+    pub separation_suspected: bool,
 }
 
 impl GlmResult {
@@ -859,6 +879,7 @@ fn fit_glm_irls_impl(
     let mut iter = 0;
     let mut converged = false;
     let mut dev_old = f64::INFINITY;
+    let mut last_step = 0.0_f64;
 
     let update_linear_predictor = |beta: &[f64], eta: &mut [f64], mu: &mut [f64]| {
         for i in 0..n_samples {
@@ -941,6 +962,8 @@ fn fit_glm_irls_impl(
                 options.penalize_intercept,
             );
         }
+        // R glm.fit: relative deviance change (primary); coefficient change (secondary).
+        let dev_rel_change = (dev_new - dev_old).abs() / (dev_new.abs() + DEVIANCE_RTOL_OFFSET);
         dev_old = dev_new;
         if let Some(trace) = deviance_trace.as_deref_mut() {
             trace.push(dev_new);
@@ -955,8 +978,9 @@ fn fit_glm_irls_impl(
             beta[j] = beta_new[j];
         }
 
-        if iter > 1 && max_change <= options.tol {
+        if iter > 1 && (dev_rel_change < options.tol || max_change <= options.tol) {
             converged = true;
+            last_step = max_change;
             break;
         }
     }
@@ -984,6 +1008,17 @@ fn fit_glm_irls_impl(
         let diff = yi - mui;
         pearson_chi2 += wi * (diff * diff) / family.variance_fn(mui);
     }
+
+    let mu_on_boundary = (0..n_samples).any(|i| {
+        weights[i] > 0.0
+            && match family {
+                GlmFamily::Binomial => {
+                    mu[i] <= BINOMIAL_BOUNDARY_EPS || mu[i] >= 1.0 - BINOMIAL_BOUNDARY_EPS
+                }
+                _ => mu[i] <= LOG_LINK_BOUNDARY_MU,
+            }
+    });
+    let separation_suspected = mu_on_boundary || last_step > SEPARATION_STEP_THRESHOLD;
 
     let df_residual = active_samples.saturating_sub(n_features);
     let dispersion = if family.has_free_dispersion() && df_residual > 0 {
@@ -1015,6 +1050,7 @@ fn fit_glm_irls_impl(
         deviance,
         df_residual,
         iterations: iter,
+        separation_suspected,
     })
 }
 
@@ -1074,8 +1110,12 @@ pub struct TweediePowerSelection {
     pub best_dispersion: f64,
     /// Fitted GLM result at `best_power`.
     pub best_fit: GlmResult,
-    /// Evaluated `(power, profile_log_likelihood)` pairs across all candidate powers.
+    /// Evaluated `(power, profile_log_likelihood)` pairs for every candidate that fitted.
     pub profile: Vec<(f64, f64)>,
+    /// Candidates that were skipped, with the error message (invalid power, IRLS or
+    /// dispersion-profile failure).
+    #[serde(default)]
+    pub failed_powers: Vec<(f64, String)>,
 }
 
 /// Select the Tweedie variance power `p in (1, 2)` over `candidate_powers` by maximizing the
@@ -1086,6 +1126,10 @@ pub struct TweediePowerSelection {
 /// (golden-section on `ln φ`, started at the Pearson estimate). This follows the
 /// `tweedie.profile` procedure of Dunn & Smyth; the saddlepoint approximation is not used
 /// because it is biased for small `y` and can favour boundary powers.
+///
+/// A candidate whose fit or profile fails (including powers outside `(1, 2)`) is skipped and
+/// recorded in [`TweediePowerSelection::failed_powers`]; the function errors only when no
+/// candidate succeeds.
 #[allow(clippy::too_many_arguments)]
 pub fn select_tweedie_power(
     candidate_powers: &[f64],
@@ -1104,41 +1148,49 @@ pub fn select_tweedie_power(
     }
 
     let mut profile = Vec::with_capacity(candidate_powers.len());
+    let mut failed_powers = Vec::new();
     let mut best: Option<(f64, f64, f64, GlmResult)> = None;
 
     for &p in candidate_powers {
         let family = GlmFamily::Tweedie { power: p };
-        let fit = fit_glm_irls_with_options(
-            family,
-            design_matrix,
-            n_samples,
-            n_features,
-            y,
-            weights,
-            offsets,
-            options,
-        )?;
-        let mu = predict_glm(
-            family,
-            design_matrix,
-            n_samples,
-            n_features,
-            &fit.coefficients,
-            offsets,
-        )?;
-        let phi_start = if fit.dispersion.is_finite() && fit.dispersion > 0.0 {
-            fit.dispersion
-        } else {
-            1.0
-        };
-        let mut series = TweedieSeries::new(p)?;
-        let (phi_hat, ll) = maximize_over_dispersion(phi_start, |phi| {
-            tweedie_log_likelihood(&mut series, y, &mu, weights, phi)
-        })?;
-
-        profile.push((p, ll));
-        if best.as_ref().is_none_or(|b| ll > b.1) {
-            best = Some((p, ll, phi_hat, fit));
+        let candidate = (|| -> Result<(f64, f64, GlmResult), PricingError> {
+            let fit = fit_glm_irls_with_options(
+                family,
+                design_matrix,
+                n_samples,
+                n_features,
+                y,
+                weights,
+                offsets,
+                options,
+            )?;
+            let mu = predict_glm(
+                family,
+                design_matrix,
+                n_samples,
+                n_features,
+                &fit.coefficients,
+                offsets,
+            )?;
+            let phi_start = if fit.dispersion.is_finite() && fit.dispersion > 0.0 {
+                fit.dispersion
+            } else {
+                1.0
+            };
+            let mut series = TweedieSeries::new(p)?;
+            let (phi_hat, ll) = maximize_over_dispersion(phi_start, |phi| {
+                tweedie_log_likelihood(&mut series, y, &mu, weights, phi)
+            })?;
+            Ok((phi_hat, ll, fit))
+        })();
+        match candidate {
+            Ok((phi_hat, ll, fit)) => {
+                profile.push((p, ll));
+                if best.as_ref().is_none_or(|b| ll > b.1) {
+                    best = Some((p, ll, phi_hat, fit));
+                }
+            }
+            Err(e) => failed_powers.push((p, e.to_string())),
         }
     }
 
@@ -1154,6 +1206,7 @@ pub fn select_tweedie_power(
         best_dispersion,
         best_fit,
         profile,
+        failed_powers,
     })
 }
 
