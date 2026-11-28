@@ -1,6 +1,7 @@
 //! Lee (1988) Table M aggregate insurance charge and savings engine.
 
 use crate::error::PricingError;
+use crate::underwriting_risk::AggregateLossDistribution;
 use serde::{Deserialize, Serialize};
 
 /// Discrete Table M aggregate distribution row.
@@ -111,6 +112,57 @@ impl TableMEngine {
         }
 
         Ok(Self { rows })
+    }
+
+    /// Build Table M directly from a discrete [`AggregateLossDistribution`] produced by
+    /// Panjer recursion, FFT convolution, or Cat ELT aggregation.
+    ///
+    /// Normalizes each grid point `x_k = k * agg.step` into entry ratio `r_k = x_k / agg.mean`
+    /// and retains strictly positive probability masses.
+    pub fn from_aggregate(agg: &AggregateLossDistribution) -> Result<Self, PricingError> {
+        if !agg.mean.is_finite() || !(agg.mean > 0.0) {
+            return Err(PricingError::NonPositiveValue(
+                "aggregate distribution mean must be finite and positive to normalize entry ratios",
+            ));
+        }
+        let mut xs = Vec::with_capacity(agg.pmf.len());
+        let mut probs = Vec::with_capacity(agg.pmf.len());
+        let mut total_p = 0.0;
+        for (k, &p) in agg.pmf.iter().enumerate() {
+            if !p.is_finite() || p < 0.0 {
+                return Err(PricingError::InvalidParameter(
+                    "aggregate pmf probabilities must be finite and non-negative",
+                ));
+            }
+            if p > 0.0 {
+                xs.push((k as f64) * agg.step);
+                probs.push(p);
+                total_p += p;
+            }
+        }
+        if !(total_p > 0.0) {
+            return Err(PricingError::EmptyInput(
+                "aggregate distribution has no positive probability mass",
+            ));
+        }
+        if (total_p - 1.0).abs() > 1e-3 {
+            return Err(PricingError::InvalidParameter(
+                "aggregate distribution tail truncation exceeds 1e-3; increase grid size",
+            ));
+        }
+        // Renormalize small numerical tail mass first, then compute exact normalized mean so E[r] == 1.0.
+        let mut norm_mean = 0.0;
+        for (x, p) in xs.iter().zip(probs.iter_mut()) {
+            *p /= total_p;
+            norm_mean += *x * *p;
+        }
+        if !norm_mean.is_finite() || !(norm_mean > 0.0) {
+            return Err(PricingError::NonPositiveValue(
+                "normalized aggregate distribution mean must be positive",
+            ));
+        }
+        let ratios: Vec<f64> = xs.into_iter().map(|x| x / norm_mean).collect();
+        Self::from_discrete_pdf(&ratios, &probs)
     }
 
     /// Evaluates insurance charge `phi(r)` at any entry ratio `r >= 0` using exact piecewise-linear

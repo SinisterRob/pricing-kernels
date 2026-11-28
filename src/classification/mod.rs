@@ -14,8 +14,8 @@ pub use diagnostics::{
     glm_information_criteria, variance_inflation_factors, weighted_gini_index,
 };
 pub use irls_glm::{
-    DesignMatrix, GlmFamily, GlmFit, GlmOptions, GlmResult, TweediePowerSelection, fit_glm_irls,
-    fit_glm_irls_with_options, predict_glm, select_tweedie_power,
+    DesignMatrix, GlmFamily, GlmFit, GlmOptions, GlmResult, RelativityRow, TweediePowerSelection,
+    fit_glm_irls, fit_glm_irls_with_options, predict_glm, select_tweedie_power,
 };
 pub use minimum_bias::{
     MinimumBiasResult, RatingTable, bailey_simon_chi_squared, bailey_simon_multiplicative,

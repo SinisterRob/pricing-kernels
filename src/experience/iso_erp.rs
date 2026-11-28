@@ -17,6 +17,13 @@ pub struct IsoErpSpec {
     pub balance_factor: f64,
 }
 
+impl IsoErpSpec {
+    /// Compute the ISO Commercial Experience Modification Factor for the given claim losses.
+    pub fn calculate(&self, claim_losses: &[f64]) -> Result<IsoErpResult, PricingError> {
+        calculate_iso_experience_mod(self, claim_losses)
+    }
+}
+
 /// Detailed result of an ISO Commercial Experience Rating calculation.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct IsoErpResult {

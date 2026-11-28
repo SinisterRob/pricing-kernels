@@ -5,6 +5,21 @@ All notable changes to `pricing-kernels` are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+- **Phase 1 & Phase 2 API ergonomics**:
+  - Validated domain containers and fluent builders: `DesignMatrix`, `GlmFit`, `RatingTable`, `EventLossTable`, `LayerTower`, `CredibilityPanel` / `CredibilityGroup`, `ScenarioMatrix`, `TreatyExperience`, `SolverOptions`, `NcciErpSpec`, and declarative `tower!` / `rate_changes!` macros.
+  - Householder QR IRLS solver in `linalg` for improved numerical conditioning.
+  - Spec entry points (`NcciErpSpec::calculate`, `IsoErpSpec::calculate`, `LargeDeductibleSpec::price`, `SeverityDistribution::layer_expected_loss`), cross-module bridges (`TableMEngine::from_aggregate`, `TableLEngine::from_limited_aggregate`), and GLM rate-filing helpers (`GlmResult::relativities`, `GlmResult::to_rater`).
+- **End-to-end Rate Indication & Commercial Pricing loop**:
+  - `trending::indication`: Overall rate level indication (`RateIndicationSpec`, `ExpenseProvisions`, `calculate_rate_indication`) supporting both Loss Ratio and Pure Premium methods (Werner & Modlin Ch. 8) with credibility weighting and formatted `Display` output.
+  - `layers::fitting`: Left-truncated (deductible) and right-censored (policy-limit) Maximum Likelihood Estimation (`SeverityObservation`, `SeverityFamily`, `fit_severity_mle`, `fit_best_severity`) for Exponential, Single-Parameter Pareto, Lognormal, Lomax, and Gamma with AIC/BIC ranking (Klugman–Panjer–Willmot Ch. 13).
+  - `layers::reinsurance`: Credibility-weighted XL exposure + experience blending (`blend_exposure_and_experience`, `BlendCredibilityRule`, `ExposureExperienceBlendResult`, Clark 2014).
+- **Examples & Benchmark CI parity**:
+  - Runnable end-to-end examples: `examples/rate_indication.rs` and `examples/commercial_xl_pricing.rs` (smoke-tested in CI).
+  - Self-hosted `theliomira` benchmark regression workflow (`.github/workflows/benchmarks.yml`), `scripts/bench-report.py`, and checked-in `benches/baseline-i9-14900k.json`.
+
 ## [0.4.0] - 2026-11-26
 
 ### Added

@@ -1,10 +1,16 @@
 //! Historical rate-level on-leveling and loss trending kernels.
 
+/// Overall rate level indication (Loss Ratio and Pure Premium methods, Werner & Modlin Ch. 8).
+pub mod indication;
 /// Geometric parallelogram on-level factor calculation (annual and arbitrary policy terms).
 pub mod parallelogram;
 /// Single-step and two-step exponential loss cost and exposure trend models.
 pub mod trend;
 
+pub use indication::{
+    ExpenseProvisions, RateIndicationPeriod, RateIndicationPeriodResult, RateIndicationResult,
+    RateIndicationSpec, calculate_rate_indication,
+};
 pub use parallelogram::{
     RateChange, parallelogram_on_level_factor, parallelogram_on_level_factor_with_term,
     policy_year_on_level_factor,

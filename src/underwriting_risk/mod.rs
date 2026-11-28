@@ -15,8 +15,9 @@ pub use aggregate::{
     discretize_severity_mean_preserving, fft_aggregate_loss, panjer_recursion,
 };
 pub use capital::{
-    EulerAllocationResult, MyersReadAllocationResult, euler_rvar_allocation, euler_sd_allocation,
-    euler_tvar_allocation, myers_read_allocation, sample_rvar, sample_tvar, sample_var,
+    EulerAllocationResult, MyersReadAllocationResult, ScenarioMatrix, euler_rvar_allocation,
+    euler_sd_allocation, euler_tvar_allocation, myers_read_allocation, sample_rvar, sample_tvar,
+    sample_var,
 };
 pub use catastrophe::{
     EltSummary, EventLossEntry, EventLossTable, elt_aggregate_distribution,

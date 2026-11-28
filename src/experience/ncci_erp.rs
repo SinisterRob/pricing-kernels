@@ -32,6 +32,13 @@ pub struct NcciErpSpecification {
 /// Concise alias for [`NcciErpSpecification`] matching [`super::IsoErpSpec`] and [`super::RetroPlanSpec`].
 pub type NcciErpSpec = NcciErpSpecification;
 
+impl NcciErpSpecification {
+    /// Compute the NCCI Experience Modification Factor for the given experience-period claims.
+    pub fn calculate(&self, claims: &[ExperienceClaim]) -> Result<NcciErpResult, PricingError> {
+        calculate_ncci_experience_mod(self, claims)
+    }
+}
+
 /// Detailed result of NCCI Experience Modification calculation.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct NcciErpResult {

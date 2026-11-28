@@ -1,7 +1,146 @@
 //! Non-parametric Bühlmann–Straub (1970) empirical Bayes credibility for heterogeneous risk groups.
 
+use super::hachemeister::{HachemeisterResult, hachemeister_credibility};
 use crate::error::PricingError;
 use serde::{Deserialize, Serialize};
+
+/// Single risk group's longitudinal experience for credibility modeling.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CredibilityGroup {
+    /// Optional human-readable label (e.g., state, class code, or account name).
+    pub label: Option<String>,
+    /// Per-period loss rates, loss ratios, or pure premiums `X_{ij}`.
+    pub losses: Vec<f64>,
+    /// Per-period strictly positive exposures or weights `P_{ij}`.
+    pub weights: Vec<f64>,
+    /// Optional time coordinates `t_{ij}` for Hachemeister regression credibility
+    /// (defaults to `1.0, 2.0, ..., n_i` if omitted).
+    pub times: Option<Vec<f64>>,
+}
+
+/// Typed multi-group experience panel for Bühlmann–Straub and Hachemeister credibility.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct CredibilityPanel {
+    groups: Vec<CredibilityGroup>,
+}
+
+impl CredibilityPanel {
+    /// Create an empty [`CredibilityPanel`].
+    pub const fn new() -> Self {
+        Self { groups: Vec::new() }
+    }
+
+    /// Append a validated risk group with matching `losses` and strictly positive `weights`.
+    pub fn add_group(
+        &mut self,
+        label: impl Into<String>,
+        losses: Vec<f64>,
+        weights: Vec<f64>,
+    ) -> Result<&mut Self, PricingError> {
+        if losses.is_empty() || losses.len() != weights.len() {
+            return Err(PricingError::DimensionMismatch(
+                "group losses and weights must be non-empty and have matching lengths",
+            ));
+        }
+        for (&x, &p) in losses.iter().zip(weights.iter()) {
+            if !x.is_finite() || !p.is_finite() {
+                return Err(PricingError::InvalidParameter(
+                    "group losses and weights must be finite",
+                ));
+            }
+            if !(p > 0.0) {
+                return Err(PricingError::NonPositiveValue(
+                    "group weights must be strictly positive",
+                ));
+            }
+        }
+        self.groups.push(CredibilityGroup {
+            label: Some(label.into()),
+            losses,
+            weights,
+            times: None,
+        });
+        Ok(self)
+    }
+
+    /// Append a validated risk group with explicit time coordinates for Hachemeister trend credibility.
+    pub fn add_trend_group(
+        &mut self,
+        label: impl Into<String>,
+        times: Vec<f64>,
+        losses: Vec<f64>,
+        weights: Vec<f64>,
+    ) -> Result<&mut Self, PricingError> {
+        if losses.is_empty() || losses.len() != weights.len() || losses.len() != times.len() {
+            return Err(PricingError::DimensionMismatch(
+                "group times, losses, and weights must be non-empty and have matching lengths",
+            ));
+        }
+        for ((&t, &x), &p) in times.iter().zip(losses.iter()).zip(weights.iter()) {
+            if !t.is_finite() || !x.is_finite() || !p.is_finite() {
+                return Err(PricingError::InvalidParameter(
+                    "group times, losses, and weights must be finite",
+                ));
+            }
+            if !(p > 0.0) {
+                return Err(PricingError::NonPositiveValue(
+                    "group weights must be strictly positive",
+                ));
+            }
+        }
+        self.groups.push(CredibilityGroup {
+            label: Some(label.into()),
+            losses,
+            weights,
+            times: Some(times),
+        });
+        Ok(self)
+    }
+
+    /// Number of risk groups in the panel.
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.groups.len()
+    }
+
+    /// Returns `true` if the panel has no groups.
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.groups.is_empty()
+    }
+
+    /// Slice of underlying [`CredibilityGroup`] records.
+    #[inline]
+    pub fn groups(&self) -> &[CredibilityGroup] {
+        &self.groups
+    }
+
+    /// Fit non-parametric Bühlmann–Straub credibility across all groups in this panel.
+    pub fn fit_buhlmann_straub(&self) -> Result<BuhlmannStraubResult, PricingError> {
+        let loss_slices: Vec<&[f64]> = self.groups.iter().map(|g| g.losses.as_slice()).collect();
+        let weight_slices: Vec<&[f64]> = self.groups.iter().map(|g| g.weights.as_slice()).collect();
+        buhlmann_straub(&loss_slices, &weight_slices)
+    }
+
+    /// Fit Hachemeister (1975) regression trend credibility across all groups in this panel.
+    ///
+    /// Groups without explicit `times` use sequential periods `1.0, 2.0, ..., n_i`.
+    pub fn fit_hachemeister(&self) -> Result<HachemeisterResult, PricingError> {
+        let owned_times: Vec<Vec<f64>> = self
+            .groups
+            .iter()
+            .map(|g| {
+                g.times
+                    .clone()
+                    .unwrap_or_else(|| (1..=g.losses.len()).map(|t| t as f64).collect())
+            })
+            .collect();
+        let time_slices: Vec<&[f64]> = owned_times.iter().map(Vec::as_slice).collect();
+        let loss_slices: Vec<&[f64]> = self.groups.iter().map(|g| g.losses.as_slice()).collect();
+        let weight_slices: Vec<&[f64]> = self.groups.iter().map(|g| g.weights.as_slice()).collect();
+        hachemeister_credibility(&time_slices, &loss_slices, &weight_slices)
+    }
+}
 
 /// Result of non-parametric Bühlmann-Straub credibility estimation.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

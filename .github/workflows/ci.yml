@@ -63,6 +63,11 @@ jobs:
         run: cargo test --all-targets --all-features
       - name: Doctests
         run: cargo test --doc --all-features
+      - name: Example smoke tests
+        shell: bash
+        run: |
+          cargo run --example rate_indication > /dev/null
+          cargo run --example commercial_xl_pricing > /dev/null
 
   msrv:
     name: MSRV (1.97)
@@ -76,10 +81,10 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: msrv-1.97
-      - name: Check library, tests, and benchmarks (default features)
-        run: cargo check --lib --tests --benches --no-default-features
-      - name: Check library, tests, and benchmarks (all features)
-        run: cargo check --lib --tests --benches --all-features
+      - name: Check library, tests, examples, and benchmarks (default features)
+        run: cargo check --lib --tests --examples --benches --no-default-features
+      - name: Check library, tests, examples, and benchmarks (all features)
+        run: cargo check --lib --tests --examples --benches --all-features
       - name: Unit tests on MSRV
         run: cargo test --lib
 
@@ -125,9 +130,12 @@ jobs:
           arguments: --all-features
       - name: Lint hooks and shell scripts
         run: shellcheck .githooks/* scripts/*.sh
-      - name: Syntax-check Node scripts
+      - name: Syntax-check Python and Node scripts
         run: |
           shopt -s nullglob
+          for py in scripts/*.py; do
+            python3 -m py_compile "$py"
+          done
           for js in scripts/*.mjs scripts/*.js; do
             node --check "$js"
           done

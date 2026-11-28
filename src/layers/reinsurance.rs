@@ -4,8 +4,213 @@
 
 use crate::error::PricingError;
 use crate::experience::TableMEngine;
-use crate::layers::CommercialLayer;
+use crate::layers::{CommercialLayer, LayerTower};
 use serde::{Deserialize, Serialize};
+
+/// Validated historical treaty experience container pairing subject-premium years and large claims.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TreatyExperience {
+    years: Vec<HistoricalTreatyYear>,
+    claims: Vec<HistoricalTreatyClaim>,
+}
+
+impl TreatyExperience {
+    /// Construct a validated [`TreatyExperience`] dataset, eagerly verifying all treaty years
+    /// and individual claim records.
+    pub fn try_new(
+        years: Vec<HistoricalTreatyYear>,
+        claims: Vec<HistoricalTreatyClaim>,
+    ) -> Result<Self, PricingError> {
+        if years.is_empty() {
+            return Err(PricingError::EmptyInput(
+                "at least one historical treaty year is required",
+            ));
+        }
+        for y in &years {
+            if !y.subject_premium.is_finite()
+                || !y.on_level_factor.is_finite()
+                || !y.exposure_trend_factor.is_finite()
+                || !(y.subject_premium > 0.0)
+                || !(y.on_level_factor > 0.0)
+                || !(y.exposure_trend_factor > 0.0)
+            {
+                return Err(PricingError::NonPositiveValue(
+                    "subject_premium, on_level_factor, and exposure_trend_factor must be finite and positive",
+                ));
+            }
+        }
+        for c in &claims {
+            if !c.incurred.is_finite()
+                || !c.severity_trend_factor.is_finite()
+                || !c.development_factor.is_finite()
+                || !(c.incurred >= 0.0)
+                || !(c.severity_trend_factor > 0.0)
+                || !(c.development_factor > 0.0)
+            {
+                return Err(PricingError::InvalidParameter(
+                    "claim incurred must be >= 0 and trend/development factors must be finite and positive",
+                ));
+            }
+            if !years.iter().any(|y| y.year == c.year) {
+                return Err(PricingError::OutOfBounds(
+                    "claim year does not match any historical treaty year",
+                ));
+            }
+        }
+        Ok(Self { years, claims })
+    }
+
+    /// Historical treaty years.
+    #[inline]
+    pub fn years(&self) -> &[HistoricalTreatyYear] {
+        &self.years
+    }
+
+    /// Historical individual claims.
+    #[inline]
+    pub fn claims(&self) -> &[HistoricalTreatyClaim] {
+        &self.claims
+    }
+
+    /// Compute experience-rated burning cost for a single [`CommercialLayer`].
+    pub fn burning_cost(&self, layer: &CommercialLayer) -> Result<BurningCostResult, PricingError> {
+        burning_cost_xl(&self.years, &self.claims, layer)
+    }
+
+    /// Compute experience-rated burning cost for every layer in a [`LayerTower`].
+    pub fn burning_cost_tower(
+        &self,
+        tower: &LayerTower,
+    ) -> Result<Vec<BurningCostResult>, PricingError> {
+        let mut results = Vec::with_capacity(tower.len());
+        for layer in tower.layers() {
+            results.push(burning_cost_xl(&self.years, &self.claims, layer)?);
+        }
+        Ok(results)
+    }
+}
+
+/// Credibility weighting rule for blending XL treaty exposure and experience rates (Clark 2014).
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub enum BlendCredibilityRule {
+    /// Explicit credibility weight `Z in [0, 1]` assigned to the experience rate.
+    Fixed(f64),
+    /// Square-root classical credibility `Z = min(1, sqrt(n / full_credibility_claims))`.
+    SquareRoot {
+        /// Number of historical or expected claims penetrating the layer (`>= 0`).
+        claim_count: f64,
+        /// Full-credibility claim count standard `n_0 > 0`.
+        full_credibility_claims: f64,
+    },
+    /// Bühlmann credibility `Z = volume / (volume + k)` where `k > 0`.
+    Buhlmann {
+        /// Experience volume (e.g. expected layer claims or adjusted subject premium, `>= 0`).
+        volume: f64,
+        /// Bühlmann credibility constant `K > 0`.
+        credibility_k: f64,
+    },
+}
+
+/// Result of credibility-blending an exposure-rated and experience-rated XL treaty loss cost.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct ExposureExperienceBlendResult {
+    /// Exposure-rated layer loss cost rate (complement of credibility).
+    pub exposure_rate: f64,
+    /// Experience-rated (burning-cost) layer loss cost rate.
+    pub experience_rate: f64,
+    /// Credibility weight `Z in [0, 1]` assigned to the experience rate.
+    pub credibility_z: f64,
+    /// Blended treaty loss cost rate `Z * experience_rate + (1 - Z) * exposure_rate`.
+    pub blended_rate: f64,
+    /// Indicated treaty technical premium (`blended_rate * subject_premium / (1 - load_ratio)`),
+    /// if `subject_premium` was provided.
+    pub technical_premium: Option<f64>,
+}
+
+/// Credibility-blend an exposure-rated XL layer loss cost (e.g. from MBBEFD or ILF curves)
+/// with an experience-rated burning cost (Clark 2014 *Basics of Reinsurance Pricing*).
+pub fn blend_exposure_and_experience(
+    exposure_rate: f64,
+    experience_rate: f64,
+    rule: BlendCredibilityRule,
+    subject_premium: Option<f64>,
+    expense_and_margin_load: f64,
+) -> Result<ExposureExperienceBlendResult, PricingError> {
+    if !exposure_rate.is_finite()
+        || !experience_rate.is_finite()
+        || !expense_and_margin_load.is_finite()
+        || !(exposure_rate >= 0.0)
+        || !(experience_rate >= 0.0)
+        || !(expense_and_margin_load >= 0.0)
+        || !(expense_and_margin_load < 1.0)
+    {
+        return Err(PricingError::InvalidParameter(
+            "rates must be finite >= 0 and expense_and_margin_load in [0, 1)",
+        ));
+    }
+
+    let z = match rule {
+        BlendCredibilityRule::Fixed(z) => {
+            if !z.is_finite() || !(z >= 0.0) || !(z <= 1.0) {
+                return Err(PricingError::InvalidParameter(
+                    "fixed credibility_z must be finite and in [0, 1]",
+                ));
+            }
+            z
+        }
+        BlendCredibilityRule::SquareRoot {
+            claim_count,
+            full_credibility_claims,
+        } => {
+            if !claim_count.is_finite()
+                || !full_credibility_claims.is_finite()
+                || !(claim_count >= 0.0)
+                || !(full_credibility_claims > 0.0)
+            {
+                return Err(PricingError::InvalidParameter(
+                    "claim_count must be >= 0 and full_credibility_claims > 0",
+                ));
+            }
+            (claim_count / full_credibility_claims).sqrt().min(1.0)
+        }
+        BlendCredibilityRule::Buhlmann {
+            volume,
+            credibility_k,
+        } => {
+            if !volume.is_finite()
+                || !credibility_k.is_finite()
+                || !(volume >= 0.0)
+                || !(credibility_k > 0.0)
+            {
+                return Err(PricingError::InvalidParameter(
+                    "volume must be >= 0 and credibility_k > 0",
+                ));
+            }
+            volume / (volume + credibility_k)
+        }
+    };
+
+    let blended_rate = z * experience_rate + (1.0 - z) * exposure_rate;
+    let technical_premium = match subject_premium {
+        None => None,
+        Some(prem) => {
+            if !prem.is_finite() || !(prem > 0.0) {
+                return Err(PricingError::NonPositiveValue(
+                    "subject_premium must be finite and positive",
+                ));
+            }
+            Some(blended_rate * prem / (1.0 - expense_and_margin_load))
+        }
+    };
+
+    Ok(ExposureExperienceBlendResult {
+        exposure_rate,
+        experience_rate,
+        credibility_z: z,
+        blended_rate,
+        technical_premium,
+    })
+}
 
 /// Historical treaty-year subject premium and adjustment factors for burning-cost rating.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]

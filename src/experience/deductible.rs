@@ -42,6 +42,18 @@ pub struct LargeDeductibleSpec {
     pub aggregate_cap_entry_ratio: Option<f64>,
 }
 
+impl LargeDeductibleSpec {
+    /// Price this commercial large deductible program against a parametric severity distribution
+    /// and optional [`TableMEngine`] (required when `aggregate_cap_entry_ratio` is `Some`).
+    pub fn price(
+        &self,
+        severity: &SeverityDistribution,
+        retained_table_m: Option<&TableMEngine>,
+    ) -> Result<LargeDeductibleResult, PricingError> {
+        price_large_deductible(self, severity, retained_table_m)
+    }
+}
+
 /// Financial breakdown of a priced commercial large deductible program.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct LargeDeductibleResult {

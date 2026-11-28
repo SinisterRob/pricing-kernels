@@ -7,6 +7,8 @@ pub mod classical;
 /// Hachemeister (1975) regression credibility for credibility-weighted trend.
 pub mod hachemeister;
 
-pub use buhlmann_straub::{BuhlmannStraubResult, buhlmann_straub};
+pub use buhlmann_straub::{
+    BuhlmannStraubResult, CredibilityGroup, CredibilityPanel, buhlmann_straub,
+};
 pub use classical::ClassicalCredibility;
 pub use hachemeister::{HachemeisterGroupResult, HachemeisterResult, hachemeister_credibility};

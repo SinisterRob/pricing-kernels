@@ -12,6 +12,115 @@
 use crate::error::PricingError;
 use serde::{Deserialize, Serialize};
 
+/// Named multi-line underwriting loss scenario matrix (`n_lines × n_scenarios`) for coherent
+/// risk measurement and capital allocation (Euler TVaR/RVaR/SD and Myers–Read).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ScenarioMatrix {
+    line_names: Vec<String>,
+    lines: Vec<Vec<f64>>,
+    n_scenarios: usize,
+}
+
+impl ScenarioMatrix {
+    /// Construct and validate a [`ScenarioMatrix`] from named per-line scenario vectors.
+    pub fn try_new(line_names: Vec<String>, lines: Vec<Vec<f64>>) -> Result<Self, PricingError> {
+        if lines.is_empty() {
+            return Err(PricingError::EmptyInput(
+                "at least one line of business is required",
+            ));
+        }
+        if line_names.len() != lines.len() {
+            return Err(PricingError::DimensionMismatch(
+                "line_names length must match number of lines",
+            ));
+        }
+        let n_scenarios = lines[0].len();
+        if n_scenarios == 0 {
+            return Err(PricingError::EmptyInput(
+                "scenario vectors must be non-empty",
+            ));
+        }
+        for line in &lines {
+            if line.len() != n_scenarios {
+                return Err(PricingError::DimensionMismatch(
+                    "all lines must have the same number of scenarios",
+                ));
+            }
+            if line.iter().any(|v| !v.is_finite()) {
+                return Err(PricingError::InvalidParameter(
+                    "scenario values must be finite",
+                ));
+            }
+        }
+        Ok(Self {
+            line_names,
+            lines,
+            n_scenarios,
+        })
+    }
+
+    /// Number of lines of business in the portfolio.
+    #[inline]
+    pub fn n_lines(&self) -> usize {
+        self.lines.len()
+    }
+
+    /// Number of scenarios per line.
+    #[inline]
+    pub const fn n_scenarios(&self) -> usize {
+        self.n_scenarios
+    }
+
+    /// Ordered line-of-business names.
+    #[inline]
+    pub fn line_names(&self) -> &[String] {
+        &self.line_names
+    }
+
+    /// Portfolio aggregate loss vector `S_k = sum_i L_{i,k}` across all scenarios.
+    pub fn portfolio_totals(&self) -> Vec<f64> {
+        let mut totals = vec![0.0; self.n_scenarios];
+        for line in &self.lines {
+            for (tot, &v) in totals.iter_mut().zip(line.iter()) {
+                *tot += v;
+            }
+        }
+        totals
+    }
+
+    fn as_slices(&self) -> Vec<&[f64]> {
+        self.lines.iter().map(Vec::as_slice).collect()
+    }
+
+    /// Allocate portfolio `TVaR_alpha` risk capital across lines via Tasche's Euler principle.
+    pub fn euler_tvar(&self, alpha: f64) -> Result<EulerAllocationResult, PricingError> {
+        let slices = self.as_slices();
+        euler_tvar_allocation(&slices, alpha)
+    }
+
+    /// Allocate portfolio `RVaR_{p_low, p_high}` risk capital across lines via Tasche's Euler principle.
+    pub fn euler_rvar(
+        &self,
+        p_low: f64,
+        p_high: f64,
+    ) -> Result<EulerAllocationResult, PricingError> {
+        let slices = self.as_slices();
+        euler_rvar_allocation(&slices, p_low, p_high)
+    }
+
+    /// Allocate portfolio standard-deviation capital `E[S] + multiplier * SD(S)` via Euler principle.
+    pub fn euler_sd(&self, multiplier: f64) -> Result<EulerAllocationResult, PricingError> {
+        let slices = self.as_slices();
+        euler_sd_allocation(&slices, multiplier)
+    }
+
+    /// Allocate portfolio surplus via the Myers & Read (2001) marginal default-put method.
+    pub fn myers_read(&self, surplus: f64) -> Result<MyersReadAllocationResult, PricingError> {
+        let slices = self.as_slices();
+        myers_read_allocation(&slices, surplus)
+    }
+}
+
 fn validate_samples(samples: &[f64]) -> Result<(), PricingError> {
     if samples.is_empty() {
         return Err(PricingError::EmptyInput("samples must not be empty"));

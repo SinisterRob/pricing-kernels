@@ -1634,3 +1634,434 @@ fn test_wasm_exports_guard_overflow_and_basic_calls() {
     );
     assert!(overflow_mod.is_nan());
 }
+
+#[test]
+fn test_phase2_ergonomics_containers_and_bridges() {
+    // 1. CredibilityPanel -> Bühlmann-Straub & Hachemeister parity with slice functions
+    let bs_data = datasets::buhlmann_straub_example();
+    let mut panel = CredibilityPanel::new();
+    for (idx, (l, w)) in bs_data
+        .group_losses
+        .iter()
+        .zip(bs_data.group_weights.iter())
+        .enumerate()
+    {
+        panel
+            .add_group(format!("Group {}", idx + 1), l.clone(), w.clone())
+            .unwrap();
+    }
+    assert_eq!(panel.len(), bs_data.group_losses.len());
+    let panel_bs = panel.fit_buhlmann_straub().unwrap();
+    let loss_slices: Vec<&[f64]> = bs_data.group_losses.iter().map(Vec::as_slice).collect();
+    let weight_slices: Vec<&[f64]> = bs_data.group_weights.iter().map(Vec::as_slice).collect();
+    let raw_bs = buhlmann_straub(&loss_slices, &weight_slices).unwrap();
+    assert!(close_rel(panel_bs.k, raw_bs.k, 1e-12));
+    assert!(close_rel(panel_bs.grand_mean, raw_bs.grand_mean, 1e-12));
+
+    let panel_hach = panel.fit_hachemeister().unwrap();
+    assert_eq!(panel_hach.groups.len(), panel.len());
+
+    // 2. ScenarioMatrix -> Euler TVaR & Myers-Read parity
+    let mat = ScenarioMatrix::try_new(
+        vec!["Auto".to_owned(), "GL".to_owned()],
+        vec![
+            vec![10.0, 20.0, 30.0, 40.0, 80.0, 120.0],
+            vec![15.0, 25.0, 20.0, 35.0, 60.0, 90.0],
+        ],
+    )
+    .unwrap();
+    assert_eq!(mat.n_lines(), 2);
+    assert_eq!(mat.n_scenarios(), 6);
+    let tvar = mat.euler_tvar(0.80).unwrap();
+    let sum_alloc: f64 = tvar.allocated_total.iter().sum();
+    assert!(close_rel(sum_alloc, tvar.portfolio_risk_measure, 1e-12));
+    let mr = mat.myers_read(120.0).unwrap();
+    assert!(close_rel(
+        mr.allocated_surplus.iter().sum::<f64>(),
+        mr.portfolio_surplus,
+        1e-12
+    ));
+
+    // 3. Spec `.calculate()` / `.price()` methods + TableMEngine::from_aggregate bridge
+    let ncci = datasets::ncci_erp_worksheet();
+    assert_eq!(
+        ncci.spec.calculate(&ncci.claims).unwrap().mod_factor,
+        ncci.expected_mod_rounded
+    );
+    let iso = IsoErpSpec {
+        expected_basic_limits_loss: 200_000.0,
+        max_single_limit: 50_000.0,
+        credibility_k: 50_000.0,
+        balance_factor: 1.0,
+    };
+    assert!(close_rel(
+        iso.calculate(&[120_000.0, 30_000.0, 20_000.0])
+            .unwrap()
+            .mod_factor_unrounded,
+        0.60,
+        1e-12
+    ));
+
+    let sev = SeverityDistribution::Lomax {
+        alpha: 2.5,
+        theta: 100_000.0,
+    };
+    let ded = LargeDeductibleSpec {
+        expected_indemnity: 500_000.0,
+        expected_alae: 50_000.0,
+        deductible: 50_000.0,
+        policy_limit: 1_000_000.0,
+        alae_treatment: AlaeTreatment::ProRata,
+        fixed_expenses: 25_000.0,
+        variable_expense_ratio: 0.20,
+        aggregate_cap_entry_ratio: None,
+    };
+    assert!(ded.price(&sev, None).unwrap().indicated_premium > 0.0);
+    assert!(close_rel(
+        sev.layer_expected_loss(100_000.0, 400_000.0).unwrap(),
+        CommercialLayer::new(100_000.0, 400_000.0, 1.0)
+            .unwrap()
+            .layer_expected_loss(&sev)
+            .unwrap(),
+        1e-12
+    ));
+
+    // Bridge Panjer aggregate -> TableMEngine & TableLEngine
+    let disc = discretize_severity_mean_preserving(&sev, 20_000.0, 64).unwrap();
+    let agg = panjer_recursion(
+        FrequencyDistribution::Poisson { lambda: 4.0 },
+        &disc,
+        20_000.0,
+        256,
+    )
+    .unwrap();
+    let tm = TableMEngine::from_aggregate(&agg).unwrap();
+    assert!(close_rel(tm.charge_at(0.0), 1.0, 1e-3));
+    let tl = TableLEngine::from_limited_aggregate(&agg, agg.mean * 1.15).unwrap();
+    assert!(tl.loss_elimination_ratio > 0.10 && tl.loss_elimination_ratio < 0.20);
+
+    // 4. GlmResult::relativities and to_rater
+    let dm =
+        DesignMatrix::try_from_rows(&[[1.0, 0.0], [1.0, 0.0], [1.0, 1.0], [1.0, 1.0]]).unwrap();
+    let fit = GlmFit::new(GlmFamily::Poisson, &dm, &[10.0, 10.0, 20.0, 20.0])
+        .fit()
+        .unwrap();
+    let rels = fit.relativities(Some(&["Base", "HighRisk"])).unwrap();
+    assert!(close_rel(rels[0].relativity, 10.0, 1e-6));
+    assert!(close_rel(rels[1].relativity, 2.0, 1e-6));
+    assert!(rels[1].ci_low_95 < rels[1].relativity && rels[1].relativity < rels[1].ci_high_95);
+    let rater = fit.to_rater().unwrap();
+    assert!(close_rel(
+        rater.score(1.0, &[rels[1].relativity]),
+        20.0,
+        1e-6
+    ));
+}
+
+#[test]
+fn test_rate_level_indication_loss_ratio_and_pure_premium_equivalence() {
+    // Werner & Modlin Ch. 8 exact equivalence:
+    // When fixed_expense_per_exposure == fixed_expense_ratio * current_average_rate,
+    // Loss Ratio Method and Pure Premium Method yield identical indicated rate changes.
+    let spec = RateIndicationSpec {
+        periods: vec![
+            RateIndicationPeriod {
+                year: 2023,
+                earned_exposures: 5_000.0,
+                earned_premium: 4_000_000.0,
+                on_level_factor: 1.05,
+                premium_trend_factor: 1.02,
+                reported_loss: 2_500_000.0,
+                loss_development_factor: 1.08,
+                loss_trend_factor: 1.06,
+                alae_load_factor: 1.05,
+                weight: None,
+            },
+            RateIndicationPeriod {
+                year: 2024,
+                earned_exposures: 5_000.0,
+                earned_premium: 4_200_000.0,
+                on_level_factor: 1.00,
+                premium_trend_factor: 1.02,
+                reported_loss: 2_400_000.0,
+                loss_development_factor: 1.20,
+                loss_trend_factor: 1.03,
+                alae_load_factor: 1.05,
+                weight: None,
+            },
+        ],
+        expenses: ExpenseProvisions {
+            fixed_expense_ratio: 0.08,
+            fixed_expense_per_exposure: 0.08 * 856.8, // 0.08 * exact current average rate
+            variable_expense_ratio: 0.17,
+            profit_and_contingencies_ratio: 0.05,
+            ulae_factor: 1.04,
+        },
+        credibility_z: Some(0.75),
+        complement_of_credibility: 0.02,
+    };
+
+    let res = spec.calculate().unwrap();
+    assert!(close_rel(res.permissible_loss_ratio, 0.78, 1e-12));
+    assert!(close_rel(res.current_average_rate, 856.8, 1e-12));
+    assert!(close_rel(
+        res.indicated_rate_change,
+        res.pure_premium_indicated_change,
+        1e-12
+    ));
+    let expected_cw = 0.75 * res.indicated_rate_change + 0.25 * 0.02;
+    assert!(close_rel(
+        res.credibility_weighted_change.unwrap(),
+        expected_cw,
+        1e-12
+    ));
+    assert!(format!("{res}").contains("Rate Level Indication Summary"));
+}
+
+#[test]
+fn test_exposure_experience_xl_blend_and_treaty_experience() {
+    let exp = TreatyExperience::try_new(
+        vec![HistoricalTreatyYear {
+            year: 2024,
+            subject_premium: 10_000_000.0,
+            on_level_factor: 1.0,
+            exposure_trend_factor: 1.0,
+        }],
+        vec![
+            HistoricalTreatyClaim {
+                year: 2024,
+                incurred: 800_000.0,
+                severity_trend_factor: 1.0,
+                development_factor: 1.0,
+            },
+            HistoricalTreatyClaim {
+                year: 2024,
+                incurred: 1_200_000.0,
+                severity_trend_factor: 1.0,
+                development_factor: 1.0,
+            },
+        ],
+    )
+    .unwrap();
+    let t = pricing_kernels::tower![500_000.0 xs 500_000.0, 1_000_000.0 xs 1_000_000.0].unwrap();
+    let bc_tower = exp.burning_cost_tower(&t).unwrap();
+    assert_eq!(bc_tower.len(), 2);
+    // Layer 1 (500k xs 500k): 300k + 500k = 800k -> 0.08 rate
+    assert!(close_rel(
+        bc_tower[0].overall_burning_cost_rate,
+        0.08,
+        1e-12
+    ));
+    // Layer 2 (1M xs 1M): 0 + 200k = 200k -> 0.02 rate
+    assert!(close_rel(
+        bc_tower[1].overall_burning_cost_rate,
+        0.02,
+        1e-12
+    ));
+
+    let blend = blend_exposure_and_experience(
+        0.06,
+        0.08,
+        BlendCredibilityRule::SquareRoot {
+            claim_count: 9.0,
+            full_credibility_claims: 36.0, // Z = 0.5
+        },
+        Some(10_000_000.0),
+        0.20,
+    )
+    .unwrap();
+    assert!(close_rel(blend.credibility_z, 0.50, 1e-12));
+    assert!(close_rel(blend.blended_rate, 0.07, 1e-12));
+    assert!(close_rel(
+        blend.technical_premium.unwrap(),
+        0.07 * 10_000_000.0 / 0.80,
+        1e-12
+    ));
+}
+
+#[test]
+fn test_censored_truncated_severity_mle() {
+    // 1. Exponential exact closed-form MLE under left-truncation & right-censoring:
+    // 3 uncensored claims at (30, 50, 70) with deductible 10 + 1 censored at 100 with deductible 10
+    // sum(x_i - d_i) = 20 + 40 + 60 + 90 = 210, uncensored = 3 -> lambda_hat = 3 / 210 = 1/70
+    let exp_obs = [
+        SeverityObservation::truncated(30.0, 10.0),
+        SeverityObservation::truncated(50.0, 10.0),
+        SeverityObservation::truncated(70.0, 10.0),
+        SeverityObservation::censored(100.0, 10.0),
+    ];
+    let exp_fit = fit_severity_mle(
+        SeverityFamily::Exponential,
+        &exp_obs,
+        &SolverOptions::default(),
+    )
+    .unwrap();
+    assert_eq!(exp_fit.n_censored, 1);
+    match exp_fit.distribution {
+        SeverityDistribution::Exponential { lambda } => {
+            assert!(close_rel(lambda, 3.0 / 210.0, 1e-12));
+        }
+        other => panic!("unexpected distribution: {other:?}"),
+    }
+
+    // 2. Single-Parameter Pareto exact closed-form MLE under right-censoring
+    let pareto_obs = [
+        SeverityObservation::exact(200.0),
+        SeverityObservation::exact(400.0),
+        SeverityObservation::censored(1_000.0, 0.0),
+    ];
+    let p_fit = fit_severity_mle(
+        SeverityFamily::SingleParameterPareto { threshold: 100.0 },
+        &pareto_obs,
+        &SolverOptions::default(),
+    )
+    .unwrap();
+    let expected_alpha = 2.0 / ((2.0_f64).ln() + (4.0_f64).ln() + (10.0_f64).ln());
+    match p_fit.distribution {
+        SeverityDistribution::SingleParameterPareto { alpha, x_m } => {
+            assert!(close_rel(x_m, 100.0, 1e-12));
+            assert!(close_rel(alpha, expected_alpha, 1e-12));
+        }
+        other => panic!("unexpected distribution: {other:?}"),
+    }
+
+    // 3. Lognormal exact uncensored MLE + censored/truncated Lomax & Gamma convergence + AIC ranking
+    let ln_obs: Vec<SeverityObservation> = [100.0, 200.0, 400.0, 800.0]
+        .into_iter()
+        .map(SeverityObservation::exact)
+        .collect();
+    let ranked = fit_best_severity(
+        &[
+            SeverityFamily::Lognormal,
+            SeverityFamily::Lomax,
+            SeverityFamily::Gamma,
+            SeverityFamily::Exponential,
+        ],
+        &ln_obs,
+        &SolverOptions::default(),
+    )
+    .unwrap();
+    assert_eq!(ranked.len(), 4);
+    assert!(ranked[0].aic <= ranked[1].aic);
+    assert!(ranked[1].aic <= ranked[2].aic);
+    assert!(ranked[2].aic <= ranked[3].aic);
+    // All fitted distributions produce valid positive ILFs
+    for fit in &ranked {
+        let ilf = fit
+            .distribution
+            .increased_limits_factor(1_000.0, 200.0)
+            .unwrap();
+        assert!(ilf >= 1.0);
+    }
+}
+
+#[test]
+fn test_adversarial_p0_regression_guards() {
+    // 1. GlmResult::to_rater rejects Binomial (logit link) while allowing log-link families
+    let dm =
+        DesignMatrix::try_from_rows(&[[1.0, 0.0], [1.0, 0.0], [1.0, 1.0], [1.0, 1.0]]).unwrap();
+    let bin_fit = GlmFit::new(GlmFamily::Binomial, &dm, &[0.2, 0.3, 0.7, 0.8])
+        .fit()
+        .unwrap();
+    assert_eq!(bin_fit.family, GlmFamily::Binomial);
+    assert!(bin_fit.to_rater().is_err());
+
+    // 2. RateIndicationSpec with custom period weights applies weights consistently to Pure Premium
+    let weighted_spec = RateIndicationSpec {
+        periods: vec![
+            RateIndicationPeriod {
+                year: 2023,
+                earned_exposures: 1_000.0,
+                earned_premium: 1_000_000.0,
+                on_level_factor: 1.0,
+                premium_trend_factor: 1.0,
+                reported_loss: 500_000.0,
+                loss_development_factor: 1.0,
+                loss_trend_factor: 1.0,
+                alae_load_factor: 1.0,
+                weight: Some(0.20),
+            },
+            RateIndicationPeriod {
+                year: 2024,
+                earned_exposures: 1_000.0,
+                earned_premium: 1_000_000.0,
+                on_level_factor: 1.0,
+                premium_trend_factor: 1.0,
+                reported_loss: 800_000.0,
+                loss_development_factor: 1.0,
+                loss_trend_factor: 1.0,
+                alae_load_factor: 1.0,
+                weight: Some(0.80),
+            },
+        ],
+        expenses: ExpenseProvisions {
+            fixed_expense_ratio: 0.08,
+            fixed_expense_per_exposure: 80.0, // 0.08 * 1000 avg rate
+            variable_expense_ratio: 0.17,
+            profit_and_contingencies_ratio: 0.05,
+            ulae_factor: 1.0,
+        },
+        credibility_z: None,
+        complement_of_credibility: 0.0,
+    };
+    let w_res = weighted_spec.calculate().unwrap();
+    // Weighted LR = 0.2 * 0.50 + 0.8 * 0.80 = 0.74; Weighted PP = 0.2 * 500 + 0.8 * 800 = 740
+    assert!(close_rel(w_res.weighted_loss_ratio, 0.74, 1e-12));
+    assert!(close_rel(w_res.projected_pure_premium, 740.0, 1e-12));
+    assert!(close_rel(
+        w_res.indicated_rate_change,
+        w_res.pure_premium_indicated_change,
+        1e-12
+    ));
+
+    // 3. fit_severity_mle returns Err(NonConvergence) if max_iter is insufficient
+    let obs = [
+        SeverityObservation::truncated(25_000.0, 10_000.0),
+        SeverityObservation::truncated(60_000.0, 10_000.0),
+        SeverityObservation::censored(250_000.0, 10_000.0),
+    ];
+    let err = fit_severity_mle(
+        SeverityFamily::Lomax,
+        &obs,
+        &SolverOptions::default().with_max_iter(2),
+    );
+    assert!(matches!(err, Err(PricingError::NonConvergence(_))));
+
+    // 4. TableMEngine::from_aggregate rejects severely truncated PMFs cleanly
+    let truncated_agg = AggregateLossDistribution::from_pmf(100.0, vec![0.3, 0.3, 0.2]).unwrap();
+    assert!(TableMEngine::from_aggregate(&truncated_agg).is_err());
+
+    // 5. Eager validation on TreatyExperience and CredibilityPanel
+    assert!(
+        TreatyExperience::try_new(
+            vec![HistoricalTreatyYear {
+                year: 2024,
+                subject_premium: -100.0,
+                on_level_factor: 1.0,
+                exposure_trend_factor: 1.0,
+            }],
+            vec![],
+        )
+        .is_err()
+    );
+    assert!(
+        TreatyExperience::try_new(
+            vec![HistoricalTreatyYear {
+                year: 2024,
+                subject_premium: 1_000_000.0,
+                on_level_factor: 1.0,
+                exposure_trend_factor: 1.0,
+            }],
+            vec![HistoricalTreatyClaim {
+                year: 2020, // orphan year not in years
+                incurred: 100_000.0,
+                severity_trend_factor: 1.0,
+                development_factor: 1.0,
+            }],
+        )
+        .is_err()
+    );
+    let mut panel = CredibilityPanel::new();
+    assert!(panel.add_group("Bad", vec![1.0], vec![0.0]).is_err());
+    assert!(panel.add_group("NaN", vec![f64::NAN], vec![1.0]).is_err());
+}

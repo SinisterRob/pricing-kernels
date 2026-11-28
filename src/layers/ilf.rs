@@ -538,6 +538,12 @@ impl SeverityDistribution {
         let lev = self.limited_expected_value(retention)?;
         Ok(((mean - lev) / mean).clamp(0.0, 1.0))
     }
+
+    /// Expected loss cost in a 100%-participation excess layer `limit xs attachment`:
+    /// `E[X ∧ (attachment + limit)] - E[X ∧ attachment]`.
+    pub fn layer_expected_loss(&self, attachment: f64, limit: f64) -> Result<f64, PricingError> {
+        CommercialLayer::new(attachment, limit, 1.0)?.layer_expected_loss(self)
+    }
 }
 
 /// Specifications for a commercial excess insurance layer.

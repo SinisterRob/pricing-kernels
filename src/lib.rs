@@ -12,6 +12,7 @@ pub(crate) mod linalg;
 pub(crate) mod special;
 pub mod trending;
 pub mod underwriting_risk;
+pub(crate) mod validate;
 
 #[cfg(feature = "wasm")]
 #[doc(hidden)]
@@ -94,13 +95,14 @@ pub mod prelude {
     pub use crate::classification::{
         DesignMatrix, DoubleLiftBucket, GiniResult, GlmFamily, GlmFit, GlmOptions, GlmResult,
         InformationCriteria, LorenzCurvePoint, MinimumBiasResult, MultiplicativeRater, RatingTable,
-        TweediePowerSelection, bailey_simon_chi_squared, bailey_simon_multiplicative,
-        double_lift_chart, fit_glm_irls, fit_glm_irls_with_options, glm_information_criteria,
-        predict_glm, select_tweedie_power, variance_inflation_factors, weighted_gini_index,
+        RelativityRow, TweediePowerSelection, bailey_simon_chi_squared,
+        bailey_simon_multiplicative, double_lift_chart, fit_glm_irls, fit_glm_irls_with_options,
+        glm_information_criteria, predict_glm, select_tweedie_power, variance_inflation_factors,
+        weighted_gini_index,
     };
     pub use crate::credibility::{
-        BuhlmannStraubResult, ClassicalCredibility, HachemeisterGroupResult, HachemeisterResult,
-        buhlmann_straub, hachemeister_credibility,
+        BuhlmannStraubResult, ClassicalCredibility, CredibilityGroup, CredibilityPanel,
+        HachemeisterGroupResult, HachemeisterResult, buhlmann_straub, hachemeister_credibility,
     };
     pub use crate::error::{PricingError, SolverOptions};
     pub use crate::experience::{
@@ -112,20 +114,24 @@ pub mod prelude {
         solve_balanced_retro_plan, solve_balanced_retro_plan_table_l,
     };
     pub use crate::layers::{
-        BurningCostResult, BurningCostYearResult, CommercialLayer, HistoricalTreatyClaim,
-        HistoricalTreatyYear, LayerTower, MbbefdCurve, ReinstatementBasis,
-        ReinstatementPricingResult, SeverityDistribution, SlidingScaleSpec, SwissReCurve,
-        burning_cost_xl, expected_loss_corridor_retention, expected_profit_commission,
-        price_reinstatements,
+        BlendCredibilityRule, BurningCostResult, BurningCostYearResult, CommercialLayer,
+        ExposureExperienceBlendResult, HistoricalTreatyClaim, HistoricalTreatyYear, LayerTower,
+        MbbefdCurve, ReinstatementBasis, ReinstatementPricingResult, SeverityDistribution,
+        SeverityFamily, SeverityFitResult, SeverityObservation, SlidingScaleSpec, SwissReCurve,
+        TreatyExperience, blend_exposure_and_experience, burning_cost_xl,
+        expected_loss_corridor_retention, expected_profit_commission, fit_best_severity,
+        fit_severity_mle, price_reinstatements,
     };
     pub use crate::trending::{
-        RateChange, TrendModel, TwoStepTrendModel, parallelogram_on_level_factor,
+        ExpenseProvisions, RateChange, RateIndicationPeriod, RateIndicationPeriodResult,
+        RateIndicationResult, RateIndicationSpec, TrendModel, TwoStepTrendModel,
+        calculate_rate_indication, parallelogram_on_level_factor,
         parallelogram_on_level_factor_with_term, policy_year_on_level_factor,
     };
     pub use crate::underwriting_risk::{
         AggregateLossDistribution, DistortionOperator, DistortionPricingResult, EltSummary,
         EulerAllocationResult, EventLossEntry, EventLossTable, FrequencyDistribution,
-        KrepsRiskLoadResult, MyersReadAllocationResult, RmkPricingResult,
+        KrepsRiskLoadResult, MyersReadAllocationResult, RmkPricingResult, ScenarioMatrix,
         convolve_independent_aggregates, discretize_severity_mean_preserving,
         distortion_price_aggregate, distortion_price_discrete, elt_aggregate_distribution,
         elt_occurrence_layer_expected_loss, elt_oep, elt_oep_pml, elt_summary,

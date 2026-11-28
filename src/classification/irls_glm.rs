@@ -224,9 +224,30 @@ impl GlmOptions {
     }
 }
 
-/// Fitted GLM result with coefficients, standard errors, dispersion, and deviance.
+/// Rate-filing relativity row derived from a log-link GLM coefficient (`exp(beta_j)`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RelativityRow {
+    /// Feature / rating-factor name (`"intercept"`, `"x1"`, etc. when unnamed).
+    pub name: String,
+    /// Log-scale GLM coefficient `beta_j`.
+    pub beta: f64,
+    /// Asymptotic standard error `SE(beta_j)`.
+    pub std_error: f64,
+    /// Multiplicative relativity `exp(beta_j)`.
+    pub relativity: f64,
+    /// Lower 95% Wald confidence bound `exp(beta_j - 1.959964 * SE)`.
+    pub ci_low_95: f64,
+    /// Upper 95% Wald confidence bound `exp(beta_j + 1.959964 * SE)`.
+    pub ci_high_95: f64,
+    /// Wald z-statistic `beta_j / SE(beta_j)` (`0.0` if `SE == 0.0`).
+    pub z_score: f64,
+}
+
+/// Fitted GLM result with family, coefficients, standard errors, dispersion, and deviance.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct GlmResult {
+    /// Error family and link function used to fit this GLM.
+    pub family: GlmFamily,
     /// Estimated regression coefficients (`beta`).
     pub coefficients: Vec<f64>,
     /// Asymptotic standard errors for coefficients: `sqrt(diag(phi * (X^T W X + Lambda)^-1))`.
@@ -240,6 +261,73 @@ pub struct GlmResult {
     pub df_residual: usize,
     /// Number of IRLS iterations until convergence.
     pub iterations: usize,
+}
+
+impl GlmResult {
+    /// Convert log-link GLM coefficients into multiplicative rating relativities (or odds
+    /// ratios for [`GlmFamily::Binomial`]) with 95% Wald confidence intervals and z-scores.
+    pub fn relativities(
+        &self,
+        feature_names: Option<&[&str]>,
+    ) -> Result<Vec<RelativityRow>, PricingError> {
+        const Z_95: f64 = 1.959_963_984_540_054;
+        if let Some(names) = feature_names
+            && names.len() != self.coefficients.len()
+        {
+            return Err(PricingError::DimensionMismatch(
+                "feature_names length must match number of GLM coefficients",
+            ));
+        }
+        let mut rows = Vec::with_capacity(self.coefficients.len());
+        for (j, (&beta, &se)) in self
+            .coefficients
+            .iter()
+            .zip(self.standard_errors.iter())
+            .enumerate()
+        {
+            let name = match feature_names {
+                Some(names) => names[j].to_owned(),
+                None if j == 0 => "intercept".to_owned(),
+                None => format!("x{j}"),
+            };
+            let z_score = if se > 0.0 { beta / se } else { 0.0 };
+            rows.push(RelativityRow {
+                name,
+                beta,
+                std_error: se,
+                relativity: beta.exp(),
+                ci_low_95: (beta - Z_95 * se).exp(),
+                ci_high_95: (beta + Z_95 * se).exp(),
+                z_score,
+            });
+        }
+        Ok(rows)
+    }
+
+    /// Construct a [`crate::classification::MultiplicativeRater`] using `exp(coefficients[0])`
+    /// as the base rate for log-link GLMs (with intercept in column `0`).
+    ///
+    /// Rejects [`GlmFamily::Binomial`] (logit link), where `exp(beta[0])` is baseline odds
+    /// rather than a multiplicative rate.
+    pub fn to_rater(&self) -> Result<crate::classification::MultiplicativeRater, PricingError> {
+        if matches!(self.family, GlmFamily::Binomial) {
+            return Err(PricingError::InvalidParameter(
+                "to_rater requires a log-link GLM; Binomial uses a logit link",
+            ));
+        }
+        let Some(&b0) = self.coefficients.first() else {
+            return Err(PricingError::EmptyInput(
+                "GLM result has no intercept coefficient",
+            ));
+        };
+        let base_rate = b0.exp();
+        if !base_rate.is_finite() || !(base_rate > 0.0) {
+            return Err(PricingError::InvalidParameter(
+                "exp(intercept) must be finite and positive",
+            ));
+        }
+        Ok(crate::classification::MultiplicativeRater::new(base_rate))
+    }
 }
 
 /// Validated row-major `n_samples × n_features` design matrix for GLM fitting and prediction.
@@ -766,6 +854,7 @@ pub fn fit_glm_irls_with_options(
     }
 
     Ok(GlmResult {
+        family,
         coefficients: beta,
         standard_errors,
         dispersion,

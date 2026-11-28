@@ -1,0 +1,46 @@
+{
+  "metadata": {
+    "hardware": "Intel Core i9-14900K",
+    "rustc": "1.97.0",
+    "commit": "4b0cadb",
+    "updated_at": "2026-11-27"
+  },
+  "entries": [
+    { "id": "classification/scoring_multiplicative_single", "label": "Multiplicative Rater (single policy)", "domain": "Classification" },
+    { "id": "credibility_and_trending/parallelogram_on_level_3_changes", "label": "Parallelogram On-Level (3 rate changes)", "domain": "Trending" },
+    { "id": "experience_and_retro/ncci_experience_mod", "label": "NCCI Experience Mod (ERP)", "domain": "Experience" },
+    { "id": "layers_and_reinsurance/ilf_mixed_exponential", "label": "ILF Mixed Exponential", "domain": "Layers" },
+    { "id": "layers_and_reinsurance/mbbefd_layer_exposure_factor", "label": "MBBEFD Layer Exposure Factor", "domain": "Layers" },
+    { "id": "layers_and_reinsurance/ilf_lognormal", "label": "ILF Lognormal", "domain": "Layers" },
+    { "id": "credibility_and_trending/buhlmann_straub_3x3", "label": "Bühlmann–Straub Credibility (`3×3`)", "domain": "Credibility" },
+    { "id": "experience_and_retro/solve_balanced_retro_plan_table_l", "label": "Balanced Retro Plan (Table L)", "domain": "Experience" },
+    { "id": "classification/bailey_simon_10x10", "label": "Bailey–Simon Minimum Bias (`10×10`)", "domain": "Classification" },
+    { "id": "experience_and_retro/solve_balanced_retro_plan", "label": "Balanced Retro Plan (Table M)", "domain": "Experience" },
+    { "id": "classification/glm_irls_poisson_3x2", "label": "Poisson IRLS GLM (`3×2`)", "domain": "Classification" },
+    { "id": "classification/weighted_gini_200", "label": "Weighted Gini Index (200 obs)", "domain": "Classification" },
+    { "id": "underwriting_risk/panjer_poisson_256", "label": "Panjer Recursion (Poisson, 256 pts)", "domain": "Capital" },
+    { "id": "classification/glm_irls_tweedie_ridge_3x2", "label": "Tweedie Ridge IRLS GLM (`3×2`)", "domain": "Classification" },
+    { "id": "underwriting_risk/elt_oep_pml_100", "label": "Cat ELT OEP / PML (100 events)", "domain": "Capital" },
+    { "id": "underwriting_risk/euler_tvar_500_scenarios", "label": "Euler TVaR Allocation (500 scenarios)", "domain": "Capital" },
+    { "id": "underwriting_risk/fft_aggregate_1024", "label": "Tilted FFT Aggregate (1,024 pts)", "domain": "Capital" }
+  ],
+  "benchmarks": {
+    "classification/scoring_multiplicative_single": { "median_ns": 1.55, "mean_ns": 1.55 },
+    "credibility_and_trending/parallelogram_on_level_3_changes": { "median_ns": 11.1, "mean_ns": 11.1 },
+    "experience_and_retro/ncci_experience_mod": { "median_ns": 11.1, "mean_ns": 11.1 },
+    "layers_and_reinsurance/ilf_mixed_exponential": { "median_ns": 37.9, "mean_ns": 37.9 },
+    "layers_and_reinsurance/mbbefd_layer_exposure_factor": { "median_ns": 43.2, "mean_ns": 43.2 },
+    "layers_and_reinsurance/ilf_lognormal": { "median_ns": 43.8, "mean_ns": 43.8 },
+    "credibility_and_trending/buhlmann_straub_3x3": { "median_ns": 45.6, "mean_ns": 45.6 },
+    "experience_and_retro/solve_balanced_retro_plan_table_l": { "median_ns": 490.0, "mean_ns": 490.0 },
+    "classification/bailey_simon_10x10": { "median_ns": 600.0, "mean_ns": 600.0 },
+    "experience_and_retro/solve_balanced_retro_plan": { "median_ns": 640.0, "mean_ns": 640.0 },
+    "classification/glm_irls_poisson_3x2": { "median_ns": 730.0, "mean_ns": 730.0 },
+    "classification/weighted_gini_200": { "median_ns": 860.0, "mean_ns": 860.0 },
+    "underwriting_risk/panjer_poisson_256": { "median_ns": 1770.0, "mean_ns": 1770.0 },
+    "classification/glm_irls_tweedie_ridge_3x2": { "median_ns": 3590.0, "mean_ns": 3590.0 },
+    "underwriting_risk/elt_oep_pml_100": { "median_ns": 11900.0, "mean_ns": 11900.0 },
+    "underwriting_risk/euler_tvar_500_scenarios": { "median_ns": 13000.0, "mean_ns": 13000.0 },
+    "underwriting_risk/fft_aggregate_1024": { "median_ns": 30700.0, "mean_ns": 30700.0 }
+  }
+}
