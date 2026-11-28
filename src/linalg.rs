@@ -103,6 +103,17 @@ pub fn solve_upper_transpose_into(
     Ok(())
 }
 
+/// Solve `A x = b` for symmetric positive-definite row-major `dim × dim` matrix `A`
+/// via its Cholesky factor (`L y = b`, then `L^T x = y`).
+pub fn cholesky_solve(a: &[f64], dim: usize, b: &[f64]) -> Result<Vec<f64>, PricingError> {
+    let l = cholesky_lower(a, dim)?;
+    let mut y = vec![0.0; dim];
+    let mut x = vec![0.0; dim];
+    solve_lower_into(&l, dim, b, &mut y)?;
+    solve_upper_transpose_into(&l, dim, &y, &mut x)?;
+    Ok(x)
+}
+
 /// Invert a symmetric positive-definite `dim × dim` matrix `A` using Cholesky factor `L`.
 pub fn cholesky_invert(a: &[f64], dim: usize) -> Result<Vec<f64>, PricingError> {
     let l = cholesky_lower(a, dim)?;
@@ -454,5 +465,13 @@ mod tests {
         let mut y = [0.0; 1];
         assert!(solve_lower_into(&[1.0, 0.0, 0.0, 1.0], 2, &[1.0, 2.0], &mut y).is_err());
         assert!(cholesky_invert(&[1.0, f64::NAN, f64::NAN, 1.0], 2).is_err());
+        assert!(cholesky_solve(&[1.0, 0.0, 0.0, 1.0], 2, &[1.0]).is_err());
+    }
+
+    #[test]
+    fn cholesky_solve_matches_hand_solution() {
+        // [4 2; 2 3] x = [2; 1] -> x = [0.5, 0].
+        let x = cholesky_solve(&[4.0, 2.0, 2.0, 3.0], 2, &[2.0, 1.0]).unwrap();
+        assert!((x[0] - 0.5).abs() < 1e-15 && x[1].abs() < 1e-15, "{x:?}");
     }
 }

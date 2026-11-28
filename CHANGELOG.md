@@ -16,6 +16,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **ALAE ILFs**: ALAE-Included under bivariate Lognormal uses an exact 1-D conditional-LEV reduction with adaptive Gauss–Kronrod (fixed 32×32 Gauss–Legendre had errors up to 3.8%). Power-Law documented as deterministic ALAE.
 - **Reinsurance**: pro-rata-as-to-amount-and-time reinstatements are exact under compound Poisson with uniform arrivals (Sundt 1991; Mata 2000); the flat 0.5 time factor (first reinstatement −16% at λ=1) is removed.
 - **MBBEFD**: continuous across b=1 and bg=1 via `expm1`/`ln_1p` (removed 1e-12 tolerance branches with 5e-5 cancellation error).
+- **Hurdle Poisson exposure**: zero part is now a complementary log-log GLM with the `ln E` offset, $P(Y>0)=1-e^{-E e^{x^T\gamma}}$ (previously logit without offset: $P(Y>0)$ exposure-independent, fitted means 4.1× off at low exposure).
+- **GLMM**: `fit_random_intercept_glmm` solves the joint conditional mode $(\hat\beta, \hat u)$ by penalized Newton (Schur complement; `glmer(nAGQ = 0)`) instead of alternating fixed/random updates that stopped ~0.15 nats from the optimum (τ²=9: b̂₀ = 2.51 vs ≈ −1.5); Σû = 0 holds exactly; scale-free Newton-decrement / relative-step stops; `ln τ²` search expands up to τ² = 1e4 instead of silently capping at e² ≈ 7.39.
+- **IRLS convergence** (`fit_glm_irls*`): R `glm.fit` relative-deviance stop $|D-D_{old}|/(|D|+0.1)<$ `tol` (|Δβ| ≤ `tol` kept as secondary); zero-claim levels and separated Binomial fits now return `Ok` (were `NonConvergence` even at 2000 iterations).
+- **`select_tweedie_power`**: a failing candidate no longer aborts the grid; failures are skipped and recorded, error only if none succeed.
+- **`double_lift_chart`**: never drops empty buckets silently; each bucket receives ≥ 1 observation.
 
 ### Changed (breaking)
 - YLT `oep_pml`/`aep_pml` default to the rank convention $T = N/r$ and error when $T > N$; `EmpiricalPmlConvention::LowerQuantile` restores the old behaviour.
@@ -27,6 +32,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `HachemeisterResult` adds `vhm_matrix_raw`; Hachemeister numbers change.
 - New fields: `TweediePowerSelection.best_dispersion`, `InformationCriteria.{log_likelihood, ml_dispersion}`, `converged` on `ZeroModifiedPoissonResult` and `RandomInterceptGlmmResult`; new variant `RegularizedGlmFamily::ZeroTruncatedPoisson`.
 - `glm_information_criteria` rejects `QuasiPoisson` (no likelihood); AIC/BIC values change.
+- New fields `GlmResult.separation_suspected`, `TweediePowerSelection.failed_powers`, `RandomInterceptGlmmResult.{tau_squared_at_lower_bound, tau_squared_at_upper_bound}`; new variant `RegularizedGlmFamily::BinomialCloglog`. `ZeroModifiedPoissonResult.zero_part` from `fit_hurdle_poisson` is a cloglog fit (predict with `BinomialCloglog` and `ln E` offsets); Hurdle fitted values change whenever offsets are supplied.
+- `fit_random_intercept_glmm`: `max_iter` now bounds Newton iterations per joint-mode solve; `iterations` counts profiled-likelihood (τ²) evaluations; `laplace_log_likelihood` includes $-\ln y!$; GLMM estimates change; rank-deficient `[1, x]` returns `SingularMatrix`.
+- `GlmOptions::tol` also drives the relative-deviance stop, so IRLS may stop earlier (results agree to within the tolerance).
+- `double_lift_chart` errors when `n_buckets > n` (previously returned fewer buckets).
 - `bspline_basis` errors outside $[t_d, t_{M-d}]$ and requires `knots.len() >= 2·degree + 2`; `batch_score_into` rejects NaN/negative inputs and min > max.
 
 ### Added

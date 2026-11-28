@@ -142,6 +142,11 @@ pub struct DoubleLiftBucket {
 /// Construct an exposure-weighted double-lift chart comparing incumbent (`pred_a`) against
 /// candidate (`pred_b`) pure-premium predictions across `n_buckets` quantiles sorted by `pred_b / pred_a`
 /// (CAS Monograph No. 5, Ch. 7).
+///
+/// Buckets are filled greedily to roughly equal exposure, but each bucket always receives at
+/// least one observation, so exactly `n_buckets` non-empty buckets are returned. Requesting
+/// more buckets than observations is an error ([`PricingError::InvalidParameter`]) rather
+/// than silently returning fewer buckets.
 pub fn double_lift_chart(
     exposures: &[f64],
     actual_losses: &[f64],
@@ -158,6 +163,11 @@ pub fn double_lift_chart(
     if actual_losses.len() != n || pred_a.len() != n || pred_b.len() != n {
         return Err(PricingError::DimensionMismatch(
             "exposures, actual_losses, pred_a, and pred_b must have equal length",
+        ));
+    }
+    if n_buckets > n {
+        return Err(PricingError::InvalidParameter(
+            "n_buckets must not exceed the number of observations",
         ));
     }
 
@@ -201,9 +211,11 @@ pub fn double_lift_chart(
             bucket_target
         };
 
+        // Observations that must be left so every later bucket gets at least one.
+        let reserve = n_buckets - b - 1;
         while idx < n {
             let k = order[idx];
-            if b_exp > 0.0 && b_exp + 0.5 * exposures[k] > target_cum {
+            if b_exp > 0.0 && (b_exp + 0.5 * exposures[k] > target_cum || n - idx <= reserve) {
                 break;
             }
             b_exp += exposures[k];
@@ -214,16 +226,15 @@ pub fn double_lift_chart(
             idx += 1;
         }
 
-        if b_exp > 0.0 {
-            buckets.push(DoubleLiftBucket {
-                bucket: b,
-                exposure: b_exp,
-                actual_pure_premium: b_actual / b_exp,
-                model_a_pure_premium: b_a / b_exp,
-                model_b_pure_premium: b_b / b_exp,
-                mean_ratio_b_to_a: b_ratio_sum / b_exp,
-            });
-        }
+        // `b_exp > 0`: every bucket takes at least one positive-exposure observation.
+        buckets.push(DoubleLiftBucket {
+            bucket: b,
+            exposure: b_exp,
+            actual_pure_premium: b_actual / b_exp,
+            model_a_pure_premium: b_a / b_exp,
+            model_b_pure_premium: b_b / b_exp,
+            mean_ratio_b_to_a: b_ratio_sum / b_exp,
+        });
     }
 
     Ok(buckets)
