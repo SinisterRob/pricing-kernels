@@ -148,13 +148,13 @@ pub mod prelude {
     pub use crate::underwriting_risk::{
         AGGREGATE_GRID_TOLERANCE, AggregateLossDistribution, DistortionOperator,
         DistortionPricingResult, EltSummary, EmpiricalPmlConvention, EulerAllocationResult,
-        EventLossEntry, EventLossTable, FrequencyDistribution, KrepsRiskLoadResult,
-        MyersReadAllocationResult, RmkPricingResult, ScenarioMatrix, YearLossTable, YltEvent,
-        convolve_independent_aggregates, discretize_severity_mean_preserving,
-        distortion_price_aggregate, distortion_price_discrete, elt_aggregate_distribution,
-        elt_occurrence_layer_expected_loss, elt_oep, elt_oep_pml, elt_summary,
-        euler_rvar_allocation, euler_sd_allocation, euler_tvar_allocation, fft_aggregate_loss,
-        kreps_marginal_risk_load, myers_read_allocation, panjer_recursion,
+        EventLossEntry, EventLossTable, FFT_ROUNDOFF_SAFETY_FACTOR, FrequencyDistribution,
+        KrepsRiskLoadResult, MyersReadAllocationResult, RmkPricingResult, ScenarioMatrix,
+        TVAR_MAX_LOST_TAIL_FRACTION, YearLossTable, YltEvent, convolve_independent_aggregates,
+        discretize_severity_mean_preserving, distortion_price_aggregate, distortion_price_discrete,
+        elt_aggregate_distribution, elt_occurrence_layer_expected_loss, elt_oep, elt_oep_pml,
+        elt_summary, euler_rvar_allocation, euler_sd_allocation, euler_tvar_allocation,
+        fft_aggregate_loss, kreps_marginal_risk_load, myers_read_allocation, panjer_recursion,
         rmk_risk_adjusted_pricing, sample_rvar, sample_tvar, sample_var, simulate_ylt_from_elt,
     };
 }
