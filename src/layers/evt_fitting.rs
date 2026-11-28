@@ -634,9 +634,10 @@ fn mom_initial_phi(family: EvtFamily, obs: &[SeverityObservation]) -> Vec<f64> {
             vec![alpha.ln(), 0.0, lambda.ln()]
         }
         EvtFamily::Weibull => {
-            const EULER_MASCHERONI: f64 = 0.577_215_664_901_532_9;
             let k = (std::f64::consts::PI / (6.0_f64.sqrt() * log_var.sqrt())).clamp(0.1, 20.0);
-            let lambda = (log_mean + EULER_MASCHERONI / k).exp().max(1e-6);
+            let lambda = (log_mean + std::f64::consts::EULER_GAMMA / k)
+                .exp()
+                .max(1e-6);
             vec![k.ln(), lambda.ln()]
         }
         EvtFamily::Gamma => {
