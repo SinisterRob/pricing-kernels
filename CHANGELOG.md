@@ -7,6 +7,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed (full actuarial review, 2026-11-27)
+- **Aggregate / cat (`underwriting_risk`)**: Panjer, FFT and multi-component convolution now detect grid truncation and circular wrap-around (`AGGREGATE_GRID_TOLERANCE` = 1e-6 lost mass / mean error) instead of returning silently biased distributions; `var`/`tvar` error beyond retained mass and TVaR ≥ VaR is guaranteed; ELT AEP rejects losses beyond the grid and uses mean-preserving Beta discretization (AEP mean = AAL to 1e-9); YLT Poisson sampler is exact for λ > 30 (normal approximation removed); floating-point quantile-rank errors fixed in `sample_var` and empirical PML.
+- **Credibility**: Hachemeister VHM is now an unbiased exposure-weighted moment estimator for unequal designs (was ~2× biased); collective trend is credibility-weighted $b = (\sum Z_i)^{-1}\sum Z_i\beta_i$. Classical standards validate inputs (tolerance 0 no longer yields NaN).
+- **Experience rating**: Table M rescales mean entry ratio to exactly 1 and renormalizes probabilities (φ(0)=1, ψ=φ+r−1 to 1e-12); Table L renormalizes probabilities; retro `expense_ratio` correctly documented as excluding premium taxes but including LCF-provided LAE.
+- **GLMs (`classification`)**: Hurdle count part is a true zero-truncated Poisson MLE (previously double-corrected, +58% bias); Tweedie power selection uses the exact Dunn & Smyth (2005) series density with profiled φ (saddlepoint removed); AIC/BIC use the full log-likelihood at ML dispersion; regularized GLMs no longer clamp η to ±20 (overflow bound 700, surfaced as `NonConvergence`/`OutOfBounds`); Hurdle/ZIP/GLMM validate lengths (no panic) and report `converged`; outer loop honours `options.tolerance`; B-spline endpoint/domain handling fixed; deviance-monitored IRLS step-halving (Marschner 2011).
+- **Severity / EVT (`layers`)**: Burr XII reparametrized in (ln α, ln γ, ln θ), scale-equivariant; GPD ξ > −1 (Smith 1985); boundary or NaN-SE fits report `converged = false`; `SolverOptions::tol` honoured everywhere; SEs cover every estimated field in declared order; weighted BIC/KS/AD with delayed-entry product-limit KS under left truncation.
+- **ALAE ILFs**: ALAE-Included under bivariate Lognormal uses an exact 1-D conditional-LEV reduction with adaptive Gauss–Kronrod (fixed 32×32 Gauss–Legendre had errors up to 3.8%). Power-Law documented as deterministic ALAE.
+- **Reinsurance**: pro-rata-as-to-amount-and-time reinstatements are exact under compound Poisson with uniform arrivals (Sundt 1991; Mata 2000); the flat 0.5 time factor (first reinstatement −16% at λ=1) is removed.
+- **MBBEFD**: continuous across b=1 and bg=1 via `expm1`/`ln_1p` (removed 1e-12 tolerance branches with 5e-5 cancellation error).
+
+### Changed (breaking)
+- YLT `oep_pml`/`aep_pml` default to the rank convention $T = N/r$ and error when $T > N$; `EmpiricalPmlConvention::LowerQuantile` restores the old behaviour.
+- `var`/`tvar`, Panjer, FFT, convolution and ELT-AEP return errors where they previously returned silently biased values.
+- `price_reinstatements` rejects `ReinstatementBasis::ProRataAmountAndTime`; use `price_reinstatements_compound_poisson` (exact) or `price_reinstatements_time_weighted` (explicit time factor). The 0.4.0 note "pro-rata by amount and by time" referred to the flat-0.5 approximation.
+- `AlaeDependenceModel::BivariateLognormal` rejects a severity that differs from its owned marginal (`indemnity_marginal()`).
+- Spliced EVT SE vectors have length 5 (body_weight included); new field `EvtFitResult.iterations`.
+- `TrendModel::new` and `ClassicalCredibility::from_confidence_and_tolerance` return `Result`; `TableMEngine.rows` / `TableLEngine.rows` are private (`rows()`, validated `from_rows`, validated serde).
+- `HachemeisterResult` adds `vhm_matrix_raw`; Hachemeister numbers change.
+- New fields: `TweediePowerSelection.best_dispersion`, `InformationCriteria.{log_likelihood, ml_dispersion}`, `converged` on `ZeroModifiedPoissonResult` and `RandomInterceptGlmmResult`; new variant `RegularizedGlmFamily::ZeroTruncatedPoisson`.
+- `glm_information_criteria` rejects `QuasiPoisson` (no likelihood); AIC/BIC values change.
+- `bspline_basis` errors outside $[t_d, t_{M-d}]$ and requires `knots.len() >= 2·degree + 2`; `batch_score_into` rejects NaN/negative inputs and min > max.
+
+### Added
+- `EmpiricalPmlConvention`, `oep_pml_with` / `aep_pml_with`, `AggregateLossDistribution::total_mass`, `AGGREGATE_GRID_TOLERANCE`.
+- NCCI Rule 2-B per-claim and multiple-claim (default 2×) accident limitations: `NcciAccidentLimitation`, `calculate_ncci_experience_mod_by_accident`.
+- Classical credibility pure-premium $n_0(1+CV^2)$ and severity $n_0 CV^2$ standards.
+- `tweedie_log_density` (Dunn & Smyth series), `MultiplicativeRater::{try_new, validate, try_score}`.
+- `AlaeDependenceModel::PowerLawLognormal { c, gamma, cv }`, `price_reinstatements_compound_poisson`, `price_reinstatements_time_weighted`, `compound_poisson_reinstatement_slices`, `ReinstatementSliceExpectations`.
+- Seeded (42069) regression suites: `tests/{underwriting_risk,classification,credibility_experience,layers}_regressions.rs` — brute-force convolution parity, Monte Carlo unbiasedness (Bühlmann–Straub, Hachemeister, Jewell), parameter recovery (Burr, GPD, Tweedie p, ZTP), hand-computed OEP/AEP/AggXL/Kreps/NCCI, and special-function reference values.
+
 ### Added
 - **Phase 1 & Phase 2 API ergonomics**:
   - Validated domain containers and fluent builders: `DesignMatrix`, `GlmFit`, `RatingTable`, `EventLossTable`, `LayerTower`, `CredibilityPanel` / `CredibilityGroup`, `ScenarioMatrix`, `TreatyExperience`, `SolverOptions`, `NcciErpSpec`, and declarative `tower!` / `rate_changes!` macros.

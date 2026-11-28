@@ -298,10 +298,14 @@ fn bench_layers_and_reinsurance(c: &mut Criterion) {
         sigma_a: 0.8,
         rho: 0.65,
     };
+    // The bivariate model owns its indemnity marginal; passing any other severity errors.
+    let biv_sev = biv_dep
+        .indemnity_marginal()
+        .expect("BivariateLognormal always owns an indemnity marginal");
     group.bench_function("alae_aware_ilf_bivariate_included", |b| {
         b.iter(|| {
             alae_aware_ilf(
-                black_box(&lognormal),
+                black_box(&biv_sev),
                 black_box(100_000.0),
                 black_box(500_000.0),
                 black_box(biv_dep),
