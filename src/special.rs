@@ -443,3 +443,88 @@ mod tests {
         assert!(regularized_incomplete_beta(f64::NAN, 2.0, 2.0).is_nan());
     }
 }
+
+#[cfg(test)]
+mod reference_value_tests {
+    use super::*;
+
+    const TOL: f64 = 1e-12;
+
+    fn assert_close(actual: f64, expected: f64, label: &str) {
+        assert!(
+            (actual - expected).abs() <= TOL,
+            "{label}: actual={actual:e}, expected={expected:e}, diff={:e}",
+            (actual - expected).abs()
+        );
+    }
+
+    #[test]
+    fn gamma_p_matches_closed_forms() {
+        for &x in &[0.01, 0.1, 0.5, 1.0, 1.5, 2.0, 3.0, 5.0, 10.0, 25.0] {
+            // P(1, x) = 1 - e^{-x}
+            assert_close(gamma_p(1.0, x), -(-x).exp_m1(), "P(1,x)");
+            // P(2, x) = 1 - e^{-x} (1 + x)
+            assert_close(gamma_p(2.0, x), 1.0 - (-x).exp() * (1.0 + x), "P(2,x)");
+            // P(3, x) = 1 - e^{-x} (1 + x + x^2 / 2)
+            assert_close(
+                gamma_p(3.0, x),
+                1.0 - (-x).exp() * (1.0 + x + 0.5 * x * x),
+                "P(3,x)",
+            );
+            // Complement identity P + Q = 1
+            assert_close(gamma_p(2.5, x) + gamma_q(2.5, x), 1.0, "P+Q");
+        }
+    }
+
+    #[test]
+    fn gamma_p_half_matches_tabulated_erf() {
+        // P(1/2, x) = erf(sqrt(x)); erf reference values to 16 significant digits.
+        let table = [
+            (0.25_f64, 0.520_499_877_813_046_5_f64), // erf(0.5)
+            (1.0, 0.842_700_792_949_714_9),          // erf(1)
+            (2.25, 0.966_105_146_475_310_7),         // erf(1.5)
+            (4.0, 0.995_322_265_018_952_7),          // erf(2)
+            (9.0, 0.999_977_909_503_001_4),          // erf(3)
+        ];
+        for (x, erf_sqrt_x) in table {
+            assert_close(gamma_p(0.5, x), erf_sqrt_x, "P(1/2,x)");
+        }
+    }
+
+    #[test]
+    fn incomplete_beta_matches_closed_forms() {
+        for &x in &[0.01, 0.1, 0.25, 0.5, 0.75, 0.9, 0.99] {
+            for &a in &[0.5, 1.0, 2.5, 7.0] {
+                // I_x(a, 1) = x^a
+                assert_close(regularized_incomplete_beta(x, a, 1.0), x.powf(a), "I(a,1)");
+                // I_x(1, b) = 1 - (1 - x)^b
+                assert_close(
+                    regularized_incomplete_beta(x, 1.0, a),
+                    1.0 - (1.0 - x).powf(a),
+                    "I(1,b)",
+                );
+                // Reflection I_x(a, b) = 1 - I_{1-x}(b, a)
+                assert_close(
+                    regularized_incomplete_beta(x, a, 3.0),
+                    1.0 - regularized_incomplete_beta(1.0 - x, 3.0, a),
+                    "reflection",
+                );
+            }
+            // I_x(2, 2) = 3x^2 - 2x^3
+            assert_close(
+                regularized_incomplete_beta(x, 2.0, 2.0),
+                3.0 * x * x - 2.0 * x * x * x,
+                "I(2,2)",
+            );
+            // I_x(1/2, 1/2) = (2 / pi) asin(sqrt x)
+            assert_close(
+                regularized_incomplete_beta(x, 0.5, 0.5),
+                std::f64::consts::FRAC_2_PI * x.sqrt().asin(),
+                "I(1/2,1/2)",
+            );
+        }
+        for &a in &[0.5, 3.0, 40.0] {
+            assert_close(regularized_incomplete_beta(0.5, a, a), 0.5, "I_0.5(a,a)");
+        }
+    }
+}
