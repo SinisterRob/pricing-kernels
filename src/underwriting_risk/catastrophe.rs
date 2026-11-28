@@ -7,7 +7,11 @@
 //! - S. J. Mildenhall & J. A. Major, *Introduction to Capital Modeling and Portfolio Management*,
 //!   CAS Monograph No. 15.
 
-use super::aggregate::{AggregateLossDistribution, FrequencyDistribution, fft_aggregate_loss};
+use super::aggregate::{
+    AggregateLossDistribution, FrequencyDistribution, fft_aggregate_loss,
+    mean_preserving_pmf_from_lev,
+};
+use super::capital::lower_quantile_index;
 use crate::error::PricingError;
 use crate::layers::CommercialLayer;
 use crate::special::regularized_incomplete_beta;
@@ -112,6 +116,15 @@ pub struct EventLossEntry {
 
 impl EventLossEntry {
     /// Total conditional event severity standard deviation `sqrt(sd_indep^2 + sd_corr^2)`.
+    ///
+    /// **Assumption:** the independent and correlated components are combined in quadrature,
+    /// i.e. treated as uncorrelated variance components of the single-event severity. Some
+    /// vendor ELT formats instead define the total as the linear sum `sd_indep + sd_corr`
+    /// (the correlated component being perfectly correlated across the locations that make up
+    /// the event loss). The crate does not adopt that convention without a cited source; if your
+    /// ELT reports a precombined linear total, pass it as `std_dev_indep` with
+    /// `std_dev_corr = 0.0`. This choice drives the Beta fit, [`elt_summary`] variance, OEP/AEP,
+    /// and [`simulate_ylt_from_elt`].
     #[inline]
     pub fn total_std_dev(&self) -> f64 {
         self.std_dev_indep.hypot(self.std_dev_corr)
@@ -348,8 +361,31 @@ pub fn elt_occurrence_layer_expected_loss(
     Ok(total_ceded)
 }
 
+/// Limited expected value `E[X ^ d]` of a Beta event severity `X = M * U`, `U ~ Beta(a, b)`:
+/// `E[X ^ d] = M * (mu0 * I_u(a + 1, b) + u * (1 - I_u(a, b)))` with `u = d / M`, `mu0 = a / (a + b)`.
+fn beta_scaled_lev(entry: &EventLossEntry, alpha: f64, beta: f64, d: f64) -> f64 {
+    if d <= 0.0 {
+        return 0.0;
+    }
+    if d >= entry.max_loss {
+        return entry.mean_loss;
+    }
+    let u = d / entry.max_loss;
+    let mu0 = alpha / (alpha + beta);
+    let partial_mean = mu0 * regularized_incomplete_beta(u, alpha + 1.0, beta);
+    let survival = 1.0 - regularized_incomplete_beta(u, alpha, beta);
+    entry.max_loss * (partial_mean + u * survival)
+}
+
 /// Build the exact compound-Poisson Aggregate Exceedance Probability (AEP) distribution
 /// from an Event Loss Table via FFT convolution (`step` = grid spacing, `fft_size` = power of 2).
+///
+/// Event severities are discretized mean-preservingly (point masses split linearly between
+/// bracketing grid points; Beta severities via the Klugman–Panjer–Willmot limited-expected-value
+/// method), so the discrete severity mixture reproduces the ELT AAL exactly. Returns
+/// [`PricingError::OutOfBounds`] if any event's `max_loss` (Beta) or `mean_loss` (point mass)
+/// lies beyond the grid `(fft_size - 1) * step`, and propagates the FFT aliasing guard of
+/// [`fft_aggregate_loss`].
 pub fn elt_aggregate_distribution(
     entries: &[EventLossEntry],
     step: f64,
@@ -373,34 +409,46 @@ pub fn elt_aggregate_distribution(
         ));
     }
 
+    let last_bin = fft_size - 1;
     let mut mix_pmf = vec![0.0; fft_size];
     for entry in entries {
         if entry.annual_rate == 0.0 {
             continue;
         }
         let weight = entry.annual_rate / summary.total_annual_rate;
-        let params = entry.beta_params()?;
-        if params.is_none() {
-            let exact_bin = entry.mean_loss / step;
-            let lo = (exact_bin.floor() as usize).min(fft_size - 1);
-            let hi = (lo + 1).min(fft_size - 1);
-            if lo == hi {
-                mix_pmf[lo] += weight;
-            } else {
-                let frac = (exact_bin - (lo as f64)).clamp(0.0, 1.0);
+        match entry.beta_params()? {
+            None => {
+                // Point mass: linear split between the two bracketing grid points (mean-preserving).
+                let exact_bin = entry.mean_loss / step;
+                let lo_f = exact_bin.floor();
+                let frac = exact_bin - lo_f;
+                if lo_f > last_bin as f64 || (frac > 0.0 && lo_f >= last_bin as f64) {
+                    return Err(PricingError::OutOfBounds(
+                        "ELT event loss exceeds severity grid (fft_size - 1) * step; increase step or fft_size",
+                    ));
+                }
+                let lo = lo_f as usize;
                 mix_pmf[lo] += weight * (1.0 - frac);
-                mix_pmf[hi] += weight * frac;
+                if frac > 0.0 {
+                    mix_pmf[lo + 1] += weight * frac;
+                }
             }
-        } else {
-            let max_bin = ((entry.max_loss / step).ceil() as usize).min(fft_size - 1);
-            let mut prev_cdf = 0.0;
-            for k in 0..max_bin {
-                let upper = ((k as f64) + 0.5) * step;
-                let cdf = 1.0 - entry.survival_with_params(upper, params);
-                mix_pmf[k] += weight * (cdf - prev_cdf).max(0.0);
-                prev_cdf = cdf;
+            Some((alpha, beta)) => {
+                let max_bin_f = (entry.max_loss / step).ceil();
+                if max_bin_f > last_bin as f64 {
+                    return Err(PricingError::OutOfBounds(
+                        "ELT event max_loss exceeds severity grid (fft_size - 1) * step; increase step or fft_size",
+                    ));
+                }
+                let max_bin = max_bin_f as usize;
+                let lev: Vec<f64> = (0..=max_bin)
+                    .map(|j| beta_scaled_lev(entry, alpha, beta, (j as f64) * step))
+                    .collect();
+                let sev_pmf = mean_preserving_pmf_from_lev(&lev, step);
+                for (slot, &p) in mix_pmf.iter_mut().zip(sev_pmf.iter()) {
+                    *slot += weight * p;
+                }
             }
-            mix_pmf[max_bin] += weight * (1.0 - prev_cdf).max(0.0);
         }
     }
 
@@ -521,14 +569,34 @@ impl YearLossTable {
         self.exceedance_prob(&self.annual_aggregate_losses(), threshold)
     }
 
-    /// Empirical Occurrence PML at `return_period > 1.0` years (e.g., `100.0` for 1-in-100).
+    /// Empirical Occurrence PML at `return_period > 1.0` years (e.g., `100.0` for 1-in-100)
+    /// under the default [`EmpiricalPmlConvention::RankReturnPeriod`] convention.
     pub fn oep_pml(&self, return_period: f64) -> Result<f64, PricingError> {
-        empirical_pml(self.annual_occurrence_losses(), return_period)
+        self.oep_pml_with(return_period, EmpiricalPmlConvention::default())
     }
 
-    /// Empirical Aggregate PML at `return_period > 1.0` years (e.g., `100.0` for 1-in-100).
+    /// Empirical Aggregate PML at `return_period > 1.0` years (e.g., `100.0` for 1-in-100)
+    /// under the default [`EmpiricalPmlConvention::RankReturnPeriod`] convention.
     pub fn aep_pml(&self, return_period: f64) -> Result<f64, PricingError> {
-        empirical_pml(self.annual_aggregate_losses(), return_period)
+        self.aep_pml_with(return_period, EmpiricalPmlConvention::default())
+    }
+
+    /// Empirical Occurrence PML at `return_period` under an explicit [`EmpiricalPmlConvention`].
+    pub fn oep_pml_with(
+        &self,
+        return_period: f64,
+        convention: EmpiricalPmlConvention,
+    ) -> Result<f64, PricingError> {
+        empirical_pml(self.annual_occurrence_losses(), return_period, convention)
+    }
+
+    /// Empirical Aggregate PML at `return_period` under an explicit [`EmpiricalPmlConvention`].
+    pub fn aep_pml_with(
+        &self,
+        return_period: f64,
+        convention: EmpiricalPmlConvention,
+    ) -> Result<f64, PricingError> {
+        empirical_pml(self.annual_aggregate_losses(), return_period, convention)
     }
 
     /// Expected annual ceded loss for a combined per-occurrence + aggregate excess-of-loss
@@ -575,18 +643,59 @@ impl YearLossTable {
     }
 }
 
-fn empirical_pml(mut annual_losses: Vec<f64>, return_period: f64) -> Result<f64, PricingError> {
+/// Convention mapping a return period `T` to an order statistic of `N` simulated annual losses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum EmpiricalPmlConvention {
+    /// Standard catastrophe-model rank convention (default): the loss of rank `r`
+    /// (`r = 1` is the largest of `N` years) has empirical return period `N / r`.
+    /// `PML(T)` is the loss at rank `r = floor(N / T)`, i.e. the loss whose empirical return
+    /// period is the smallest one `>= T` (exact when `N / T` is an integer; conservative
+    /// otherwise, no interpolation). With `N = 100` years of losses `1..=100`,
+    /// `PML(100) = 100` and `PML(50) = 99`. Returns [`PricingError::OutOfBounds`] when
+    /// `T > N` (the return period is beyond the simulated horizon).
+    #[default]
+    RankReturnPeriod,
+    /// Lower empirical quantile `inf { x : F_N(x) >= 1 - 1 / T }`, the order statistic
+    /// `ceil(N (1 - 1 / T))` in ascending order. When `N / T = r` is an integer this is the
+    /// loss of rank `r + 1` (e.g. `PML(100) = 99` for losses `1..=100`), one rank below
+    /// [`Self::RankReturnPeriod`]. Defined for every `T > 1`.
+    LowerQuantile,
+}
+
+/// Round-off allowance, in units of `f64::EPSILON` relative to `N / T`, when computing the
+/// rank `floor(N / T)` so that exactly representable ratios are not floored one rank low.
+const PML_RANK_ULPS: f64 = 4.0;
+
+fn empirical_pml(
+    mut annual_losses: Vec<f64>,
+    return_period: f64,
+    convention: EmpiricalPmlConvention,
+) -> Result<f64, PricingError> {
     if !return_period.is_finite() || !(return_period > 1.0) {
         return Err(PricingError::InvalidParameter(
             "return_period must be finite and > 1.0",
         ));
     }
     let n = annual_losses.len();
+    if n == 0 {
+        return Err(PricingError::EmptyInput(
+            "YLT must contain at least one year",
+        ));
+    }
     annual_losses.sort_by(f64::total_cmp);
-    let alpha = 1.0 - 1.0 / return_period;
-    let idx = ((alpha * (n as f64) - 1e-15).ceil() as usize)
-        .saturating_sub(1)
-        .min(n - 1);
+    let idx = match convention {
+        EmpiricalPmlConvention::RankReturnPeriod => {
+            let ratio = (n as f64) / return_period;
+            let rank = (ratio + ratio * PML_RANK_ULPS * f64::EPSILON).floor() as usize;
+            if rank == 0 {
+                return Err(PricingError::OutOfBounds(
+                    "return_period exceeds the YLT simulation horizon n_years",
+                ));
+            }
+            n - rank.min(n)
+        }
+        EmpiricalPmlConvention::LowerQuantile => lower_quantile_index(n, 1.0 - 1.0 / return_period),
+    };
     Ok(annual_losses[idx])
 }
 
@@ -660,29 +769,48 @@ impl Xoshiro256StarStar {
         if x + y > 0.0 { x / (x + y) } else { 0.5 }
     }
 
+    /// Knuth multiplicative Poisson draw, exact for `0 < lambda <= POISSON_KNUTH_MAX_LAMBDA`.
+    fn sample_poisson_knuth(&mut self, lambda: f64) -> u32 {
+        let l = (-lambda).exp();
+        let mut k = 0u32;
+        let mut p = 1.0;
+        loop {
+            p *= self.next_f64();
+            if p <= l {
+                return k;
+            }
+            k = k.saturating_add(1);
+        }
+    }
+
+    /// Exact Poisson draw for any `lambda >= 0`.
+    ///
+    /// `lambda` is split into `m = ceil(lambda / POISSON_KNUTH_MAX_LAMBDA)` equal chunks and
+    /// the independent Knuth draws are summed; by Poisson additivity
+    /// (`sum_i Poisson(lambda / m) ~ Poisson(lambda)`) the result is exact in distribution.
+    /// Chosen over transformed-rejection samplers (e.g. Hörmann 1993 PTRS) for simplicity and
+    /// auditability: cost is `O(lambda)` uniforms per draw, negligible at catastrophe annual
+    /// event rates.
     fn sample_poisson(&mut self, lambda: f64) -> u32 {
-        if lambda <= 0.0 {
+        if !(lambda > 0.0) || !lambda.is_finite() {
             return 0;
         }
-        if lambda < 30.0 {
-            let l = (-lambda).exp();
-            let mut k = 0u32;
-            let mut p = 1.0;
-            loop {
-                k += 1;
-                p *= self.next_f64().max(1e-300);
-                if p <= l {
-                    return k - 1;
-                }
-            }
+        let chunks = (lambda / POISSON_KNUTH_MAX_LAMBDA).ceil().max(1.0);
+        let chunk_lambda = lambda / chunks;
+        let mut total = 0u32;
+        let mut remaining = chunks;
+        while remaining > 0.0 {
+            total = total.saturating_add(self.sample_poisson_knuth(chunk_lambda));
+            remaining -= 1.0;
         }
-        // Normal approximation for high annual rate (> 30 events/yr).
-        let draw = (lambda + lambda.sqrt() * self.next_std_normal())
-            .round()
-            .max(0.0);
-        draw as u32
+        total
     }
 }
+
+/// Largest Poisson mean drawn directly by Knuth's multiplicative method. Keeps
+/// `exp(-lambda) >= exp(-30) ~ 9.4e-14`, far above `f64` underflow and well resolved by the
+/// 53-bit uniform product, so each chunk draw is exact to `f64` precision.
+const POISSON_KNUTH_MAX_LAMBDA: f64 = 30.0;
 
 /// Deterministically simulate a [`YearLossTable`] of `n_years` simulation years from a
 /// catastrophe Event Loss Table using a seeded `Xoshiro256**` PRNG (recommended default
@@ -746,4 +874,63 @@ pub fn simulate_ylt_from_elt(
     }
 
     Ok(YearLossTable { n_years, events })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Seeded Monte Carlo check that the chunked-Knuth sampler reproduces the exact
+    /// Poisson(40) mean, variance, skewness `1/sqrt(40)`, and upper tail `P(N >= 55)`.
+    /// The former rounded-normal approximation (skewness ~0) fails the skewness bound.
+    #[test]
+    fn poisson_sampler_matches_exact_moments_above_knuth_threshold() {
+        const SEED: u64 = 42069;
+        const N_DRAWS: usize = 200_000;
+        let lambda = 40.0_f64;
+        let mut rng = Xoshiro256StarStar::from_seed(SEED);
+        let draws: Vec<f64> = (0..N_DRAWS)
+            .map(|_| f64::from(rng.sample_poisson(lambda)))
+            .collect();
+        let n = N_DRAWS as f64;
+        let mean = draws.iter().sum::<f64>() / n;
+        let m2 = draws.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / n;
+        let m3 = draws.iter().map(|x| (x - mean).powi(3)).sum::<f64>() / n;
+        let skew = m3 / m2.powf(1.5);
+
+        // Standard errors: mean sqrt(40/n) ~ 0.014; var ~ 40 sqrt(2/n) ~ 0.13; skew ~ sqrt(6/n) ~ 0.0055.
+        assert!((mean - lambda).abs() < 0.06, "mean={mean}");
+        assert!((m2 - lambda).abs() < 0.6, "var={m2}");
+        let exact_skew = 1.0 / lambda.sqrt();
+        assert!(
+            (skew - exact_skew).abs() < 0.025,
+            "skew={skew}, exact={exact_skew}"
+        );
+
+        // Exact upper tail P(N >= 55) from the Poisson pmf recursion.
+        let mut pmf = (-lambda).exp();
+        let mut cdf_54 = pmf;
+        for k in 1..55 {
+            pmf *= lambda / f64::from(k);
+            cdf_54 += pmf;
+        }
+        let exact_tail = 1.0 - cdf_54;
+        let emp_tail = draws.iter().filter(|&&x| x >= 55.0).count() as f64 / n;
+        let se = (exact_tail * (1.0 - exact_tail) / n).sqrt();
+        assert!(
+            (emp_tail - exact_tail).abs() < 5.0 * se,
+            "tail emp={emp_tail}, exact={exact_tail}"
+        );
+    }
+
+    #[test]
+    fn poisson_sampler_is_deterministic_and_handles_degenerate_rates() {
+        let mut a = Xoshiro256StarStar::from_seed(42069);
+        let mut b = Xoshiro256StarStar::from_seed(42069);
+        for &lambda in &[0.5, 29.9, 30.0, 75.0, 400.0] {
+            assert_eq!(a.sample_poisson(lambda), b.sample_poisson(lambda));
+        }
+        assert_eq!(a.sample_poisson(0.0), 0);
+        assert_eq!(a.sample_poisson(f64::NAN), 0);
+    }
 }

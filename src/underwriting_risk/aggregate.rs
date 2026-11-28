@@ -16,6 +16,15 @@ use crate::layers::SeverityDistribution;
 use serde::{Deserialize, Serialize};
 use std::f64::consts::TAU;
 
+/// Maximum probability mass (and maximum relative mean error) an aggregate grid may lose to
+/// truncation (Panjer) or circular wrap-around aliasing (FFT) before the kernel returns
+/// [`PricingError::OutOfBounds`] instead of a silently biased distribution.
+///
+/// `1e-6` keeps the lost mass two orders of magnitude below a `1 - 0.9999` (1-in-10,000)
+/// tail probability, so every `VaR` / `TVaR` level used in practice is supported by
+/// retained grid mass. Increase `n_steps` / `fft_size` (or `step`) if this guard fires.
+pub const AGGREGATE_GRID_TOLERANCE: f64 = 1e-6;
+
 /// Claim-count frequency distribution in the Panjer `(a, b, 0)` class.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub enum FrequencyDistribution {
@@ -197,6 +206,19 @@ impl AggregateLossDistribution {
         })
     }
 
+    /// Total probability mass `sum_k g_k` retained on the grid (`1.0` for a complete distribution).
+    ///
+    /// `1.0 - total_mass()` is the mass lost to grid truncation beyond `(pmf.len() - 1) * step`.
+    pub fn total_mass(&self) -> f64 {
+        self.pmf.iter().sum()
+    }
+
+    /// Recursive-summation round-off bound (`n * f64::EPSILON`) used when comparing the
+    /// accumulated CDF against a confidence level.
+    fn cdf_round_off(&self) -> f64 {
+        (self.pmf.len() as f64) * f64::EPSILON
+    }
+
     /// Exceedance probability `P(S > x)` evaluated on the discrete grid.
     pub fn exceedance_probability(&self, x: f64) -> Result<f64, PricingError> {
         if !x.is_finite() {
@@ -215,43 +237,66 @@ impl AggregateLossDistribution {
     }
 
     /// Value-at-Risk `VaR_alpha(S) = inf { x : F(x) >= alpha }` for `alpha in (0, 1)`.
+    ///
+    /// Returns [`PricingError::OutOfBounds`] when `alpha` exceeds the probability mass retained
+    /// on the grid (the quantile lies beyond `(pmf.len() - 1) * step` and is not representable).
     pub fn var(&self, alpha: f64) -> Result<f64, PricingError> {
         if !alpha.is_finite() || !(alpha > 0.0) || !(alpha < 1.0) {
             return Err(PricingError::InvalidParameter(
                 "confidence level alpha must be finite and in (0, 1)",
             ));
         }
+        let threshold = alpha - self.cdf_round_off();
         let mut cdf = 0.0;
         for (k, &p) in self.pmf.iter().enumerate() {
             cdf += p;
-            if cdf >= alpha - 1e-15 {
+            if cdf >= threshold {
                 return Ok((k as f64) * self.step);
             }
         }
-        Ok(((self.pmf.len() - 1) as f64) * self.step)
+        Err(PricingError::OutOfBounds(
+            "VaR confidence level exceeds the probability mass retained on the aggregate grid",
+        ))
     }
 
     /// Coherent Tail Value-at-Risk `TVaR_alpha(S) = (1 / (1 - alpha)) * integral_alpha^1 VaR_u(S) du`.
+    ///
+    /// Any mass missing from the grid lies above every grid point, i.e. inside every tail, so
+    /// `TVaR` is only computable when `|1 - total_mass()| <= AGGREGATE_GRID_TOLERANCE`; otherwise
+    /// [`PricingError::OutOfBounds`] is returned. The tail integral is normalized by the retained
+    /// tail mass, so the result is a probability-weighted average of grid points at or above
+    /// `VaR_alpha` and `TVaR_alpha >= VaR_alpha` holds by construction.
     pub fn tvar(&self, alpha: f64) -> Result<f64, PricingError> {
         if !alpha.is_finite() || !(alpha > 0.0) || !(alpha < 1.0) {
             return Err(PricingError::InvalidParameter(
                 "confidence level alpha must be finite and in (0, 1)",
             ));
         }
-        let tail = 1.0 - alpha;
+        if (1.0 - self.total_mass()).abs() > AGGREGATE_GRID_TOLERANCE {
+            return Err(PricingError::OutOfBounds(
+                "TVaR undefined: aggregate grid total mass differs from 1 by more than AGGREGATE_GRID_TOLERANCE",
+            ));
+        }
         let mut cdf = 0.0;
         let mut weighted_sum = 0.0;
+        let mut tail_mass = 0.0;
         for (k, &p) in self.pmf.iter().enumerate() {
             let next_cdf = cdf + p;
             if next_cdf > alpha {
                 let contrib = next_cdf.min(1.0) - cdf.max(alpha);
                 if contrib > 0.0 {
                     weighted_sum += contrib * (k as f64) * self.step;
+                    tail_mass += contrib;
                 }
             }
             cdf = next_cdf;
         }
-        Ok(weighted_sum / tail)
+        if !(tail_mass > 0.0) {
+            return Err(PricingError::OutOfBounds(
+                "TVaR confidence level exceeds the probability mass retained on the aggregate grid",
+            ));
+        }
+        Ok(weighted_sum / tail_mass)
     }
 
     /// Expected aggregate loss ceded to an aggregate stop-loss layer `limit xs attachment`.
@@ -297,15 +342,60 @@ pub fn discretize_severity_mean_preserving(
     for j in 1..n_bins {
         lev.push(dist.limited_expected_value((j as f64) * step)?);
     }
+    Ok(mean_preserving_pmf_from_lev(&lev, step))
+}
 
+/// Klugman–Panjer–Willmot mean-preserving (local moment matching, order 1) PMF from limited
+/// expected values `lev[j] = E[X ^ (j * step)]` (`lev[0] = 0`).
+///
+/// `f_0 = 1 - lev[1] / h`, `f_j = (2 lev[j] - lev[j-1] - lev[j+1]) / h`, and the remaining tail
+/// mass is folded into the last bin, so `sum_j j h f_j = lev[n - 1]` telescopes exactly.
+pub(crate) fn mean_preserving_pmf_from_lev(lev: &[f64], step: f64) -> Vec<f64> {
+    let n_bins = lev.len();
     let mut pmf = vec![0.0; n_bins];
+    if n_bins < 2 {
+        if let Some(first) = pmf.first_mut() {
+            *first = 1.0;
+        }
+        return pmf;
+    }
     pmf[0] = (1.0 - lev[1] / step).clamp(0.0, 1.0);
     for j in 1..(n_bins - 1) {
         pmf[j] = ((2.0 * lev[j] - lev[j - 1] - lev[j + 1]) / step).max(0.0);
     }
     let prefix_sum: f64 = pmf[..(n_bins - 1)].iter().sum();
     pmf[n_bins - 1] = (1.0 - prefix_sum).max(0.0);
-    Ok(pmf)
+    pmf
+}
+
+/// Exact mean `E[X] = sum_k k h f_k` of a discrete severity PMF on grid spacing `step`.
+fn severity_grid_mean(severity_pmf: &[f64], step: f64) -> f64 {
+    severity_pmf
+        .iter()
+        .enumerate()
+        .map(|(k, &p)| (k as f64) * step * p)
+        .sum()
+}
+
+/// Reject a discretized aggregate whose retained mass or mean shows truncation / aliasing.
+///
+/// For a finite-support severity PMF the compound mean `E[S] = E[N] E[X]` is exact, so a
+/// relative mean error beyond [`AGGREGATE_GRID_TOLERANCE`] detects mass truncated off the grid
+/// or wrapped around to low indices by circular convolution, even when total mass is `1`.
+fn check_grid_adequacy(
+    dist: &AggregateLossDistribution,
+    expected_mean: f64,
+    mass_msg: &'static str,
+    mean_msg: &'static str,
+) -> Result<(), PricingError> {
+    if (1.0 - dist.total_mass()).abs() > AGGREGATE_GRID_TOLERANCE {
+        return Err(PricingError::OutOfBounds(mass_msg));
+    }
+    let scale = expected_mean.abs().max(dist.step);
+    if (dist.mean - expected_mean).abs() > AGGREGATE_GRID_TOLERANCE * scale {
+        return Err(PricingError::OutOfBounds(mean_msg));
+    }
+    Ok(())
 }
 
 fn validate_severity_pmf(severity_pmf: &[f64]) -> Result<(), PricingError> {
@@ -330,6 +420,11 @@ fn validate_severity_pmf(severity_pmf: &[f64]) -> Result<(), PricingError> {
 }
 
 /// Exact Panjer `(a, b, 0)` compound aggregate loss recursion (Panjer 1981).
+///
+/// The recursion is exact on grid points `0..n_steps`; mass beyond `(n_steps - 1) * step` is
+/// truncated. Returns [`PricingError::OutOfBounds`] if the lost mass `1 - sum g_k` or the
+/// relative mean deficit versus `E[N] E[X]` exceeds [`AGGREGATE_GRID_TOLERANCE`] (this also
+/// fires when `g_0 = P_N(f_0)` underflows to zero for very large expected claim counts).
 pub fn panjer_recursion(
     freq: FrequencyDistribution,
     severity_pmf: &[f64],
@@ -373,7 +468,14 @@ pub fn panjer_recursion(
         g[x] = (acc / denom).max(0.0);
     }
 
-    AggregateLossDistribution::from_pmf(step, g)
+    let dist = AggregateLossDistribution::from_pmf(step, g)?;
+    check_grid_adequacy(
+        &dist,
+        freq.mean()? * severity_grid_mean(severity_pmf, step),
+        "Panjer grid truncation: lost probability mass exceeds AGGREGATE_GRID_TOLERANCE; increase n_steps",
+        "Panjer grid truncation: aggregate mean deficit exceeds AGGREGATE_GRID_TOLERANCE; increase n_steps",
+    )?;
+    Ok(dist)
 }
 
 /// Pure-Rust in-place iterative radix-2 Cooley–Tukey FFT (`inverse = false` for DFT, `true` for IDFT).
@@ -451,6 +553,11 @@ pub(crate) fn radix2_fft(
 /// - `fft_size`: Must be a power of two `>= severity_pmf.len()`.
 /// - `tilt`: Optional exponential tilt `theta >= 0` (`f_tilde_k = exp(-theta * k) * f_k`)
 ///   to suppress circular wrap-around aliasing. Use `None` for no tilting (`theta = 0`).
+///
+/// Returns [`PricingError::OutOfBounds`] when wrap-around aliasing is detected: total mass
+/// differs from `1` (tilted case) or the PMF mean differs from the exact compound mean
+/// `E[N] E[X]` by more than [`AGGREGATE_GRID_TOLERANCE`] relative (untilted aliasing conserves
+/// mass but moves it to low indices, so the mean check is what detects it).
 pub fn fft_aggregate_loss(
     freq: FrequencyDistribution,
     severity_pmf: &[f64],
@@ -511,11 +618,28 @@ pub fn fft_aggregate_loss(
         *val = untilted.max(0.0);
     }
 
-    AggregateLossDistribution::from_pmf(step, re)
+    let dist = AggregateLossDistribution::from_pmf(step, re)?;
+    check_grid_adequacy(
+        &dist,
+        freq.mean()? * severity_grid_mean(severity_pmf, step),
+        "FFT aliasing: aggregate grid mass differs from 1 by more than AGGREGATE_GRID_TOLERANCE; increase fft_size or tilt",
+        "FFT aliasing: aggregate mean deviates from E[N]E[X] by more than AGGREGATE_GRID_TOLERANCE; increase fft_size or tilt",
+    )?;
+    Ok(dist)
+}
+
+/// PMF length after trimming trailing exact-zero masses (at least `1`).
+fn effective_support_len(pmf: &[f64]) -> usize {
+    pmf.iter().rposition(|&p| p > 0.0).map_or(1, |i| i + 1)
 }
 
 /// Convolve multiple independent aggregate loss distributions sharing the same grid `step`
 /// (e.g. combining attritional + large + catastrophe prospective underwriting risk) via FFT.
+///
+/// For the circular convolution to equal the linear convolution (no wrap-around), `fft_size`
+/// must be at least the combined support `sum_i (len_i - 1) + 1`, where `len_i` is the
+/// component PMF length after trimming trailing zero masses; otherwise
+/// [`PricingError::InvalidParameter`] is returned.
 pub fn convolve_independent_aggregates(
     components: &[&AggregateLossDistribution],
     fft_size: usize,
@@ -536,15 +660,11 @@ pub fn convolve_independent_aggregates(
             "aggregate component grid step must be finite and positive",
         ));
     }
+    let mut combined_support = 1usize;
     for comp in components {
         if !comp.step.is_finite() || (comp.step - step).abs() > 1e-12 * step.max(1.0) {
             return Err(PricingError::DimensionMismatch(
                 "all aggregate components must share the same grid step",
-            ));
-        }
-        if comp.pmf.len() > fft_size {
-            return Err(PricingError::InvalidParameter(
-                "fft_size must be >= every component pmf length",
             ));
         }
         if comp.pmf.iter().any(|&p| !p.is_finite() || p < 0.0) {
@@ -552,6 +672,12 @@ pub fn convolve_independent_aggregates(
                 "aggregate component pmf entries must be finite and non-negative",
             ));
         }
+        combined_support = combined_support.saturating_add(effective_support_len(&comp.pmf) - 1);
+    }
+    if combined_support > fft_size {
+        return Err(PricingError::InvalidParameter(
+            "fft_size must be >= combined support sum_i (len_i - 1) + 1 to avoid circular wrap-around",
+        ));
     }
 
     let mut prod_re = vec![1.0; fft_size];
@@ -562,7 +688,8 @@ pub fn convolve_independent_aggregates(
     for comp in components {
         buf_re.fill(0.0);
         buf_im.fill(0.0);
-        buf_re[..comp.pmf.len()].copy_from_slice(&comp.pmf);
+        let n = effective_support_len(&comp.pmf);
+        buf_re[..n].copy_from_slice(&comp.pmf[..n]);
         radix2_fft(&mut buf_re, &mut buf_im, false)?;
 
         for k in 0..fft_size {

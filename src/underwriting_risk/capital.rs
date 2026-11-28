@@ -174,10 +174,23 @@ pub fn sample_var(samples: &[f64], alpha: f64) -> Result<f64, PricingError> {
     }
     let mut sorted = samples.to_vec();
     sorted.sort_by(f64::total_cmp);
-    let idx = ((alpha * (sorted.len() as f64) - 1e-15).ceil() as usize)
+    Ok(sorted[lower_quantile_index(sorted.len(), alpha)])
+}
+
+/// Round-off allowance, in units of `f64::EPSILON` relative to `alpha * n`, when computing the
+/// empirical quantile rank `ceil(alpha * n)`. `alpha * n` carries at most a few ulps of
+/// representation + multiplication error (e.g. `0.28 * 100 = 28.000000000000004`), so `4` ulps
+/// snaps such products back to the intended integer without moving genuinely fractional ranks.
+const QUANTILE_RANK_ULPS: f64 = 4.0;
+
+/// Zero-based order-statistic index `ceil(alpha * n) - 1` of the lower empirical quantile
+/// `inf { x : F_n(x) >= alpha }`, robust to floating-point error in `alpha * n` (`n >= 1`).
+pub(crate) fn lower_quantile_index(n: usize, alpha: f64) -> usize {
+    let target = alpha * (n as f64);
+    let tol = target.abs() * QUANTILE_RANK_ULPS * f64::EPSILON;
+    ((target - tol).ceil() as usize)
         .saturating_sub(1)
-        .min(sorted.len() - 1);
-    Ok(sorted[idx])
+        .min(n.saturating_sub(1))
 }
 
 /// Exact coherent sample Range Value-at-Risk `RVaR_{p_low, p_high}(X)` (average of quantile
