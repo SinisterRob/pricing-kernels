@@ -636,3 +636,123 @@ fn ylt_beta_sampler_is_exact_for_tiny_shapes() {
             .all(|e| e.loss.is_finite() && (0.0..=1.0).contains(&e.loss))
     );
 }
+
+// ---------------------------------------------------------------------------
+// Grid exceedance by index (not `k * step > x` in floating point)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn exceedance_probability_uses_exact_grid_indices() {
+    // Four equally likely grid points 0, h, 2h, 3h: P(S > j h) = (3 - j) / 4 exactly.
+    for step in [0.1, 0.01, 1e-3, 0.5, 0.25, 1.0, 1e6] {
+        let agg = AggregateLossDistribution::from_pmf(step, vec![0.25; 4]).unwrap();
+        for j in 0..4_u32 {
+            // Both the decimal literal j*h and the computed product must hit index j.
+            for x in [
+                f64::from(j) * step,
+                format!("{}", f64::from(j) * step).parse().unwrap(),
+            ] {
+                let p = agg.exceedance_probability(x).unwrap();
+                assert_eq!(p, f64::from(3 - j) / 4.0, "step={step} j={j} x={x}");
+            }
+        }
+        // Midpoints and points beyond the grid.
+        assert_eq!(agg.exceedance_probability(0.5 * step).unwrap(), 0.75);
+        assert_eq!(agg.exceedance_probability(2.5 * step).unwrap(), 0.25);
+        assert_eq!(agg.exceedance_probability(10.0 * step).unwrap(), 0.0);
+        assert_eq!(agg.exceedance_probability(-step).unwrap(), 1.0);
+        // Stop-loss layers attached exactly at a grid point get no round-off residual.
+        let el = agg.layer_expected_loss(3.0 * step, step).unwrap();
+        assert_eq!(el, 0.0, "step={step}");
+        let el = agg.layer_expected_loss(2.0 * step, 10.0 * step).unwrap();
+        assert!(close_rel(el, 0.25 * step, 1e-12), "step={step} el={el}");
+    }
+    // The reported defect: step 0.1, P(S > 0.3) must be 0 (0.3 / 0.1 = 2.9999999999999996).
+    let agg = AggregateLossDistribution::from_pmf(0.1, vec![0.25; 4]).unwrap();
+    assert_eq!(agg.exceedance_probability(0.3).unwrap(), 0.0);
+}
+
+// ---------------------------------------------------------------------------
+// Distortion pricing uses the same mass / lost-tail rules as `tvar`
+// ---------------------------------------------------------------------------
+
+use pricing_kernels::underwriting_risk::{
+    AGGREGATE_GRID_TOLERANCE, DistortionOperator, TVAR_MAX_LOST_TAIL_FRACTION,
+    distortion_price_aggregate, distortion_price_discrete,
+};
+
+#[test]
+fn distortion_tvar_matches_aggregate_tvar_and_rejects_lost_tail() {
+    // Complete grid: exact parity with `tvar`.
+    let mut pmf = vec![0.0; 1001];
+    pmf[0] = 0.5;
+    for p in pmf.iter_mut().skip(1).take(1000) {
+        *p = 0.5 / 1000.0;
+    }
+    let agg = AggregateLossDistribution::from_pmf(1.0, pmf).unwrap();
+    for alpha in [0.5, 0.9, 0.99, 0.999] {
+        let tvar = agg.tvar(alpha).unwrap();
+        let dist = distortion_price_aggregate(&agg, DistortionOperator::Tvar { alpha }).unwrap();
+        assert!(
+            close_rel(dist.risk_adjusted_price, tvar, 1e-9),
+            "alpha={alpha} distortion={} tvar={tvar}",
+            dist.risk_adjusted_price
+        );
+    }
+
+    // The reported defect: 5e-5 of mass lost beyond the grid. `tvar` errors; so must distortion.
+    let mut pmf = vec![0.0; 1001];
+    pmf[0] = 0.5;
+    for p in pmf.iter_mut().skip(1).take(999) {
+        *p = 0.49995 / 999.0;
+    }
+    let lossy = AggregateLossDistribution::from_pmf(1.0, pmf).unwrap();
+    assert!(lossy.tvar(0.999).is_err());
+    assert!(matches!(
+        distortion_price_aggregate(&lossy, DistortionOperator::Tvar { alpha: 0.999 }),
+        Err(PricingError::OutOfBounds(_))
+    ));
+
+    // Lost mass inside AGGREGATE_GRID_TOLERANCE: accepted iff within the tail-fraction rule,
+    // with the same decision as `tvar` on both sides of the threshold.
+    let lost = 0.5 * AGGREGATE_GRID_TOLERANCE;
+    let mut pmf = vec![0.0; 1001];
+    pmf[0] = 0.5;
+    for p in pmf.iter_mut().skip(1).take(1000) {
+        *p = (0.5 - lost) / 1000.0;
+    }
+    let small = AggregateLossDistribution::from_pmf(1.0, pmf).unwrap();
+    let alpha_ok = 1.0 - 2.0 * lost / TVAR_MAX_LOST_TAIL_FRACTION;
+    let alpha_bad = 1.0 - 0.5 * lost / TVAR_MAX_LOST_TAIL_FRACTION;
+    let t = small.tvar(alpha_ok).unwrap();
+    let d =
+        distortion_price_aggregate(&small, DistortionOperator::Tvar { alpha: alpha_ok }).unwrap();
+    assert!(
+        close_rel(d.risk_adjusted_price, t, 1e-3),
+        "{} vs {t}",
+        d.risk_adjusted_price
+    );
+    assert!(small.tvar(alpha_bad).is_err());
+    assert!(
+        distortion_price_aggregate(&small, DistortionOperator::Tvar { alpha: alpha_bad }).is_err()
+    );
+}
+
+#[test]
+fn distortion_price_discrete_requires_unit_mass_within_grid_tolerance() {
+    let losses = [0.0, 100.0, 250.0, 600.0];
+    let op = DistortionOperator::Wang { lambda: 0.0 };
+    // Within tolerance: renormalized, so the risk-neutral price is the renormalized mean.
+    let eps = 0.5 * AGGREGATE_GRID_TOLERANCE;
+    let probs = [0.40, 0.30, 0.20, 0.10 + eps];
+    let res = distortion_price_discrete(&losses, &probs, op).unwrap();
+    let mean = (30.0 + 50.0 + 600.0 * (0.10 + eps)) / (1.0 + eps);
+    assert!(close_rel(res.risk_adjusted_price, mean, 1e-12));
+    assert!(close_rel(res.expected_loss, mean, 1e-12));
+    // Outside tolerance (accepted by the old 1e-4 rule): rejected.
+    let probs = [0.40, 0.30, 0.20, 0.10 - 5e-5];
+    assert!(matches!(
+        distortion_price_discrete(&losses, &probs, op),
+        Err(PricingError::InvalidParameter(_))
+    ));
+}

@@ -48,6 +48,11 @@ pub const FFT_ROUNDOFF_SAFETY_FACTOR: f64 = 8.0;
 /// above every grid point, the returned value is then a lower bound on the true `TVaR`.
 pub const TVAR_MAX_LOST_TAIL_FRACTION: f64 = 1e-3;
 
+/// Relative tolerance for snapping a threshold `x / step` onto the integer grid index in
+/// [`AggregateLossDistribution::exceedance_probability`] (a few ulps of the ratio, so
+/// `0.3 / 0.1 = 2.9999999999999996` is treated as index 3).
+pub const GRID_SNAP_REL_TOL: f64 = 8.0 * f64::EPSILON;
+
 /// Claim-count frequency distribution in the Panjer `(a, b, 0)` class.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub enum FrequencyDistribution {
@@ -291,13 +296,35 @@ impl AggregateLossDistribution {
         if x < 0.0 {
             return Ok(self.pmf.iter().sum::<f64>().clamp(0.0, 1.0));
         }
-        let mut prob = 0.0;
-        for (k, &p) in self.pmf.iter().enumerate() {
-            if (k as f64) * self.step > x {
-                prob += p;
-            }
-        }
+        // Sum over grid indices k > floor(x / step), snapping x / step to the nearest integer
+        // when it lies within GRID_SNAP_REL_TOL: comparing `k * step > x` in floating point
+        // misclassifies grid points (e.g. 3 * 0.1 = 0.30000000000000004 > 0.3).
+        let first = match self.grid_floor_index(x) {
+            Some(j) => j + 1,
+            None => return Ok(0.0),
+        };
+        let prob: f64 = self.pmf.iter().skip(first).sum();
         Ok(prob.clamp(0.0, 1.0))
+    }
+
+    /// Largest grid index `j` with `j * step <= x` for `x >= 0` (`x / step` snapped to the
+    /// nearest integer within [`GRID_SNAP_REL_TOL`]); `None` when `j >= pmf.len() - 1`, i.e.
+    /// no grid point exceeds `x`.
+    fn grid_floor_index(&self, x: f64) -> Option<usize> {
+        let ratio = x / self.step;
+        let nearest = ratio.round();
+        let j = if (ratio - nearest).abs() <= GRID_SNAP_REL_TOL * nearest.abs().max(1.0) {
+            nearest
+        } else {
+            ratio.floor()
+        };
+        let last = self.pmf.len().saturating_sub(1);
+        if !(j < last as f64) {
+            return None;
+        }
+        // `0 <= j < last` is an exact integer-valued f64 here.
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        Some(j as usize)
     }
 
     /// Value-at-Risk `VaR_alpha(S) = inf { x : F(x) >= alpha }` for `alpha in (0, 1)`.
@@ -380,12 +407,16 @@ impl AggregateLossDistribution {
                 "attachment must be >= 0 and limit must be > 0",
             ));
         }
+        // Same grid-index rule as `exceedance_probability`: points snapped onto the attachment
+        // contribute exactly zero (not a round-off residual).
+        let first = match self.grid_floor_index(attachment) {
+            Some(j) => j + 1,
+            None => return Ok(0.0),
+        };
         let mut total = 0.0;
-        for (k, &p) in self.pmf.iter().enumerate() {
+        for (k, &p) in self.pmf.iter().enumerate().skip(first) {
             let x = (k as f64) * self.step;
-            if x > attachment {
-                total += p * (x - attachment).min(limit);
-            }
+            total += p * (x - attachment).clamp(0.0, limit);
         }
         Ok(total)
     }

@@ -391,9 +391,16 @@ pub struct ReinstatementPricingResult {
     pub effective_rate_on_line: f64,
 }
 
-/// Absolute tolerance (in currency units) allowed when checking slice expectations
-/// against `layer_limit` and against each other.
-const SLICE_BOUND_TOL: f64 = 1e-9;
+/// Relative tolerance allowed when checking slice expectations against `layer_limit` and
+/// against each other: a bound `b` admits values up to `b + SLICE_BOUND_REL_TOL * max(1, b)`
+/// (round-off of a few ulps in caller-computed slice expectations at any currency scale).
+const SLICE_BOUND_REL_TOL: f64 = 1e-9;
+
+/// Upper acceptance limit for a quantity bounded above by `bound` (see [`SLICE_BOUND_REL_TOL`]).
+#[inline]
+fn slice_upper_bound(bound: f64) -> f64 {
+    bound + SLICE_BOUND_REL_TOL * bound.abs().max(1.0)
+}
 
 fn validate_reinstatement_inputs(
     layer_limit: f64,
@@ -423,7 +430,7 @@ fn validate_reinstatement_inputs(
     }
     let mut total_expected_loss = 0.0;
     for &s in expected_layer_losses {
-        if !s.is_finite() || !(s >= 0.0) || s > layer_limit + SLICE_BOUND_TOL {
+        if !s.is_finite() || !(s >= 0.0) || s > slice_upper_bound(layer_limit) {
             return Err(PricingError::InvalidParameter(
                 "each expected layer loss must be finite and in [0, layer_limit]",
             ));
@@ -541,7 +548,7 @@ pub fn price_reinstatements_time_weighted(
         ));
     }
     for (&t_k, &s_k) in time_weighted_layer_losses.iter().zip(expected_layer_losses) {
-        if !t_k.is_finite() || !(t_k >= 0.0) || t_k > s_k + SLICE_BOUND_TOL {
+        if !t_k.is_finite() || !(t_k >= 0.0) || t_k > slice_upper_bound(s_k) {
             return Err(PricingError::InvalidParameter(
                 "time-weighted slice loss must be finite and in [0, expected slice loss]",
             ));
