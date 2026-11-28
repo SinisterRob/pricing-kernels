@@ -100,8 +100,8 @@ pub mod prelude {
         bailey_simon_chi_squared, bailey_simon_multiplicative, bspline_basis, double_lift_chart,
         fit_glm_irls, fit_glm_irls_with_options, fit_hurdle_poisson, fit_random_intercept_glmm,
         fit_regularized_glm, fit_zero_inflated_poisson, glm_information_criteria,
-        natural_cubic_spline_basis, predict_glm, select_tweedie_power, variance_inflation_factors,
-        weighted_gini_index,
+        natural_cubic_spline_basis, predict_glm, select_tweedie_power, tweedie_log_density,
+        variance_inflation_factors, weighted_gini_index,
     };
     pub use crate::credibility::{
         BuhlmannStraubResult, ClassicalCredibility, CredibilityGroup, CredibilityPanel,
@@ -112,11 +112,12 @@ pub mod prelude {
     pub use crate::error::{PricingError, SolverOptions};
     pub use crate::experience::{
         AlaeTreatment, ExperienceClaim, IsoErpResult, IsoErpSpec, LargeDeductibleResult,
-        LargeDeductibleSpec, NcciErpResult, NcciErpSpec, NcciErpSpecification, RetroPlanResult,
-        RetroPlanSpec, ScheduleRatingItem, ScheduleRatingResult, TableLEngine, TableLRow,
-        TableMEngine, TableMRow, calculate_iso_experience_mod, calculate_ncci_experience_mod,
-        calculate_off_balance, calculate_schedule_mod, price_large_deductible,
-        solve_balanced_retro_plan, solve_balanced_retro_plan_table_l,
+        LargeDeductibleSpec, NcciAccidentLimitation, NcciErpResult, NcciErpSpec,
+        NcciErpSpecification, RetroPlanResult, RetroPlanSpec, ScheduleRatingItem,
+        ScheduleRatingResult, TableLEngine, TableLRow, TableMEngine, TableMRow,
+        calculate_iso_experience_mod, calculate_ncci_experience_mod,
+        calculate_ncci_experience_mod_by_accident, calculate_off_balance, calculate_schedule_mod,
+        price_large_deductible, solve_balanced_retro_plan, solve_balanced_retro_plan_table_l,
     };
     pub use crate::layers::{
         AlaeDependenceModel, AlaeIlfResult, AlaePolicyTreatment, BlendCredibilityRule,
@@ -143,14 +144,15 @@ pub mod prelude {
         solve_capped_rate_off_balance, two_step_premium_trend,
     };
     pub use crate::underwriting_risk::{
-        AggregateLossDistribution, DistortionOperator, DistortionPricingResult, EltSummary,
-        EulerAllocationResult, EventLossEntry, EventLossTable, FrequencyDistribution,
-        KrepsRiskLoadResult, MyersReadAllocationResult, RmkPricingResult, ScenarioMatrix,
-        YearLossTable, YltEvent, convolve_independent_aggregates,
-        discretize_severity_mean_preserving, distortion_price_aggregate, distortion_price_discrete,
-        elt_aggregate_distribution, elt_occurrence_layer_expected_loss, elt_oep, elt_oep_pml,
-        elt_summary, euler_rvar_allocation, euler_sd_allocation, euler_tvar_allocation,
-        fft_aggregate_loss, kreps_marginal_risk_load, myers_read_allocation, panjer_recursion,
+        AGGREGATE_GRID_TOLERANCE, AggregateLossDistribution, DistortionOperator,
+        DistortionPricingResult, EltSummary, EmpiricalPmlConvention, EulerAllocationResult,
+        EventLossEntry, EventLossTable, FrequencyDistribution, KrepsRiskLoadResult,
+        MyersReadAllocationResult, RmkPricingResult, ScenarioMatrix, YearLossTable, YltEvent,
+        convolve_independent_aggregates, discretize_severity_mean_preserving,
+        distortion_price_aggregate, distortion_price_discrete, elt_aggregate_distribution,
+        elt_occurrence_layer_expected_loss, elt_oep, elt_oep_pml, elt_summary,
+        euler_rvar_allocation, euler_sd_allocation, euler_tvar_allocation, fft_aggregate_loss,
+        kreps_marginal_risk_load, myers_read_allocation, panjer_recursion,
         rmk_risk_adjusted_pricing, sample_rvar, sample_tvar, sample_var, simulate_ylt_from_elt,
     };
 }
