@@ -94,10 +94,13 @@ macro_rules! rate_changes {
 pub mod prelude {
     pub use crate::classification::{
         DesignMatrix, DoubleLiftBucket, GiniResult, GlmFamily, GlmFit, GlmOptions, GlmResult,
-        InformationCriteria, LorenzCurvePoint, MinimumBiasResult, MultiplicativeRater, RatingTable,
-        RelativityRow, TweediePowerSelection, bailey_simon_chi_squared,
-        bailey_simon_multiplicative, double_lift_chart, fit_glm_irls, fit_glm_irls_with_options,
-        glm_information_criteria, predict_glm, select_tweedie_power, variance_inflation_factors,
+        InformationCriteria, LorenzCurvePoint, MinimumBiasResult, MultiplicativeRater,
+        RandomInterceptGlmmResult, RatingTable, RegularizedGlmFamily, RegularizedGlmOptions,
+        RegularizedGlmResult, RelativityRow, TweediePowerSelection, ZeroModifiedPoissonResult,
+        bailey_simon_chi_squared, bailey_simon_multiplicative, bspline_basis, double_lift_chart,
+        fit_glm_irls, fit_glm_irls_with_options, fit_hurdle_poisson, fit_random_intercept_glmm,
+        fit_regularized_glm, fit_zero_inflated_poisson, glm_information_criteria,
+        natural_cubic_spline_basis, predict_glm, select_tweedie_power, variance_inflation_factors,
         weighted_gini_index,
     };
     pub use crate::credibility::{
@@ -114,19 +117,27 @@ pub mod prelude {
         solve_balanced_retro_plan, solve_balanced_retro_plan_table_l,
     };
     pub use crate::layers::{
-        BlendCredibilityRule, BurningCostResult, BurningCostYearResult, CommercialLayer,
-        ExposureExperienceBlendResult, HistoricalTreatyClaim, HistoricalTreatyYear, LayerTower,
-        MbbefdCurve, ReinstatementBasis, ReinstatementPricingResult, SeverityDistribution,
-        SeverityFamily, SeverityFitResult, SeverityObservation, SlidingScaleSpec, SwissReCurve,
-        TreatyExperience, blend_exposure_and_experience, burning_cost_xl,
+        AlaeDependenceModel, AlaeIlfResult, AlaePolicyTreatment, BlendCredibilityRule,
+        BurningCostResult, BurningCostYearResult, CommercialLayer, EvtFamily, EvtFitResult,
+        ExposureExperienceBlendResult, FittedEvtDistribution, GoodnessOfFitDiagnostics,
+        HistoricalTreatyClaim, HistoricalTreatyYear, LayerTower, MbbefdCurve, ReinstatementBasis,
+        ReinstatementPricingResult, SeverityDistribution, SeverityFamily, SeverityFitResult,
+        SeverityObservation, SlidingScaleSpec, SpliceBodyFamily, SpliceContinuity, SwissReCurve,
+        TreatyExperience, alae_aware_ilf, alae_excess_layer_expected_loss, alae_loss_severity,
+        blend_exposure_and_experience, burning_cost_xl, empirical_mean_excess,
         expected_loss_corridor_retention, expected_profit_commission, fit_best_severity,
-        fit_severity_mle, price_reinstatements,
+        fit_evt_mle, fit_severity_mle, gauss_kronrod_integrate,
+        gauss_kronrod_integrate_semi_infinite, goodness_of_fit, price_reinstatements,
     };
     pub use crate::trending::{
-        ExpenseProvisions, RateChange, RateIndicationPeriod, RateIndicationPeriodResult,
-        RateIndicationResult, RateIndicationSpec, TrendModel, TwoStepTrendModel,
-        calculate_rate_indication, parallelogram_on_level_factor,
-        parallelogram_on_level_factor_with_term, policy_year_on_level_factor,
+        ExpenseProvisions, LossRatioIndicationResult, MyersCohnResult, MyersCohnSpec,
+        PremiumTrendResult, PurePremiumIndicationResult, RateCappingResult, RateChange,
+        RateIndicationPeriod, RateIndicationPeriodResult, RateIndicationResult, RateIndicationSpec,
+        RoeProfitLoadResult, TrendModel, TwoStepTrendModel, calculate_rate_indication,
+        extension_of_exposures_olep, loss_ratio_indication, myers_cohn_profit_load,
+        parallelogram_on_level_factor, parallelogram_on_level_factor_with_term,
+        policy_year_on_level_factor, pure_premium_indication, roe_implied_profit_load,
+        solve_capped_rate_off_balance, two_step_premium_trend,
     };
     pub use crate::underwriting_risk::{
         AggregateLossDistribution, DistortionOperator, DistortionPricingResult, EltSummary,

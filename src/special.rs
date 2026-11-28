@@ -10,6 +10,57 @@ pub(crate) fn normal_cdf_exact(z: f64) -> f64 {
     0.5 * erfc_approx(-z / std::f64::consts::SQRT_2)
 }
 
+/// Log standard normal survival `ln Φ(-z)` without underflow for large `z > 0`.
+///
+/// For `z > 5.0`, evaluates the asymptotic Mills-ratio expansion directly in
+/// log-space: `-z^2/2 - 0.5*ln(2π) - ln(z) + ln(1 - 1/z^2 + 3/z^4 - 15/z^6 + 105/z^8)`.
+pub(crate) fn log_normal_survival(z: f64) -> f64 {
+    if z.is_nan() {
+        return f64::NAN;
+    }
+    if z > 5.0 {
+        let inv_z2 = 1.0 / (z * z);
+        let series = 1.0
+            - inv_z2 * (1.0 - inv_z2 * (3.0 - inv_z2 * (15.0 - inv_z2 * (105.0 - 945.0 * inv_z2))));
+        -0.5 * z * z - 0.5 * std::f64::consts::TAU.ln() - z.ln() + series.max(1e-300).ln()
+    } else {
+        normal_cdf_exact(-z).max(1e-300).ln()
+    }
+}
+
+/// Regularized upper incomplete gamma `Q(a, x) = 1 - P(a, x)` for `a > 0, x >= 0`.
+pub(crate) fn gamma_q(a: f64, x: f64) -> f64 {
+    if a.is_nan() || x.is_nan() || a <= 0.0 || x < 0.0 {
+        return f64::NAN;
+    }
+    if x == 0.0 {
+        return 1.0;
+    }
+    if x >= a + 1.0 {
+        gamma_q_cf(a, x)
+    } else {
+        (1.0 - gamma_p(a, x)).clamp(0.0, 1.0)
+    }
+}
+
+/// Digamma function `ψ(x) = d/dx ln Γ(x)` for `x > 0` via recurrence shift and
+/// asymptotic Bernoulli series (accurate to `< 1e-14`).
+pub(crate) fn digamma(mut x: f64) -> f64 {
+    if !x.is_finite() || x <= 0.0 {
+        return f64::NAN;
+    }
+    let mut acc = 0.0;
+    while x < 8.0 {
+        acc -= 1.0 / x;
+        x += 1.0;
+    }
+    let inv_x = 1.0 / x;
+    let inv_x2 = inv_x * inv_x;
+    acc + x.ln()
+        - 0.5 * inv_x
+        - inv_x2 * (1.0 / 12.0 - inv_x2 * (1.0 / 120.0 - inv_x2 * (1.0 / 252.0 - inv_x2 / 240.0)))
+}
+
 /// Complementary error function `erfc(x)` accurate to ~1e-15 (Cody 1969).
 fn erfc_approx(x: f64) -> f64 {
     if x.is_nan() {

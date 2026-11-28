@@ -1,6 +1,10 @@
 //! Severity layering, Increased Limit Factors (ILFs), deductible pricing,
 //! MBBEFD exposure curves, and treaty reinsurance pricing.
 
+/// ALAE-aware excess layer and Increased Limits Factor (ILF) pricing kernels.
+pub mod alae_ilf;
+/// Censored and truncated MLE + EVT and spliced body–tail severity fitting.
+pub mod evt_fitting;
 /// Censored and truncated maximum likelihood fitting for parametric severity distributions.
 pub mod fitting;
 /// Continuous severity distributions, ILFs, and excess layers.
@@ -9,6 +13,16 @@ pub mod ilf;
 pub mod mbbefd;
 /// Treaty reinsurance pricing (burning cost, reinstatements, sliding scale, corridors, profit commission).
 pub mod reinsurance;
+
+pub use alae_ilf::{
+    AlaeDependenceModel, AlaeIlfResult, AlaePolicyTreatment, alae_aware_ilf,
+    alae_excess_layer_expected_loss, alae_loss_severity, gauss_kronrod_integrate,
+    gauss_kronrod_integrate_semi_infinite,
+};
+pub use evt_fitting::{
+    EvtFamily, EvtFitResult, FittedEvtDistribution, GoodnessOfFitDiagnostics, SpliceBodyFamily,
+    SpliceContinuity, empirical_mean_excess, fit_evt_mle, goodness_of_fit,
+};
 
 pub use fitting::{
     SeverityFamily, SeverityFitResult, SeverityObservation, fit_best_severity, fit_severity_mle,

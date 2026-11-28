@@ -6,6 +6,8 @@ pub mod diagnostics;
 pub mod irls_glm;
 /// Bailey (1963) balance-principle and Bailey-Simon (1960) chi-squared minimum bias solvers.
 pub mod minimum_bias;
+/// Regularized Elastic Net GLMs, B-splines / Natural Cubic Splines, Hurdle/ZIP, and random-intercept GLMMs.
+pub mod regularized_glm;
 /// Zero-allocation multiplicative rating plan scorer.
 pub mod scoring;
 
@@ -19,5 +21,10 @@ pub use irls_glm::{
 };
 pub use minimum_bias::{
     MinimumBiasResult, RatingTable, bailey_simon_chi_squared, bailey_simon_multiplicative,
+};
+pub use regularized_glm::{
+    RandomInterceptGlmmResult, RegularizedGlmFamily, RegularizedGlmOptions, RegularizedGlmResult,
+    ZeroModifiedPoissonResult, bspline_basis, fit_hurdle_poisson, fit_random_intercept_glmm,
+    fit_regularized_glm, fit_zero_inflated_poisson, natural_cubic_spline_basis,
 };
 pub use scoring::MultiplicativeRater;
