@@ -1,5 +1,8 @@
 #![doc = include_str!("../README.md")]
 #![cfg_attr(not(feature = "wasm"), forbid(unsafe_code))]
+#![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used))]
+#![allow(clippy::needless_range_loop)]
+#![allow(clippy::neg_cmp_op_on_partial_ord)]
 #![warn(missing_docs)]
 
 pub mod classification;
@@ -13,6 +16,8 @@ pub(crate) mod special;
 pub mod trending;
 pub mod underwriting_risk;
 pub(crate) mod validate;
+
+pub use error::{PricingError, Result};
 
 #[cfg(feature = "wasm")]
 #[doc(hidden)]
@@ -41,7 +46,7 @@ macro_rules! tower {
             let mut layers = ::std::vec::Vec::new();
             $(
                 let share: f64 = $crate::__tower_share!($( $share )?);
-                layers.push($crate::layers::CommercialLayer::new(
+                layers.push($crate::layers::CommercialLayer::try_new(
                     ($attachment) as f64,
                     ($limit) as f64,
                     share,
@@ -98,10 +103,9 @@ pub mod prelude {
         RandomInterceptGlmmResult, RatingTable, RegularizedGlmFamily, RegularizedGlmOptions,
         RegularizedGlmResult, RelativityRow, TweediePowerSelection, ZeroModifiedPoissonResult,
         bailey_simon_chi_squared, bailey_simon_multiplicative, bspline_basis, double_lift_chart,
-        fit_glm_irls, fit_glm_irls_with_options, fit_hurdle_poisson, fit_random_intercept_glmm,
-        fit_regularized_glm, fit_zero_inflated_poisson, glm_information_criteria,
-        natural_cubic_spline_basis, predict_glm, select_tweedie_power, variance_inflation_factors,
-        weighted_gini_index,
+        fit_glm_irls, fit_hurdle_poisson, fit_random_intercept_glmm, fit_regularized_glm,
+        fit_zero_inflated_poisson, glm_information_criteria, natural_cubic_spline_basis,
+        predict_glm, select_tweedie_power, variance_inflation_factors, weighted_gini_index,
     };
     pub use crate::credibility::{
         BuhlmannStraubResult, ClassicalCredibility, CredibilityGroup, CredibilityPanel,
@@ -112,11 +116,11 @@ pub mod prelude {
     pub use crate::error::{PricingError, SolverOptions};
     pub use crate::experience::{
         AlaeTreatment, ExperienceClaim, IsoErpResult, IsoErpSpec, LargeDeductibleResult,
-        LargeDeductibleSpec, NcciErpResult, NcciErpSpec, NcciErpSpecification, RetroPlanResult,
-        RetroPlanSpec, ScheduleRatingItem, ScheduleRatingResult, TableLEngine, TableLRow,
-        TableMEngine, TableMRow, calculate_iso_experience_mod, calculate_ncci_experience_mod,
-        calculate_off_balance, calculate_schedule_mod, price_large_deductible,
-        solve_balanced_retro_plan, solve_balanced_retro_plan_table_l,
+        LargeDeductibleSpec, NcciErpResult, NcciErpSpec, RetroPlanResult, RetroPlanSpec,
+        ScheduleRatingItem, ScheduleRatingResult, TableLEngine, TableLRow, TableMEngine, TableMRow,
+        calculate_iso_experience_mod, calculate_ncci_experience_mod, calculate_off_balance,
+        calculate_schedule_mod, price_large_deductible, solve_balanced_retro_plan,
+        solve_balanced_retro_plan_table_l,
     };
     pub use crate::layers::{
         AlaeDependenceModel, AlaeIlfResult, AlaePolicyTreatment, BlendCredibilityRule,

@@ -14,7 +14,7 @@ pub struct ExperienceClaim {
 
 /// NCCI Experience Rating Plan calculation inputs and parameters.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
-pub struct NcciErpSpecification {
+pub struct NcciErpSpec {
     /// State split point between primary and excess loss (e.g. $18,500).
     pub split_point: f64,
     /// Total expected losses (`E = sum_class Payroll * Expected Loss Rate`).
@@ -29,10 +29,7 @@ pub struct NcciErpSpecification {
     pub apply_era: bool,
 }
 
-/// Concise alias for [`NcciErpSpecification`] matching [`super::IsoErpSpec`] and [`super::RetroPlanSpec`].
-pub type NcciErpSpec = NcciErpSpecification;
-
-impl NcciErpSpecification {
+impl NcciErpSpec {
     /// Compute the NCCI Experience Modification Factor for the given experience-period claims.
     pub fn calculate(&self, claims: &[ExperienceClaim]) -> Result<NcciErpResult, PricingError> {
         calculate_ncci_experience_mod(self, claims)
@@ -67,7 +64,7 @@ pub struct NcciErpResult {
 /// where each claim's loss is split at `split_point` (after 70% ERA reduction for
 /// medical-only claims when `apply_era` is `true`).
 pub fn calculate_ncci_experience_mod(
-    spec: &NcciErpSpecification,
+    spec: &NcciErpSpec,
     claims: &[ExperienceClaim],
 ) -> Result<NcciErpResult, PricingError> {
     if !spec.expected_losses.is_finite() || !(spec.expected_losses > 0.0) {

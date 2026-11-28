@@ -3,7 +3,7 @@
 //! Provides canonical worked examples and tables for reproducible tests,
 //! doctests, and benchmarks without external file I/O.
 
-use crate::experience::{ExperienceClaim, NcciErpSpecification, RetroPlanSpec};
+use crate::experience::{ExperienceClaim, NcciErpSpec, RetroPlanSpec};
 use serde::{Deserialize, Serialize};
 
 /// Bailey (1963) / Brown (1988) 3x2 commercial classification grid.
@@ -34,7 +34,7 @@ pub fn commercial_classification_grid() -> ClassificationGridDataset {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct NcciWorksheetDataset {
     /// Plan parameters (split point, expected losses, D-ratio, W, B, ERA).
-    pub spec: NcciErpSpecification,
+    pub spec: NcciErpSpec,
     /// Experience period claims.
     pub claims: Vec<ExperienceClaim>,
     /// Exact unrounded modification factor (`107_225 / 125_000 = 0.8578`).
@@ -46,7 +46,7 @@ pub struct NcciWorksheetDataset {
 /// Returns the standard NCCI Experience Rating Plan worksheet benchmark with ERA enabled.
 pub fn ncci_erp_worksheet() -> NcciWorksheetDataset {
     NcciWorksheetDataset {
-        spec: NcciErpSpecification {
+        spec: NcciErpSpec {
             split_point: 18_500.0,
             expected_losses: 100_000.0,
             d_ratio: 0.40,

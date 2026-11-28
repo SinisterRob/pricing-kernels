@@ -38,6 +38,9 @@ impl fmt::Display for PricingError {
 
 impl std::error::Error for PricingError {}
 
+/// Convenience result alias using [`PricingError`].
+pub type Result<T> = core::result::Result<T, PricingError>;
+
 /// Common iterative solver convergence options (`max_iter`, `tol`) shared across
 /// minimum-bias and retrospective rating plan solvers.
 #[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]

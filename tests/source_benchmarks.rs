@@ -16,8 +16,14 @@ fn test_bailey_1963_balance_and_brown_1988_poisson_glm_equivalence() {
     let exposures = [1235.0, 582.0, 2845.0, 1204.0, 890.0, 410.0];
     let loss_costs = [105.4, 132.8, 92.1, 116.5, 81.0, 102.3];
 
-    let mb = bailey_simon_multiplicative(n_rows, n_cols, &exposures, &loss_costs, 500, 1e-12)
-        .expect("Bailey 1963 balance");
+    let mb = bailey_simon_multiplicative(
+        n_rows,
+        n_cols,
+        &exposures,
+        &loss_costs,
+        &SolverOptions::default().with_max_iter(500).with_tol(1e-12),
+    )
+    .expect("Bailey 1963 balance");
 
     // 1. Verify exact row and column balance identities:
     // sum_j P_ij * fitted_ij == sum_j P_ij * A_ij
@@ -71,8 +77,7 @@ fn test_bailey_1963_balance_and_brown_1988_poisson_glm_equivalence() {
         &total_losses,
         &weights,
         &offsets,
-        100,
-        1e-12,
+        &GlmOptions::default().with_max_iter(100).with_tol(1e-12),
     )
     .expect("Poisson GLM");
 
@@ -102,15 +107,16 @@ fn test_bailey_simon_1960_chi_squared_minimum_bias() {
     let exposures = [1000.0, 800.0, 500.0, 400.0];
     let losses = [100.0, 128.0, 155.0, 172.0];
 
-    let bal = bailey_simon_multiplicative(2, 2, &exposures, &losses, 200, 1e-12).unwrap();
-    let chi = bailey_simon_chi_squared(2, 2, &exposures, &losses, 200, 1e-12).unwrap();
+    let mb_opts = SolverOptions::default().with_max_iter(200).with_tol(1e-12);
+    let bal = bailey_simon_multiplicative(2, 2, &exposures, &losses, &mb_opts).unwrap();
+    let chi = bailey_simon_chi_squared(2, 2, &exposures, &losses, &mb_opts).unwrap();
 
     assert!(chi.chi_squared <= bal.chi_squared + 1e-12);
     assert!(chi.chi_squared < bal.chi_squared);
 
     // Exact multiplicative table recovers exact factors with zero chi-squared.
     let exact_losses = [100.0, 120.0, 150.0, 180.0];
-    let exact = bailey_simon_chi_squared(2, 2, &exposures, &exact_losses, 200, 1e-12).unwrap();
+    let exact = bailey_simon_chi_squared(2, 2, &exposures, &exact_losses, &mb_opts).unwrap();
     assert!(close_rel(exact.base_rate, 100.0, 1e-9));
     assert!(close_rel(exact.relativities_dim1[1], 1.5, 1e-9));
     assert!(close_rel(exact.relativities_dim2[1], 1.2, 1e-9));
@@ -134,8 +140,7 @@ fn test_glm_irls_gamma_and_collinearity_rejection() {
         &y,
         &weights,
         &offsets,
-        100,
-        1e-12,
+        &GlmOptions::default().with_max_iter(100).with_tol(1e-12),
     )
     .unwrap();
 
@@ -165,8 +170,7 @@ fn test_glm_irls_gamma_and_collinearity_rejection() {
         &[10.0, 12.0, 20.0, 22.0],
         &[1.0; 4],
         &[0.0; 4],
-        50,
-        1e-8,
+        &GlmOptions::default().with_max_iter(50).with_tol(1e-8),
     )
     .unwrap_err();
     assert!(matches!(err, PricingError::SingularMatrix(_)));
@@ -272,7 +276,7 @@ fn test_buhlmann_straub_exact_worked_example() {
 
 #[test]
 fn test_ncci_experience_mod_exact_calculation() {
-    let spec = NcciErpSpecification {
+    let spec = NcciErpSpec {
         split_point: 18_500.0,
         expected_losses: 100_000.0,
         d_ratio: 0.40,
@@ -348,7 +352,12 @@ fn test_table_m_lee_identities_and_retro_plan_balance() {
         expense_ratio: 0.20,
     };
 
-    let retro = solve_balanced_retro_plan(&spec, &table_m, 200, 1e-10).unwrap();
+    let retro = solve_balanced_retro_plan(
+        &spec,
+        &table_m,
+        &SolverOptions::default().with_max_iter(200).with_tol(1e-10),
+    )
+    .unwrap();
 
     // Verify exact actuarial balance equation at the converged solution:
     let e_lcf = spec.lcf * spec.expected_loss_ratio;
@@ -419,11 +428,11 @@ fn test_all_six_severity_families_lev_ilf_ler_and_lee_survival_integral() {
         assert!(ler > 0.0 && ler < 1.0);
 
         // Layer sum conservation: [0, 100k] + [100k, 250k] == [0, 250k]
-        let l1 = CommercialLayer::new(0.0, 100_000.0, 1.0)
+        let l1 = CommercialLayer::try_new(0.0, 100_000.0, 1.0)
             .unwrap()
             .layer_expected_loss(dist)
             .unwrap();
-        let l2 = CommercialLayer::new(100_000.0, 150_000.0, 1.0)
+        let l2 = CommercialLayer::try_new(100_000.0, 150_000.0, 1.0)
             .unwrap()
             .layer_expected_loss(dist)
             .unwrap();
@@ -484,8 +493,11 @@ fn test_parallelogram_multi_change_calendar_year_and_policy_year() {
 #[test]
 fn test_adversarial_nan_inf_and_dimension_guards() {
     // NaN rejections across every kernel
+    let fast_opts = SolverOptions::default().with_max_iter(50).with_tol(1e-6);
+    let fast_glm_opts = GlmOptions::default().with_max_iter(50).with_tol(1e-6);
     assert!(
-        bailey_simon_multiplicative(2, 2, &[1.0, f64::NAN, 1.0, 1.0], &[1.0; 4], 50, 1e-6).is_err()
+        bailey_simon_multiplicative(2, 2, &[1.0, f64::NAN, 1.0, 1.0], &[1.0; 4], &fast_opts)
+            .is_err()
     );
     assert!(
         fit_glm_irls(
@@ -496,8 +508,7 @@ fn test_adversarial_nan_inf_and_dimension_guards() {
             &[f64::NAN, 1.0],
             &[1.0; 2],
             &[0.0; 2],
-            50,
-            1e-6
+            &fast_glm_opts,
         )
         .is_err()
     );
@@ -510,8 +521,7 @@ fn test_adversarial_nan_inf_and_dimension_guards() {
             &[0.0, 1.0],
             &[1.0; 2],
             &[0.0; 2],
-            50,
-            1e-6
+            &fast_glm_opts,
         )
         .is_err()
     );
@@ -532,18 +542,25 @@ fn test_adversarial_nan_inf_and_dimension_guards() {
         theta: 100_000.0,
     };
     assert!(lomax.limited_expected_value(f64::NAN).is_err());
-    assert!(CommercialLayer::new(0.0, f64::INFINITY, 1.0).is_err());
+    assert!(CommercialLayer::try_new(0.0, f64::INFINITY, 1.0).is_err());
 
     // Phase 2 adversarial guards
-    assert!(MbbefdCurve::new(-0.1, 2.0).is_err());
-    assert!(MbbefdCurve::new(1.0, 0.5).is_err());
+    assert!(MbbefdCurve::try_new(-0.1, 2.0).is_err());
+    assert!(MbbefdCurve::try_new(1.0, 0.5).is_err());
     assert!(MbbefdCurve::from_swiss_re_c(-1.0).is_err());
     assert!(
         MbbefdCurve::from_preset(SwissReCurve::Y2)
             .exposure_curve(f64::NAN)
             .is_err()
     );
-    assert!(burning_cost_xl(&[], &[], &CommercialLayer::new(0.0, 100.0, 1.0).unwrap()).is_err());
+    assert!(
+        burning_cost_xl(
+            &[],
+            &[],
+            &CommercialLayer::try_new(0.0, 100.0, 1.0).unwrap()
+        )
+        .is_err()
+    );
     assert!(
         price_reinstatements(
             100.0,
@@ -568,9 +585,9 @@ fn test_bernegger_1997_mbbefd_swiss_re_curves_and_survival_integral() {
         MbbefdCurve::from_preset(SwissReCurve::Y3),
         MbbefdCurve::from_preset(SwissReCurve::Y4),
         MbbefdCurve::from_preset(SwissReCurve::Lloyds),
-        MbbefdCurve::new(0.5, 1.0).unwrap(), // g = 1 limiting case (linear)
-        MbbefdCurve::new(1.0, 5.0).unwrap(), // b = 1 limiting case
-        MbbefdCurve::new(0.25, 4.0).unwrap(), // b * g = 1 limiting case
+        MbbefdCurve::try_new(0.5, 1.0).unwrap(), // g = 1 limiting case (linear)
+        MbbefdCurve::try_new(1.0, 5.0).unwrap(), // b = 1 limiting case
+        MbbefdCurve::try_new(0.25, 4.0).unwrap(), // b * g = 1 limiting case
     ];
 
     for curve in &curves {
@@ -634,7 +651,7 @@ fn test_bernegger_1997_mbbefd_swiss_re_curves_and_survival_integral() {
 #[test]
 fn test_clark_2014_reinsurance_burning_cost_reinstatements_and_proportional_terms() {
     // 1. Experience-rated burning cost for $500k xs $500k treaty
-    let layer = CommercialLayer::new(500_000.0, 500_000.0, 1.0).unwrap();
+    let layer = CommercialLayer::try_new(500_000.0, 500_000.0, 1.0).unwrap();
     let years = [
         HistoricalTreatyYear {
             year: 2023,
@@ -801,7 +818,8 @@ fn test_skurnick_1974_table_l_balance_and_retro_solver() {
     assert!(close_rel(tl.charge_at(5.0), 0.10, 1e-12));
 
     // 3. Balanced Table L retro plan satisfies exact actuarial balance equation
-    let plan = solve_balanced_retro_plan_table_l(&retro.spec, &tl, 200, 1e-12).unwrap();
+    let retro_opts = SolverOptions::default().with_max_iter(200).with_tol(1e-12);
+    let plan = solve_balanced_retro_plan_table_l(&retro.spec, &tl, &retro_opts).unwrap();
     let e_lcf = retro.spec.lcf * retro.spec.expected_loss_ratio;
     let expected_bpf = retro.spec.expense_ratio
         - (retro.spec.lcf - 1.0) * retro.spec.expected_loss_ratio
@@ -809,7 +827,7 @@ fn test_skurnick_1974_table_l_balance_and_retro_solver() {
     assert!(close_rel(plan.basic_premium_factor, expected_bpf, 1e-9));
 
     // Adding a per-occurrence limit (k > 0) raises the basic premium factor relative to unlimited Table M
-    let plan_unlimited = solve_balanced_retro_plan(&retro.spec, &tm, 200, 1e-12).unwrap();
+    let plan_unlimited = solve_balanced_retro_plan(&retro.spec, &tm, &retro_opts).unwrap();
     assert!(plan.basic_premium_factor > plan_unlimited.basic_premium_factor);
 }
 
@@ -1032,7 +1050,7 @@ fn test_catastrophe_elt_oep_aep_pml_and_layer_pricing() {
     assert!(aep_3m >= oep_3m - 1e-3);
 
     // Occurrence layer expected loss for $4M xs $2M
-    let layer = CommercialLayer::new(2_000_000.0, 4_000_000.0, 1.0).unwrap();
+    let layer = CommercialLayer::try_new(2_000_000.0, 4_000_000.0, 1.0).unwrap();
     let ceded = elt_occurrence_layer_expected_loss(&entries, &layer).unwrap();
     // Event 2 alone contributes 0.02 * 4M = 80k; Event 1 adds positive Beta tail above 2M
     assert!(ceded > 80_000.0);
@@ -1162,7 +1180,7 @@ fn test_tweedie_negbin_binomial_invgauss_and_ridge_glm() {
     let w = [1.0; 6];
     let offsets = [0.0; 6];
 
-    let tw = fit_glm_irls_with_options(
+    let tw = fit_glm_irls(
         GlmFamily::Tweedie { power: 1.5 },
         &design,
         6,
@@ -1192,7 +1210,7 @@ fn test_tweedie_negbin_binomial_invgauss_and_ridge_glm() {
     assert!(sel.best_power > 1.0 && sel.best_power < 2.0);
 
     // 2. Ridge penalty shrinks non-intercept slope strictly toward 0
-    let tw_ridge = fit_glm_irls_with_options(
+    let tw_ridge = fit_glm_irls(
         GlmFamily::Tweedie { power: 1.5 },
         &design,
         6,
@@ -1209,6 +1227,7 @@ fn test_tweedie_negbin_binomial_invgauss_and_ridge_glm() {
     assert!(tw_ridge.coefficients[1].abs() < tw.coefficients[1].abs());
 
     // 3. Negative Binomial approaches Poisson as alpha -> 0
+    let glm_tight = GlmOptions::default().with_max_iter(100).with_tol(1e-10);
     let y_cnt = [2.0, 4.0, 3.0, 8.0, 10.0, 9.0];
     let pois = fit_glm_irls(
         GlmFamily::Poisson,
@@ -1218,8 +1237,7 @@ fn test_tweedie_negbin_binomial_invgauss_and_ridge_glm() {
         &y_cnt,
         &w,
         &offsets,
-        100,
-        1e-10,
+        &glm_tight,
     )
     .unwrap();
     let nb_small = fit_glm_irls(
@@ -1230,8 +1248,7 @@ fn test_tweedie_negbin_binomial_invgauss_and_ridge_glm() {
         &y_cnt,
         &w,
         &offsets,
-        100,
-        1e-10,
+        &glm_tight,
     )
     .unwrap();
     assert!(close_rel(
@@ -1255,8 +1272,7 @@ fn test_tweedie_negbin_binomial_invgauss_and_ridge_glm() {
         &y_bin,
         &w,
         &offsets,
-        100,
-        1e-10,
+        &glm_tight,
     )
     .unwrap();
     let probs = predict_glm(
@@ -1286,8 +1302,7 @@ fn test_tweedie_negbin_binomial_invgauss_and_ridge_glm() {
         &y_ig,
         &w,
         &offsets,
-        100,
-        1e-10,
+        &glm_tight,
     )
     .unwrap();
     assert!(ig.coefficients[1] > 0.5);
@@ -1359,7 +1374,7 @@ fn test_subannual_parallelogram_two_step_trend_and_hachemeister() {
     assert!(close_rel(semi_olf, 1.10 / 1.025, 1e-12));
 
     // 3. Two-step exponential trend model
-    let two_step = TwoStepTrendModel::new(0.04, 0.06).unwrap();
+    let two_step = TwoStepTrendModel::try_new(0.04, 0.06).unwrap();
     let f = two_step.compound_factor(2.0, 1.5).unwrap();
     assert!(close_rel(f, 1.04_f64.powf(2.0) * 1.06_f64.powf(1.5), 1e-12));
 
@@ -1552,7 +1567,7 @@ fn test_numerical_stability_and_validation_refinements() {
             exposure_trend_factor: 1.0,
         },
     ];
-    let valid_layer = CommercialLayer::new(100_000.0, 400_000.0, 1.0).unwrap();
+    let valid_layer = CommercialLayer::try_new(100_000.0, 400_000.0, 1.0).unwrap();
     assert!(burning_cost_xl(&dup_years, &[], &valid_layer).is_err());
     let invalid_layer = CommercialLayer {
         attachment: -1.0,
@@ -1719,7 +1734,7 @@ fn test_phase2_ergonomics_containers_and_bridges() {
     assert!(ded.price(&sev, None).unwrap().indicated_premium > 0.0);
     assert!(close_rel(
         sev.layer_expected_loss(100_000.0, 400_000.0).unwrap(),
-        CommercialLayer::new(100_000.0, 400_000.0, 1.0)
+        CommercialLayer::try_new(100_000.0, 400_000.0, 1.0)
             .unwrap()
             .layer_expected_loss(&sev)
             .unwrap(),

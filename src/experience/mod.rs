@@ -32,8 +32,8 @@ pub use iso_erp::{
     calculate_iso_experience_mod, calculate_schedule_mod,
 };
 pub use ncci_erp::{
-    ExperienceClaim, NcciErpResult, NcciErpSpec, NcciErpSpecification,
-    calculate_ncci_experience_mod, calculate_off_balance,
+    ExperienceClaim, NcciErpResult, NcciErpSpec, calculate_ncci_experience_mod,
+    calculate_off_balance,
 };
 pub use retrospective::{RetroPlanResult, RetroPlanSpec, solve_balanced_retro_plan};
 pub use table_l::{TableLEngine, TableLRow, solve_balanced_retro_plan_table_l};

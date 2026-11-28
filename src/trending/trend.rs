@@ -110,7 +110,7 @@ pub struct TwoStepTrendModel {
 
 impl TwoStepTrendModel {
     /// Construct a two-step trend model with validated rates (`> -1.0`).
-    pub fn new(historical_rate: f64, prospective_rate: f64) -> Result<Self, PricingError> {
+    pub fn try_new(historical_rate: f64, prospective_rate: f64) -> Result<Self, PricingError> {
         if !historical_rate.is_finite()
             || !prospective_rate.is_finite()
             || !(historical_rate > -1.0)

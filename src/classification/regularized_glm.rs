@@ -985,15 +985,20 @@ pub fn fit_random_intercept_glmm(
     n_groups: usize,
     weights: Option<&[f64]>,
     offsets: Option<&[f64]>,
-    max_iter: usize,
+    options: &crate::error::SolverOptions,
 ) -> Result<RandomInterceptGlmmResult, PricingError> {
     if n == 0 || p == 0 || n_groups == 0 {
         return Err(PricingError::EmptyInput(
             "n, p, and n_groups must all be >= 1",
         ));
     }
-    if max_iter == 0 {
+    if options.max_iter == 0 {
         return Err(PricingError::InvalidParameter("max_iter must be >= 1"));
+    }
+    if !options.tol.is_finite() || !(options.tol > 0.0) {
+        return Err(PricingError::InvalidParameter(
+            "tolerance must be finite and positive",
+        ));
     }
     if n.checked_mul(p) != Some(x.len()) || y.len() != n || group_ids.len() != n {
         return Err(PricingError::DimensionMismatch(
@@ -1074,7 +1079,7 @@ pub fn fit_random_intercept_glmm(
         (u, h, ll)
     };
 
-    for iter in 0..max_iter.max(1) {
+    for iter in 0..options.max_iter {
         iterations = iter + 1;
         let prev_ll = laplace_ll;
 
@@ -1131,7 +1136,7 @@ pub fn fit_random_intercept_glmm(
             },
         )?;
 
-        if (laplace_ll - prev_ll).abs() < 1e-6 * (1.0 + laplace_ll.abs()) {
+        if (laplace_ll - prev_ll).abs() < options.tol * (1.0 + laplace_ll.abs()) {
             break;
         }
     }
@@ -1305,8 +1310,18 @@ mod tests {
         assert!(zip.fitted_means.iter().all(|v| v.is_finite() && *v > 0.0));
 
         let groups = [0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2];
-        let glmm =
-            fit_random_intercept_glmm(&x, 12, 1, &y, &groups, 3, None, None, 15).expect("glmm");
+        let glmm = fit_random_intercept_glmm(
+            &x,
+            12,
+            1,
+            &y,
+            &groups,
+            3,
+            None,
+            None,
+            &crate::error::SolverOptions::default().with_max_iter(15),
+        )
+        .expect("glmm");
         assert!(glmm.tau_squared >= 1e-8);
         assert!(
             glmm.group_credibilities

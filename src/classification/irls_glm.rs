@@ -489,7 +489,7 @@ impl DesignMatrix {
         n_groups: usize,
         weights: Option<&[f64]>,
         offsets: Option<&[f64]>,
-        max_iter: usize,
+        options: &crate::error::SolverOptions,
     ) -> Result<super::regularized_glm::RandomInterceptGlmmResult, PricingError> {
         super::regularized_glm::fit_random_intercept_glmm(
             &self.data,
@@ -500,7 +500,7 @@ impl DesignMatrix {
             n_groups,
             weights,
             offsets,
-            max_iter,
+            options,
         )
     }
 }
@@ -590,7 +590,7 @@ impl<'a> GlmFit<'a> {
             default_off = vec![0.0; n];
             &default_off
         };
-        fit_glm_irls_with_options(
+        fit_glm_irls(
             self.family,
             self.design.data(),
             n,
@@ -603,7 +603,8 @@ impl<'a> GlmFit<'a> {
     }
 }
 
-/// Fit a Generalized Linear Model (GLM) via Iteratively Reweighted Least Squares (IRLS).
+/// Fit an unpenalized or L2 (Ridge) penalized Generalized Linear Model (GLM) via
+/// Iteratively Reweighted Least Squares (IRLS) with configurable [`GlmOptions`].
 ///
 /// Designed specifically for actuarial commercial rating tables:
 /// - `design_matrix`: Row-major slice of size `n_samples * n_features`.
@@ -611,38 +612,9 @@ impl<'a> GlmFit<'a> {
 ///   `> 0` for Gamma/InverseGaussian, `[0, 1]` for Binomial on active rows).
 /// - `weights`: Non-negative prior weights (e.g. `1.0` for counts, claim count for severity).
 /// - `offsets`: Exposure offset `ln(E)` for log-link (use `0.0` if none).
+/// - `options`: Convergence and optional Ridge regularization controls ([`GlmOptions`]).
 #[allow(clippy::too_many_arguments)]
 pub fn fit_glm_irls(
-    family: GlmFamily,
-    design_matrix: &[f64],
-    n_samples: usize,
-    n_features: usize,
-    y: &[f64],
-    weights: &[f64],
-    offsets: &[f64],
-    max_iter: usize,
-    tol: f64,
-) -> Result<GlmResult, PricingError> {
-    fit_glm_irls_with_options(
-        family,
-        design_matrix,
-        n_samples,
-        n_features,
-        y,
-        weights,
-        offsets,
-        &GlmOptions {
-            max_iter,
-            tol,
-            ridge_lambda: 0.0,
-            penalize_intercept: false,
-        },
-    )
-}
-
-/// Fit an unpenalized or L2 (Ridge) penalized GLM via IRLS with configurable [`GlmOptions`].
-#[allow(clippy::too_many_arguments)]
-pub fn fit_glm_irls_with_options(
     family: GlmFamily,
     design_matrix: &[f64],
     n_samples: usize,
@@ -991,7 +963,7 @@ pub fn select_tweedie_power(
 
     for &p in candidate_powers {
         let family = GlmFamily::Tweedie { power: p };
-        let fit = fit_glm_irls_with_options(
+        let fit = fit_glm_irls(
             family,
             design_matrix,
             n_samples,

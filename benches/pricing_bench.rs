@@ -19,6 +19,7 @@ fn bench_classification(c: &mut Criterion) {
         }
     }
 
+    let mb_opts = SolverOptions::default().with_max_iter(50).with_tol(1e-5);
     group.bench_function("bailey_simon_10x10", |b| {
         b.iter(|| {
             bailey_simon_multiplicative(
@@ -26,8 +27,7 @@ fn bench_classification(c: &mut Criterion) {
                 black_box(n_cols),
                 black_box(&exposures),
                 black_box(&losses),
-                black_box(50),
-                black_box(1e-5),
+                black_box(&mb_opts),
             )
         });
     });
@@ -45,6 +45,7 @@ fn bench_classification(c: &mut Criterion) {
         .collect();
     let weights = [1.0; 6];
     let offsets: Vec<f64> = grid.exposures.iter().map(|&p| p.ln()).collect();
+    let glm_opts = GlmOptions::default().with_max_iter(50).with_tol(1e-9);
 
     group.bench_function("glm_irls_poisson_3x2", |b| {
         b.iter(|| {
@@ -56,8 +57,7 @@ fn bench_classification(c: &mut Criterion) {
                 black_box(&total_losses),
                 black_box(&weights),
                 black_box(&offsets),
-                50,
-                1e-9,
+                black_box(&glm_opts),
             )
         });
     });
@@ -78,7 +78,7 @@ fn bench_classification(c: &mut Criterion) {
     };
     group.bench_function("glm_irls_tweedie_ridge_3x2", |b| {
         b.iter(|| {
-            fit_glm_irls_with_options(
+            fit_glm_irls(
                 GlmFamily::Tweedie { power: 1.5 },
                 black_box(&design),
                 6,
@@ -234,8 +234,15 @@ fn bench_experience_and_retro(c: &mut Criterion) {
     let table_m =
         TableMEngine::from_discrete_pdf(&retro.entry_ratios, &retro.probabilities).unwrap();
 
+    let retro_opts = SolverOptions::default().with_max_iter(50).with_tol(1e-5);
     group.bench_function("solve_balanced_retro_plan", |b| {
-        b.iter(|| solve_balanced_retro_plan(black_box(&retro.spec), black_box(&table_m), 50, 1e-5));
+        b.iter(|| {
+            solve_balanced_retro_plan(
+                black_box(&retro.spec),
+                black_box(&table_m),
+                black_box(&retro_opts),
+            )
+        });
     });
 
     let limited_ratios = [0.18, 0.54, 0.90, 1.26, 1.62];
@@ -243,7 +250,11 @@ fn bench_experience_and_retro(c: &mut Criterion) {
         TableLEngine::from_limited_discrete_pdf(&limited_ratios, &retro.probabilities).unwrap();
     group.bench_function("solve_balanced_retro_plan_table_l", |b| {
         b.iter(|| {
-            solve_balanced_retro_plan_table_l(black_box(&retro.spec), black_box(&table_l), 50, 1e-5)
+            solve_balanced_retro_plan_table_l(
+                black_box(&retro.spec),
+                black_box(&table_l),
+                black_box(&retro_opts),
+            )
         });
     });
 

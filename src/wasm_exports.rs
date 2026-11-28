@@ -13,7 +13,7 @@
 #![allow(unsafe_code)]
 
 use crate::credibility::ClassicalCredibility;
-use crate::experience::{ExperienceClaim, NcciErpSpecification, calculate_ncci_experience_mod};
+use crate::experience::{ExperienceClaim, NcciErpSpec, calculate_ncci_experience_mod};
 use crate::layers::{MbbefdCurve, SeverityDistribution};
 use crate::trending::{RateChange, parallelogram_on_level_factor};
 
@@ -140,7 +140,7 @@ pub extern "C" fn pk_ncci_experience_mod(
             is_medical_only: med_only,
         });
     }
-    let spec = NcciErpSpecification {
+    let spec = NcciErpSpec {
         split_point,
         expected_losses,
         d_ratio,
