@@ -335,12 +335,93 @@ pub(crate) fn regularized_incomplete_beta(x: f64, a: f64, b: f64) -> f64 {
     if x >= 1.0 {
         return 1.0;
     }
-    let ln_bt = ln_gamma(a + b) - ln_gamma(a) - ln_gamma(b) + a * x.ln() + b * (1.0 - x).ln();
-    let bt = ln_bt.exp();
+    let bt = ln_beta_kernel(x, a, b).exp();
     if x < (a + 1.0) / (a + b + 2.0) {
         (bt * betacf(x, a, b) / a).clamp(0.0, 1.0)
     } else {
         (1.0 - bt * betacf(1.0 - x, b, a) / b).clamp(0.0, 1.0)
+    }
+}
+
+/// Shape at and above which the Stirling-series remainder `δ(z)` is used (7 Bernoulli terms
+/// give `|error| < 1e-17` for `z >= 10`).
+const STIRLING_MIN_SHAPE: f64 = 10.0;
+
+/// Stirling-series remainder `δ(z) = ln Γ(z) - [(z - 1/2) ln z - z + ln(2π) / 2]` for
+/// `z >= STIRLING_MIN_SHAPE` (R `lgammacor`; DiDonato & Morris 1992, *ACM TOMS* 18(3)).
+fn stirling_correction(z: f64) -> f64 {
+    // B_{2k} / (2k (2k - 1)) for k = 1..=7
+    const C: [f64; 7] = [
+        1.0 / 12.0,
+        -1.0 / 360.0,
+        1.0 / 1260.0,
+        -1.0 / 1680.0,
+        1.0 / 1188.0,
+        -691.0 / 360_360.0,
+        1.0 / 156.0,
+    ];
+    let inv_z2 = 1.0 / (z * z);
+    let mut acc = 0.0;
+    for &c in C.iter().rev() {
+        acc = acc * inv_z2 + c;
+    }
+    acc / z
+}
+
+/// `u - ln(1 + u)` for `u > -1` without cancellation near `u = 0` (DiDonato & Morris `rlog1`).
+///
+/// For `|u| <= 1/2`, with `r = u / (2 + u)`: `ln(1 + u) = 2 atanh(r)` and `u - 2r = r u`, so
+/// `u - ln(1 + u) = r u - 2 sum_{k>=1} r^(2k+1) / (2k + 1)` with `|r| <= 1/3`.
+fn rlog1(u: f64) -> f64 {
+    const SERIES_MAX_ABS_U: f64 = 0.5;
+    const MAX_TERMS: usize = 40;
+    if u.abs() > SERIES_MAX_ABS_U {
+        return u - u.ln_1p();
+    }
+    let r = u / (2.0 + u);
+    let r2 = r * r;
+    let mut power = r * r2;
+    let mut series = 0.0;
+    for k in 1..=MAX_TERMS {
+        let term = power / ((2 * k + 1) as f64);
+        series += term;
+        if term.abs() <= f64::EPSILON * series.abs() {
+            break;
+        }
+        power *= r2;
+    }
+    r * u - 2.0 * series
+}
+
+/// Log of the incomplete-beta prefactor `ln[x^a (1 - x)^b / B(a, b)]` for `0 < x < 1`.
+///
+/// Computing `ln Γ(a + b) - ln Γ(a) - ln Γ(b)` directly cancels terms of size `~(a + b) ln(a + b)`
+/// (relative error `~2.6e-7` in `I_x` at `a + b = 1e6`). Following DiDonato & Morris (1992,
+/// `brcomp`) / R `lbeta`, the large-shape cases use Stirling remainders `δ(·)`:
+/// - `a, b >= 10`: with `s = a + b`, `t = s x - a`, `u = t / a`, `v = -t / b`,
+///   `ln = -a rlog1(u) - b rlog1(v) + ln(a b / (2π s)) / 2 - [δ(a) + δ(b) - δ(s)]`
+///   (the first-order terms `a u + b v = 0` cancel analytically);
+/// - `p = min(a, b) < 10 <= q = max(a, b)`:
+///   `ln B = ln Γ(p) + δ(q) - δ(s) + p - p ln s + (q - 1/2) ln(1 - p / s)`;
+/// - both `< 10`: Lanczos `ln Γ` directly (no large-magnitude cancellation).
+fn ln_beta_kernel(x: f64, a: f64, b: f64) -> f64 {
+    let s = a + b;
+    let lo = a.min(b);
+    let hi = a.max(b);
+    if lo >= STIRLING_MIN_SHAPE {
+        let t = x.mul_add(s, -a);
+        let u = t / a;
+        let v = -t / b;
+        let delta = stirling_correction(a) + stirling_correction(b) - stirling_correction(s);
+        -a * rlog1(u) - b * rlog1(v) + 0.5 * ((a / s).ln() + b.ln() - std::f64::consts::TAU.ln())
+            - delta
+    } else if hi >= STIRLING_MIN_SHAPE {
+        let ln_beta = ln_gamma(lo) + stirling_correction(hi) - stirling_correction(s) + lo
+            - lo * s.ln()
+            + (hi - 0.5) * (-lo / s).ln_1p();
+        a * x.ln() + b * (-x).ln_1p() - ln_beta
+    } else {
+        ln_gamma(s) - ln_gamma(a) - ln_gamma(b) + a * x.ln() + b * (-x).ln_1p()
     }
 }
 
@@ -437,10 +518,110 @@ mod tests {
 
     #[test]
     fn incomplete_beta_converges_for_large_params() {
-        // Symmetric Beta(5_000, 5_000) has exact median 0.5 (ln_bt subtracts ~8e4, so ~1e-11 floor).
+        // Symmetric Beta(5_000, 5_000) has exact median 0.5 (stable Stirling-remainder prefactor).
         let cdf = regularized_incomplete_beta(0.5, 5_000.0, 5_000.0);
-        assert!((cdf - 0.5).abs() < 1e-10, "cdf={cdf}");
+        assert!((cdf - 0.5).abs() < 1e-13, "cdf={cdf}");
         assert!(regularized_incomplete_beta(f64::NAN, 2.0, 2.0).is_nan());
+    }
+}
+
+#[cfg(test)]
+mod large_shape_beta_tests {
+    use super::*;
+
+    /// Independent reference `P(Bin(n, x) >= k)` from pmf ratios
+    /// `p_{j+1} / p_j = (n - j) x / ((j + 1)(1 - x))`, accumulated as compensated sums of
+    /// `ln1p((p_{j+1} - p_j) / p_j)` outward from the mode and normalized by the total, so no
+    /// large `ln Γ` / log-factorial differences enter.
+    fn binomial_upper_tail(n: u64, k: u64, x: f64) -> f64 {
+        const LN_CUTOFF: f64 = -80.0;
+        let nf = n as f64;
+        let q = 1.0 - x;
+        let ln_ratio = |j: f64| -> f64 {
+            // ln[(n - j) x / ((j + 1) q)] for the step j -> j + 1
+            let num = (nf - j) * x;
+            let den = (j + 1.0) * q;
+            ((num - den) / den).ln_1p()
+        };
+        let mode = ((nf + 1.0) * x).floor().min(nf);
+        let mut total = 1.0_f64;
+        let mut tail = if mode >= k as f64 { 1.0 } else { 0.0 };
+        // Upward from the mode.
+        let (mut acc, mut comp) = (0.0_f64, 0.0_f64);
+        let mut j = mode;
+        while j < nf {
+            let y = ln_ratio(j) - comp;
+            let t = acc + y;
+            comp = (t - acc) - y;
+            acc = t;
+            j += 1.0;
+            if acc < LN_CUTOFF {
+                break;
+            }
+            let w = acc.exp();
+            total += w;
+            if j >= k as f64 {
+                tail += w;
+            }
+        }
+        // Downward from the mode: ln p_{j-1} - ln p_j = -ln_ratio(j - 1).
+        let (mut acc, mut comp) = (0.0_f64, 0.0_f64);
+        let mut j = mode;
+        while j > 0.0 {
+            let y = -ln_ratio(j - 1.0) - comp;
+            let t = acc + y;
+            comp = (t - acc) - y;
+            acc = t;
+            j -= 1.0;
+            if acc < LN_CUTOFF {
+                break;
+            }
+            let w = acc.exp();
+            total += w;
+            if j >= k as f64 {
+                tail += w;
+            }
+        }
+        tail / total
+    }
+
+    #[test]
+    fn incomplete_beta_matches_exact_binomial_tails_at_large_shapes() {
+        // I_x(k, n - k + 1) = P(Bin(n, x) >= k), a + b = n + 1 in {1e4, 2e5, 1e6}.
+        let cases: [(u64, u64, f64); 6] = [
+            (10_000, 5_050, 0.5),
+            (10_000, 1_030, 0.1),
+            (200_000, 100_300, 0.5),
+            (200_000, 99_500, 0.5),
+            (1_000_000, 500_500, 0.5),
+            (1_000_000, 100_500, 0.1),
+        ];
+        for (n, k, x) in cases {
+            let got = regularized_incomplete_beta(x, k as f64, (n - k + 1) as f64);
+            let exact = binomial_upper_tail(n, k, x);
+            let rel = (got - exact).abs() / exact;
+            assert!(
+                rel <= 1e-12,
+                "n={n} k={k} x={x}: got={got:e} exact={exact:e} rel={rel:e}"
+            );
+        }
+    }
+
+    #[test]
+    fn stable_kernel_matches_direct_form_at_small_shapes() {
+        // Below the Stirling threshold the kernel must agree with the direct Lanczos form.
+        for &(a, b) in &[(0.5, 3.0), (2.0, 9.5), (1.0, 25.0), (12.0, 40.0)] {
+            for &x in &[0.05, 0.3, 0.7] {
+                let direct = ln_gamma(a + b) - ln_gamma(a) - ln_gamma(b)
+                    + a * f64::ln(x)
+                    + b * (1.0 - x).ln();
+                let kernel = ln_beta_kernel(x, a, b);
+                assert!(
+                    (direct - kernel).abs() < 1e-12,
+                    "a={a} b={b} x={x}: {direct} vs {kernel}"
+                );
+            }
+        }
     }
 }
 

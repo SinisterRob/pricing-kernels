@@ -6,8 +6,8 @@ use pricing_kernels::error::PricingError;
 use pricing_kernels::underwriting_risk::{
     AggregateLossDistribution, EmpiricalPmlConvention, EventLossEntry, FrequencyDistribution,
     YearLossTable, YltEvent, convolve_independent_aggregates, elt_aggregate_distribution,
-    elt_summary, fft_aggregate_loss, kreps_marginal_risk_load, panjer_recursion, sample_var,
-    simulate_ylt_from_elt,
+    elt_occurrence_layer_expected_loss, elt_summary, fft_aggregate_loss, kreps_marginal_risk_load,
+    panjer_recursion, sample_var, simulate_ylt_from_elt,
 };
 
 const SEED: u64 = 42069;
@@ -438,7 +438,7 @@ fn simulated_annual_counts_have_poisson_skewness_at_high_rate() {
         std_dev_corr: 0.0,
         max_loss: 1.0,
     }];
-    let n_years = 20_000_u32;
+    let n_years = 200_000_u32;
     let ylt = simulate_ylt_from_elt(&elt, n_years, SEED).expect("ylt");
     let counts = ylt.annual_aggregate_losses();
     let n = f64::from(n_years);
@@ -446,8 +446,193 @@ fn simulated_annual_counts_have_poisson_skewness_at_high_rate() {
     let m2 = counts.iter().map(|c| (c - mean).powi(2)).sum::<f64>() / n;
     let m3 = counts.iter().map(|c| (c - mean).powi(3)).sum::<f64>() / n;
     let skew = m3 / m2.powf(1.5);
-    // SE: mean ~0.045, var ~0.4, skew ~0.017 (exact skew 1/sqrt(40) = 0.158).
-    assert!((mean - 40.0).abs() < 0.2, "mean={mean}");
-    assert!((m2 - 40.0).abs() < 2.0, "var={m2}");
-    assert!((skew - 1.0 / 40.0_f64.sqrt()).abs() < 0.07, "skew={skew}");
+    // n = 200k: SE(mean) = sqrt(40 / n) ~ 0.014, SE(var) ~ sqrt(2 * 40^2 / n) ~ 0.13,
+    // SE(skew) ~ sqrt(6 / n) ~ 0.0055 (exact skew 1/sqrt(40) = 0.158); tolerances ~4 SE.
+    assert!((mean - 40.0).abs() < 0.06, "mean={mean}");
+    assert!((m2 - 40.0).abs() < 0.6, "var={m2}");
+    assert!((skew - 1.0 / 40.0_f64.sqrt()).abs() < 0.022, "skew={skew}");
+}
+
+// ---------------------------------------------------------------------------
+// Round 2: tilted-FFT round-off floor, input-mass vs truncation, TVaR tail coverage,
+// convolution component mass
+// ---------------------------------------------------------------------------
+
+#[test]
+fn tilted_fft_matches_panjer_across_standard_tilts() {
+    // Standard Robertson / Embrechts–Frei tilts theta * N in {5, 10, 20, 30}: untilting
+    // amplifies round-off by exp(theta * k), which must be floored, not reported as aliasing.
+    let n = 4096_usize;
+    let severities: [&[f64]; 2] = [
+        &[0.0, 0.5, 0.3, 0.2],
+        &[0.05, 0.2, 0.2, 0.15, 0.1, 0.1, 0.08, 0.06, 0.04, 0.02],
+    ];
+    for sev in severities {
+        for freq in [
+            FrequencyDistribution::Poisson { lambda: 5.0 },
+            FrequencyDistribution::Binomial { m: 20, q: 0.3 },
+            FrequencyDistribution::NegativeBinomial { r: 3.0, beta: 2.0 },
+        ] {
+            let panjer = panjer_recursion(freq, sev, 1.0, n).expect("panjer");
+            for theta_n in [5.0, 10.0, 20.0, 30.0] {
+                let theta = theta_n / (n as f64);
+                let fft = fft_aggregate_loss(freq, sev, 1.0, n, Some(theta))
+                    .unwrap_or_else(|e| panic!("{freq:?} theta*N={theta_n}: {e}"));
+                let max_err = panjer
+                    .pmf
+                    .iter()
+                    .zip(&fft.pmf)
+                    .map(|(a, b)| (a - b).abs())
+                    .fold(0.0_f64, f64::max);
+                assert!(
+                    max_err <= 1e-10,
+                    "{freq:?} theta*N={theta_n}: max |fft - panjer| = {max_err:e}"
+                );
+                assert!(fft.pmf.iter().all(|&p| p >= 0.0));
+            }
+        }
+    }
+}
+
+#[test]
+fn excessive_tilt_reports_round_off_not_aliasing() {
+    // theta * N = 600 amplifies round-off by up to e^600: the error must advise reducing tilt.
+    let n = 4096_usize;
+    let err = fft_aggregate_loss(
+        FrequencyDistribution::Poisson { lambda: 200.0 },
+        &[0.0, 0.5, 0.3, 0.2],
+        1.0,
+        n,
+        Some(600.0 / (n as f64)),
+    );
+    match err {
+        Err(PricingError::OutOfBounds(msg)) => {
+            assert!(msg.contains("reduce tilt"), "{msg}");
+        }
+        other => panic!("expected round-off OutOfBounds, got {other:?}"),
+    }
+}
+
+#[test]
+fn severity_input_mass_deficit_is_rejected_as_input_error() {
+    // Sum 0.99995: previously accepted, then misreported as grid truncation forever.
+    let sev = [0.0, 0.5 - 5e-5, 0.3, 0.2];
+    let freq = FrequencyDistribution::Poisson { lambda: 2.0 };
+    for res in [
+        panjer_recursion(freq, &sev, 1.0, 1 << 12),
+        fft_aggregate_loss(freq, &sev, 1.0, 1 << 12, None),
+    ] {
+        match res {
+            Err(PricingError::InvalidParameter(msg)) => {
+                assert!(msg.contains("input mass"), "{msg}");
+            }
+            other => panic!("expected input-mass InvalidParameter, got {other:?}"),
+        }
+    }
+    // A rounding-level deficit (1e-9) is renormalized: unit mass and exact compound mean.
+    let sev_rounded = [0.0, 0.5 - 1e-9, 0.3, 0.2];
+    let agg = panjer_recursion(freq, &sev_rounded, 1.0, 256).expect("panjer");
+    let total = 1.0 - 1e-9;
+    let ex = (0.5 - 1e-9 + 0.6 + 0.6) / total;
+    assert!((agg.total_mass() - 1.0).abs() < 1e-13);
+    assert!(close_rel(agg.mean, 2.0 * ex, 1e-12));
+}
+
+#[test]
+fn tvar_rejects_poorly_represented_tail() {
+    // Lost mass 9e-7 (< AGGREGATE_GRID_TOLERANCE) is 9% of the 1e-5 tail at alpha = 0.99999.
+    let mut pmf = vec![0.0; 101];
+    pmf[0] = 1.0 - 1e-5;
+    pmf[100] = 1e-5 - 9e-7;
+    let d = AggregateLossDistribution::from_pmf(1.0, pmf).expect("pmf");
+    assert!(matches!(d.tvar(0.99999), Err(PricingError::OutOfBounds(_))));
+    // At alpha = 0.99 the same lost mass is 9e-5 of the tail (< 1e-3): accepted, lower bound.
+    let tvar = d.tvar(0.99).expect("tvar 0.99");
+    let exact_lower = 100.0 * (1e-5 - 9e-7) / (1e-2 - 9e-7);
+    assert!(close_rel(tvar, exact_lower, 1e-12), "tvar={tvar}");
+}
+
+#[test]
+fn convolution_rejects_defective_components() {
+    let defective = AggregateLossDistribution::from_pmf(1.0, vec![0.5, 0.3]).expect("pmf");
+    let res = convolve_independent_aggregates(&[&defective, &defective], 8);
+    assert!(
+        matches!(res, Err(PricingError::InvalidParameter(_))),
+        "{res:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Round 2: exact cat-layer Beta LEV and log-space Beta sampler
+// ---------------------------------------------------------------------------
+
+#[test]
+fn cat_layer_expected_loss_uses_exact_beta_lev() {
+    // Concentrated Beta (a, b ~ 1.25e7): the survival is a near-step at 5.03M, which a fixed
+    // 128-point midpoint rule cannot resolve.
+    let entry = EventLossEntry {
+        event_id: 1,
+        annual_rate: 1.0,
+        mean_loss: 5_030_000.0,
+        std_dev_indep: 1_000.0,
+        std_dev_corr: 0.0,
+        max_loss: 10_000_000.0,
+    };
+    // 10M xs 0 covers the full support: E[X ^ M] - E[X ^ 0] = E[X] exactly.
+    let full =
+        pricing_kernels::layers::CommercialLayer::new(0.0, 10_000_000.0, 1.0).expect("layer");
+    let el = elt_occurrence_layer_expected_loss(&[entry], &full).expect("el");
+    assert!((el - 5_030_000.0).abs() <= 1e-9 * 5_030_000.0, "el={el}");
+    // 2M xs 4M: E[X ^ 6M] - E[X ^ 4M] = 1.03M up to Gaussian tails beyond ~1000 SD (< 1e-300).
+    let mid = pricing_kernels::layers::CommercialLayer::new(4_000_000.0, 2_000_000.0, 1.0)
+        .expect("layer");
+    let el = elt_occurrence_layer_expected_loss(&[entry], &mid).expect("el");
+    assert!((el - 1_030_000.0).abs() <= 1e-9 * 1_030_000.0, "el={el}");
+}
+
+#[test]
+fn ylt_beta_sampler_is_exact_for_tiny_shapes() {
+    // a = b = 2e-4: X / M is ~Bernoulli(1/2) on {0, 1} with P(0.01 < U < 0.99) = 9.19e-4.
+    // The old sampler underflowed both gamma draws and returned 0.5 * M for ~74% of events.
+    let sd = 0.5 / (1.0 + 4e-4_f64).sqrt();
+    let entry = EventLossEntry {
+        event_id: 1,
+        annual_rate: 10.0,
+        mean_loss: 0.5,
+        std_dev_indep: sd,
+        std_dev_corr: 0.0,
+        max_loss: 1.0,
+    };
+    let (a, b) = entry.beta_params().expect("params").expect("beta");
+    assert!((a - 2e-4).abs() < 1e-12 && (b - 2e-4).abs() < 1e-12);
+    let exact_mid = entry.survival(0.01).expect("s") - entry.survival(0.99).expect("s");
+    // Leading-order check of the reference: a * ln(99) (exact to O(a^2)).
+    assert!(
+        close_rel(exact_mid, 2e-4 * 99.0_f64.ln(), 2e-3),
+        "{exact_mid}"
+    );
+
+    let ylt = simulate_ylt_from_elt(&[entry], 100_000, SEED).expect("ylt");
+    let events = ylt.events();
+    let n = events.len() as f64;
+    assert!(n > 990_000.0, "n={n}");
+    let mid = events
+        .iter()
+        .filter(|e| e.loss > 0.01 && e.loss < 0.99)
+        .count() as f64
+        / n;
+    // Binomial SE sqrt(p / n) ~ 3.0e-5: 4 SE.
+    let se = (exact_mid / n).sqrt();
+    assert!(
+        (mid - exact_mid).abs() < 4.0 * se,
+        "mid={mid} exact={exact_mid}"
+    );
+    // Mean 0.5, SD ~0.5: SE ~5e-4.
+    let mean = events.iter().map(|e| e.loss).sum::<f64>() / n;
+    assert!((mean - 0.5).abs() < 2e-3, "mean={mean}");
+    assert!(
+        events
+            .iter()
+            .all(|e| e.loss.is_finite() && (0.0..=1.0).contains(&e.loss))
+    );
 }

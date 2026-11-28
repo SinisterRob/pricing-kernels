@@ -1035,9 +1035,35 @@ fn test_catastrophe_elt_oep_aep_pml_and_layer_pricing() {
     // Occurrence layer expected loss for $4M xs $2M
     let layer = CommercialLayer::new(2_000_000.0, 4_000_000.0, 1.0).unwrap();
     let ceded = elt_occurrence_layer_expected_loss(&entries, &layer).unwrap();
-    // Event 2 alone contributes 0.02 * 4M = 80k; Event 1 adds positive Beta tail above 2M
-    assert!(ceded > 80_000.0);
-    assert!(ceded < summary.average_annual_loss);
+    // Event 2 (point mass 6M) contributes exactly 0.02 * 4M = 80k. Event 1: U = X / 10M ~
+    // Beta(a, b) with mu0 = 0.2, var0 = 0.05^2 -> a = 12.6, b = 50.4; its layer loss is
+    // 10M * E[min((U - 0.2)_+, 0.4)], referenced here by composite Simpson quadrature of the
+    // unnormalized density u^(a-1) (1-u)^(b-1) (normalized by its own integral, so no Gamma
+    // function or incomplete beta enters the reference), split at the kinks u = 0.2, 0.6.
+    let (a, b) = (12.6_f64, 50.4_f64);
+    let (pa, pb) = entries[0].beta_params().unwrap().unwrap();
+    assert!(close_rel(pa, a, 1e-12) && close_rel(pb, b, 1e-12));
+    let density = |u: f64| ((a - 1.0) * u.ln() + (b - 1.0) * (-u).ln_1p()).exp();
+    let simpson = |f: &dyn Fn(f64) -> f64, lo: f64, hi: f64| -> f64 {
+        let n = 20_000_usize; // even
+        let h = (hi - lo) / (n as f64);
+        let mut acc = f(lo) + f(hi);
+        for i in 1..n {
+            let w = if i % 2 == 1 { 4.0 } else { 2.0 };
+            acc += w * f(lo + (i as f64) * h);
+        }
+        acc * h / 3.0
+    };
+    let norm = simpson(&|u| density(u), 1e-300, 0.2)
+        + simpson(&|u| density(u), 0.2, 0.6)
+        + simpson(&|u| density(u), 0.6, 1.0 - 1e-16);
+    let layer_u = simpson(&|u| (u - 0.2) * density(u), 0.2, 0.6)
+        + simpson(&|u| 0.4 * density(u), 0.6, 1.0 - 1e-16);
+    let exact_ceded = 0.02 * 4_000_000.0 + 0.05 * 10_000_000.0 * layer_u / norm;
+    assert!(
+        close_rel(ceded, exact_ceded, 1e-9),
+        "ceded={ceded} exact={exact_ceded}"
+    );
 }
 
 #[test]
@@ -1146,6 +1172,26 @@ fn test_euler_tvar_rvar_sd_and_myers_read_capital_allocation() {
     assert!(close_rel(sum_a, 150.0, 1e-12));
     assert!(mr.default_probability > 0.0 && mr.default_put_value > 0.0);
     assert!(sample_var(&agg, 0.90).unwrap() >= sample_var(&agg, 0.50).unwrap());
+
+    // 5. Myers & Read hand-computed allocation on a 4-scenario example (equal weights):
+    //    X1 = (10, 0, 30, 60), X2 = (0, 20, 30, 40), S = (10, 20, 60, 100), A = 50.
+    //    Default scenarios {3, 4}: P(S > A) = 1/2, D = E[(S - A)_+] = (10 + 50) / 4 = 15,
+    //    D / P(S > A) = 30. L1 = 25, L2 = 22.5, L = 47.5; E[X1 | S > A] = 45, E[X2 | S > A] = 35.
+    //    A_i = E[X_i | S > A] - (L_i / L) * D / P(S > A):
+    //    A1 = 45 - (25 / 47.5) * 30 = 555/19, A2 = 35 - (22.5 / 47.5) * 30 = 395/19 (sum 50);
+    //    Q1 = A1 - L1 = 80/19, Q2 = A2 - L2 = -65/38 (sum 2.5 = A - L).
+    let x1 = [10.0, 0.0, 30.0, 60.0];
+    let x2 = [0.0, 20.0, 30.0, 40.0];
+    let hand = myers_read_allocation(&[&x1, &x2], 50.0).unwrap();
+    assert!(close_rel(hand.default_probability, 0.5, 1e-15));
+    assert!(close_rel(hand.default_put_value, 15.0, 1e-15));
+    assert!(close_rel(hand.portfolio_liability, 47.5, 1e-15));
+    assert!(close_rel(hand.conditional_tail_losses[0], 45.0, 1e-15));
+    assert!(close_rel(hand.conditional_tail_losses[1], 35.0, 1e-15));
+    assert!(close_rel(hand.allocated_assets[0], 555.0 / 19.0, 1e-14));
+    assert!(close_rel(hand.allocated_assets[1], 395.0 / 19.0, 1e-14));
+    assert!(close_rel(hand.allocated_surplus[0], 80.0 / 19.0, 1e-13));
+    assert!(close_rel(hand.allocated_surplus[1], -65.0 / 38.0, 1e-13));
 }
 
 #[test]

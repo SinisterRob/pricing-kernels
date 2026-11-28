@@ -322,8 +322,12 @@ pub fn elt_oep_pml(entries: &[EventLossEntry], return_period: f64) -> Result<f64
 }
 
 /// Expected annual ceded loss to a per-occurrence catastrophe excess-of-loss layer `layer`
-/// from an Event Loss Table (exact for point-mass events; 128-point composite midpoint
-/// integral of `S_i(x)` over `[attachment, attachment + limit]` for Beta-uncertain events).
+/// from an Event Loss Table.
+///
+/// Exact for both severity types: point-mass events pay `layer.payout(mean_loss)`, and
+/// Beta-uncertain events use the closed-form limited-expected-value difference
+/// `integral_a^{a+l} S_i(x) dx = E[X ^ (a + l)] - E[X ^ a]` (Klugman, Panjer & Willmot, Ch. 3)
+/// with `E[X ^ d]` from the regularized incomplete beta function.
 pub fn elt_occurrence_layer_expected_loss(
     entries: &[EventLossEntry],
     layer: &CommercialLayer,
@@ -341,21 +345,17 @@ pub fn elt_occurrence_layer_expected_loss(
         if entry.annual_rate == 0.0 {
             continue;
         }
-        if params.is_none() {
-            total_ceded += entry.annual_rate * layer.payout(entry.mean_loss);
-        } else {
-            if attach >= entry.max_loss {
-                continue;
+        match params {
+            None => total_ceded += entry.annual_rate * layer.payout(entry.mean_loss),
+            Some((alpha, beta)) => {
+                if attach >= entry.max_loss {
+                    continue;
+                }
+                let integral = (beta_scaled_lev(entry, alpha, beta, detach)
+                    - beta_scaled_lev(entry, alpha, beta, attach))
+                .max(0.0);
+                total_ceded += entry.annual_rate * layer.participation * integral;
             }
-            let hi = detach.min(entry.max_loss);
-            let n = 128_i32;
-            let h = (hi - attach) / f64::from(n);
-            let mut integral = 0.0;
-            for k in 0..n {
-                let x = attach + (f64::from(k) + 0.5) * h;
-                integral += entry.survival_with_params(x, params) * h;
-            }
-            total_ceded += entry.annual_rate * layer.participation * integral;
         }
     }
     Ok(total_ceded)
@@ -742,10 +742,15 @@ impl Xoshiro256StarStar {
         (-2.0 * u1.ln()).sqrt() * (std::f64::consts::TAU * u2).cos()
     }
 
-    fn sample_gamma(&mut self, alpha: f64) -> f64 {
+    /// Natural log of a `Gamma(alpha, 1)` draw (Marsaglia & Tsang 2000).
+    ///
+    /// For `alpha < 1` the boost `G(alpha) = G(alpha + 1) * U^(1 / alpha)` is applied in log
+    /// space, `ln G = ln G(alpha + 1) + ln(U) / alpha`, so tiny shapes (`alpha < ~1e-3`, where
+    /// `U^(1 / alpha)` underflows to `0`) remain exact instead of collapsing to zero.
+    fn sample_ln_gamma(&mut self, alpha: f64) -> f64 {
         if alpha < 1.0 {
-            let u = self.next_f64().max(1e-300);
-            return self.sample_gamma(alpha + 1.0) * u.powf(1.0 / alpha);
+            let u = self.next_f64().max(f64::MIN_POSITIVE);
+            return self.sample_ln_gamma(alpha + 1.0) + u.ln() / alpha;
         }
         let d = alpha - 1.0 / 3.0;
         let c = 1.0 / (9.0 * d).sqrt();
@@ -758,15 +763,23 @@ impl Xoshiro256StarStar {
             let v3 = v * v * v;
             let u = self.next_f64().max(1e-300);
             if u < 1.0 - 0.0331 * x * x * x * x || u.ln() < 0.5 * x * x + d * (1.0 - v3 + v3.ln()) {
-                return d * v3;
+                return d.ln() + 3.0 * v.ln();
             }
         }
     }
 
+    /// `Beta(alpha, beta)` draw `G1 / (G1 + G2) = 1 / (1 + exp(ln G2 - ln G1))`, evaluated from
+    /// log-gamma draws so it never forms `0 / 0` (no ad-hoc fallback value).
     fn sample_beta(&mut self, alpha: f64, beta: f64) -> f64 {
-        let x = self.sample_gamma(alpha);
-        let y = self.sample_gamma(beta);
-        if x + y > 0.0 { x / (x + y) } else { 0.5 }
+        let ln_x = self.sample_ln_gamma(alpha);
+        let ln_y = self.sample_ln_gamma(beta);
+        let diff = ln_y - ln_x;
+        if diff > 0.0 {
+            let e = (-diff).exp();
+            e / (1.0 + e)
+        } else {
+            1.0 / (1.0 + diff.exp())
+        }
     }
 
     /// Knuth multiplicative Poisson draw, exact for `0 < lambda <= POISSON_KNUTH_MAX_LAMBDA`.
