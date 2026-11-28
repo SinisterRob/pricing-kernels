@@ -4,3 +4,5 @@ Cargo.lock
 *.swp
 __pycache__/
 .robbit-refactor-cache.json
+
+.claude/
