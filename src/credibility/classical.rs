@@ -99,28 +99,50 @@ impl ClassicalCredibility {
     }
 
     /// Compute partial credibility `Z = sqrt(min(1.0, observed_volume / full_credibility_standard))`.
+    ///
+    /// `observed_volume = +inf` returns the well-defined limit `Z = 1` (full credibility).
+    ///
+    /// # Errors
+    /// [`PricingError::InvalidParameter`] when `observed_volume` is `NaN` or negative, or the
+    /// full-credibility standard is not finite and strictly positive.
     #[inline]
-    pub fn credibility(&self, observed_volume: f64) -> f64 {
-        if !observed_volume.is_finite()
-            || !self.full_credibility_standard.is_finite()
-            || !(self.full_credibility_standard > 0.0)
-        {
-            return f64::NAN;
+    pub fn credibility(&self, observed_volume: f64) -> Result<f64, PricingError> {
+        if !self.full_credibility_standard.is_finite() || !(self.full_credibility_standard > 0.0) {
+            return Err(PricingError::InvalidParameter(
+                "full credibility standard must be finite and strictly positive",
+            ));
         }
-        if observed_volume <= 0.0 {
-            0.0
-        } else if observed_volume >= self.full_credibility_standard {
+        if !(observed_volume >= 0.0) {
+            return Err(PricingError::InvalidParameter(
+                "observed credibility volume must be non-negative and not NaN",
+            ));
+        }
+        Ok(if observed_volume >= self.full_credibility_standard {
             1.0
         } else {
             (observed_volume / self.full_credibility_standard).sqrt()
-        }
+        })
     }
 
     /// Blend observed indication with prior complement:
     /// `Blended = Z * observed + (1 - Z) * prior`.
+    ///
+    /// # Errors
+    /// Propagates [`Self::credibility`] errors; [`PricingError::InvalidParameter`] when
+    /// `observed` or `prior` is not finite.
     #[inline]
-    pub fn blend(&self, observed_volume: f64, observed: f64, prior: f64) -> f64 {
-        let z = self.credibility(observed_volume);
-        z * observed + (1.0 - z) * prior
+    pub fn blend(
+        &self,
+        observed_volume: f64,
+        observed: f64,
+        prior: f64,
+    ) -> Result<f64, PricingError> {
+        if !observed.is_finite() || !prior.is_finite() {
+            return Err(PricingError::InvalidParameter(
+                "observed indication and prior complement must be finite",
+            ));
+        }
+        let z = self.credibility(observed_volume)?;
+        Ok(z * observed + (1.0 - z) * prior)
     }
 }

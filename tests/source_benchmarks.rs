@@ -203,15 +203,15 @@ fn test_multiplicative_rater_and_batch() {
 #[test]
 fn test_classical_credibility() {
     let cred = ClassicalCredibility::standard_90_5();
-    assert_eq!(cred.credibility(1082.41), 1.0);
-    assert_eq!(cred.credibility(2000.0), 1.0);
-    assert_eq!(cred.credibility(0.0), 0.0);
-    assert!(cred.credibility(f64::NAN).is_nan());
+    assert_eq!(cred.credibility(1082.41).unwrap(), 1.0);
+    assert_eq!(cred.credibility(2000.0).unwrap(), 1.0);
+    assert_eq!(cred.credibility(0.0).unwrap(), 0.0);
+    assert!(cred.credibility(f64::NAN).is_err());
 
-    let z = cred.credibility(1082.41 * 0.5);
+    let z = cred.credibility(1082.41 * 0.5).unwrap();
     assert!(close_rel(z, 0.5_f64.sqrt(), 1e-12));
 
-    let blended = cred.blend(1082.41 * 0.5, 120.0, 100.0);
+    let blended = cred.blend(1082.41 * 0.5, 120.0, 100.0).unwrap();
     assert!(close_rel(blended, z * 120.0 + (1.0 - z) * 100.0, 1e-12));
 }
 
@@ -303,13 +303,53 @@ fn test_ncci_experience_mod_exact_calculation() {
     assert_eq!(res.expected_excess, 60_000.0);
     // Exact numerator = 26,500 + 0.15*31,500 + 0.85*60,000 + 25,000 = 107,225
     // Exact denominator = 100,000 + 25,000 = 125,000
-    // Exact mod = 107,225 / 125,000 = 0.8578 -> rounds to 0.858
+    // Exact mod = 107,225 / 125,000 = 0.8578 -> NCCI 2-dp half-up -> 0.86
     assert!(close_rel(
         res.mod_factor_unrounded,
         107_225.0 / 125_000.0,
         1e-12
     ));
-    assert_eq!(res.mod_factor, 0.858);
+    assert_eq!(res.mod_factor, 0.86);
+}
+
+/// NCCI, *ABCs of Experience Rating*, worksheet example: `E = 197,071`, `E_p = 81,573`,
+/// `W = 0.16`, `B = 45,900`, `A_p = 88,100`, `A_e = 75,640`; published mod `1.00`.
+///
+/// Hand check: `E_e = E - E_p = 115,498`; numerator
+/// `A_p + W A_e + (1 - W) E_e + B = 88,100 + 12,102.40 + 97,018.32 + 45,900 = 243,120.72`;
+/// denominator `E + B = 242,971`; ratio `1.000616 -> 1.00` (NCCI 2-decimal rounding).
+#[test]
+fn test_ncci_abcs_worksheet_published_mod() {
+    let e = 197_071.0;
+    let e_p = 81_573.0;
+    let spec = NcciErpSpecification {
+        split_point: 18_500.0,
+        expected_losses: e,
+        d_ratio: e_p / e,
+        weight_w: 0.16,
+        ballast_b: 45_900.0,
+        apply_era: false,
+    };
+    // Four claims exceeding the split point (one carrying all excess) plus one primary-only
+    // claim reproduce the worksheet totals A_p = 88,100 and A_e = 75,640.
+    let claims: Vec<ExperienceClaim> =
+        [18_500.0 + 75_640.0, 18_500.0, 18_500.0, 18_500.0, 14_100.0]
+            .iter()
+            .map(|&incurred| ExperienceClaim {
+                incurred,
+                is_medical_only: false,
+            })
+            .collect();
+    let res = spec.calculate(&claims).unwrap();
+    assert_eq!(res.actual_primary, 88_100.0);
+    assert_eq!(res.actual_excess, 75_640.0);
+    assert!(close_rel(res.expected_excess, 115_498.0, 1e-12));
+    assert!(close_rel(
+        res.mod_factor_unrounded,
+        243_120.72 / 242_971.0,
+        1e-12
+    ));
+    assert_eq!(res.mod_factor, 1.00);
 }
 
 #[test]

@@ -4,6 +4,21 @@
 //! Reference: C. A. Hachemeister (1975), *"Credibility for Regression Models with Application
 //! to Trend"*, in *Credibility: Theory and Applications* (ed. P. M. Kahn), Academic Press,
 //! pp. 129–163; CAS Exam 8 syllabus.
+//!
+//! # Time-origin invariance (centred parameterization)
+//!
+//! The PSD projection of the VHM matrix `A` (eigenvalue clamping) is not invariant under the
+//! affine reparameterization `t -> t - c`, so estimating in the user's raw time origin makes the
+//! credibility estimates depend on whether time is coded `1..5`, `2021..2025` or `-2..2`.
+//! Following Bühlmann & Gisler (2005), *A Course in Credibility Theory*, §8.4 (choice of the
+//! design origin at the barycentre), all structural parameters, the PSD projection and the
+//! credibility matrices are computed in **centred coordinates** `t_c = t - t_bar`, where
+//! `t_bar = sum_ij w_ij t_ij / sum_ij w_ij` is the exposure-weighted collective time centre
+//! (reported as [`HachemeisterResult::time_centre`]). Results are then mapped back to the
+//! user's original time coordinates with `T = [[1, -t_bar], [0, 1]]`
+//! (`beta = T beta_c`, `A = T A_c T^T`, `Z_i = T Z_{c,i} T^-1`), so predictions
+//! `beta_0 + beta_1 t` are invariant (up to floating-point rounding) to any shift of the
+//! time origin.
 
 use crate::error::PricingError;
 use serde::{Deserialize, Serialize};
@@ -32,15 +47,21 @@ impl HachemeisterGroupResult {
 pub struct HachemeisterResult {
     /// Expected Process Variance (`s^2`): pooled unbiased weighted residual variance.
     pub epv: f64,
+    /// Exposure-weighted collective time centre `t_bar = sum_ij w_ij t_ij / sum_ij w_ij`
+    /// (original time units) at which the estimation and PSD projection are performed.
+    pub time_centre: f64,
     /// Collective prior regression vector `[intercept, slope]` (`b`), credibility-weighted
     /// `b = (sum_i Z_i)^-1 sum_i Z_i beta_i` (GLS-weighted fallback when `sum_i Z_i` is singular).
     pub collective_beta: [f64; 2],
     /// Row-major `2x2` Variance of Hypothetical Means covariance matrix `A` (PSD-projected),
     /// estimated by the exposure-weighted multivariate Bühlmann-Straub moment estimator,
-    /// unbiased (before projection) for arbitrary per-group designs.
+    /// unbiased (before projection) for arbitrary per-group designs. The projection is done in
+    /// centred coordinates (see module docs); the matrix is reported in the original time
+    /// coordinates as `T A_c T^T` (still PSD).
     pub vhm_matrix: [f64; 4],
-    /// Row-major `2x2` unbiased VHM moment estimate **before** PSD projection (may be
-    /// indefinite in small samples; exposed for diagnostics and unbiasedness checks).
+    /// Row-major `2x2` unbiased VHM moment estimate **before** PSD projection, in original
+    /// time coordinates (may be indefinite in small samples; exposed for diagnostics and
+    /// unbiasedness checks).
     pub vhm_matrix_raw: [f64; 4],
     /// Per-group standalone WLS and credibility-blended regression estimates.
     pub groups: Vec<HachemeisterGroupResult>,
@@ -86,6 +107,16 @@ fn mat_mul_2x2(a: [f64; 4], b: [f64; 4]) -> [f64; 4] {
         a[2] * b[0] + a[3] * b[2],
         a[2] * b[1] + a[3] * b[3],
     ]
+}
+
+/// Change-of-origin matrix `T = [[1, -t_bar], [0, 1]]` mapping centred `[intercept at t_bar,
+/// slope]` to original-coordinate `[intercept at t = 0, slope]`.
+#[inline]
+fn origin_transform(t_bar: f64) -> ([f64; 4], [f64; 4], [f64; 4]) {
+    let t = [1.0, -t_bar, 0.0, 1.0];
+    let t_inv = [1.0, t_bar, 0.0, 1.0];
+    let t_tr = [1.0, 0.0, -t_bar, 1.0];
+    (t, t_inv, t_tr)
 }
 
 #[inline]
@@ -137,6 +168,11 @@ fn project_psd_2x2(a: f64, b: f64, d: f64) -> [f64; 4] {
 ///   Goovaerts (1996)), then projected onto the PSD cone.
 /// - `b = (sum_i Z_i)^-1 sum_i Z_i beta_i` with `Z_i = A (A + s^2 V_i)^-1` (Hachemeister 1975).
 ///
+/// All of the above is evaluated in centred time coordinates `t - t_bar` (exposure-weighted
+/// collective barycentre, Bühlmann & Gisler (2005) §8.4) so that the PSD projection — and hence
+/// every prediction — is invariant to the time origin; reported coefficients and matrices are
+/// mapped back to the caller's original time coordinates (see the module docs).
+///
 /// Trade-off: the scalar exposure weights `w_i` give a closed-form, non-iterative unbiased
 /// estimator; the matrix-weighted (`X_i^T W_i X_i`) pseudo-estimator of Bühlmann-Gisler is more
 /// efficient for very heterogeneous designs but requires a fixed-point iteration.
@@ -157,6 +193,38 @@ pub fn hachemeister_credibility(
         ));
     }
 
+    // Pass 1: validate inputs and compute the exposure-weighted collective time centre.
+    let mut sum_w = 0.0;
+    let mut sum_wt = 0.0;
+    for i in 0..k {
+        let ts = groups_times[i];
+        let ys = groups_values[i];
+        let ws = groups_weights[i];
+        let n = ts.len();
+        if n < 2 || ys.len() != n || ws.len() != n {
+            return Err(PricingError::DimensionMismatch(
+                "each group must have matching slices with at least 2 observations",
+            ));
+        }
+        for j in 0..n {
+            let (t, y, w) = (ts[j], ys[j], ws[j]);
+            if !t.is_finite() || !y.is_finite() || !w.is_finite() || !(w > 0.0) {
+                return Err(PricingError::InvalidParameter(
+                    "times, values must be finite and weights must be finite and positive",
+                ));
+            }
+            sum_w += w;
+            sum_wt += w * t;
+        }
+    }
+    let time_centre = sum_wt / sum_w;
+    if !time_centre.is_finite() {
+        return Err(PricingError::InvalidParameter(
+            "Hachemeister collective time centre is not finite",
+        ));
+    }
+
+    // Pass 2: everything below is in centred coordinates t_c = t - time_centre.
     let mut xtwx_list = Vec::with_capacity(k);
     let mut xtwx_inv_list = Vec::with_capacity(k);
     let mut wls_betas = Vec::with_capacity(k);
@@ -168,11 +236,6 @@ pub fn hachemeister_credibility(
         let ys = groups_values[i];
         let ws = groups_weights[i];
         let n = ts.len();
-        if n < 2 || ys.len() != n || ws.len() != n {
-            return Err(PricingError::DimensionMismatch(
-                "each group must have matching slices with at least 2 observations",
-            ));
-        }
 
         let mut s00 = 0.0;
         let mut s01 = 0.0;
@@ -181,14 +244,9 @@ pub fn hachemeister_credibility(
         let mut r1 = 0.0;
 
         for j in 0..n {
-            let t = ts[j];
+            let t = ts[j] - time_centre;
             let y = ys[j];
             let w = ws[j];
-            if !t.is_finite() || !y.is_finite() || !w.is_finite() || !(w > 0.0) {
-                return Err(PricingError::InvalidParameter(
-                    "times, values must be finite and weights must be finite and positive",
-                ));
-            }
             s00 += w;
             s01 += w * t;
             s11 += w * t * t;
@@ -201,7 +259,7 @@ pub fn hachemeister_credibility(
         let beta = mat_vec_2x2(inv, [r0, r1]);
 
         for j in 0..n {
-            let resid = ys[j] - (beta[0] + beta[1] * ts[j]);
+            let resid = ys[j] - (beta[0] + beta[1] * (ts[j] - time_centre));
             total_sse += ws[j] * resid * resid;
         }
         total_df += n.saturating_sub(2);
@@ -314,6 +372,8 @@ pub fn hachemeister_credibility(
         mat_vec_2x2(invert_2x2(sum_m)?, sum_mb)
     };
 
+    // Map centred-coordinate results back to the user's original time coordinates.
+    let (t_mat, t_inv, t_tr) = origin_transform(time_centre);
     let mut groups = Vec::with_capacity(k);
     for i in 0..k {
         let z_mat = z_mats[i];
@@ -325,17 +385,18 @@ pub fn hachemeister_credibility(
         let cred_beta = [collective_beta[0] + adj[0], collective_beta[1] + adj[1]];
 
         groups.push(HachemeisterGroupResult {
-            wls_beta: wls_betas[i],
-            credibility_beta: cred_beta,
-            credibility_matrix: z_mat,
+            wls_beta: mat_vec_2x2(t_mat, wls_betas[i]),
+            credibility_beta: mat_vec_2x2(t_mat, cred_beta),
+            credibility_matrix: mat_mul_2x2(mat_mul_2x2(t_mat, z_mat), t_inv),
         });
     }
 
     Ok(HachemeisterResult {
         epv,
-        collective_beta,
-        vhm_matrix: vhm,
-        vhm_matrix_raw: [a00, a01, a01, a11],
+        time_centre,
+        collective_beta: mat_vec_2x2(t_mat, collective_beta),
+        vhm_matrix: mat_mul_2x2(mat_mul_2x2(t_mat, vhm), t_tr),
+        vhm_matrix_raw: mat_mul_2x2(mat_mul_2x2(t_mat, [a00, a01, a01, a11]), t_tr),
         groups,
     })
 }

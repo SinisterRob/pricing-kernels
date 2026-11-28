@@ -93,6 +93,7 @@ pub extern "C" fn pk_classical_credibility(full_standard: f64, observed_volume: 
         full_credibility_standard: full_standard,
     }
     .credibility(observed_volume)
+    .unwrap_or(f64::NAN)
 }
 
 /// Evaluate single-change Calendar-Year earned parallelogram on-level factor.

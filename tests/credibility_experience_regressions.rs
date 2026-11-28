@@ -215,6 +215,130 @@ fn hachemeister_collective_is_credibility_weighted() {
     assert!(a[0] * a[3] - a[1] * a[2] > 0.0);
 }
 
+/// Reviewer probe panel: K = 4 groups, 5 unit-weight years. Pre-fix, the PSD projection in
+/// the raw (t = 0 intercept) parameterization made year-6 predictions depend on the time origin
+/// (16.417 / 15.973 / 16.119 for group 2 under t = 1..5 / 2021..2025 / -2..2).
+#[test]
+fn hachemeister_predictions_invariant_to_time_origin() {
+    let ys: Vec<Vec<f64>> = vec![
+        vec![10.0, 11.5, 11.0, 13.2, 14.0],
+        vec![12.0, 12.1, 13.9, 14.2, 15.5],
+        vec![9.0, 10.5, 10.0, 12.5, 12.0],
+        vec![11.0, 11.0, 12.5, 12.0, 13.9],
+    ];
+    let ws = [
+        [1.0, 1.0, 1.0, 1.0, 1.0],
+        [1.0, 2.0, 1.0, 3.0, 1.0],
+        [2.0; 5],
+        [0.5; 5],
+    ];
+    let y_sl: Vec<&[f64]> = ys.iter().map(Vec::as_slice).collect();
+    let w_sl: Vec<&[f64]> = ws.iter().map(<[f64; 5]>::as_slice).collect();
+    let fit = |offset: f64| {
+        let ts: Vec<f64> = (1..=5).map(|t| f64::from(t) + offset).collect();
+        let t_sl: Vec<&[f64]> = (0..ys.len()).map(|_| ts.as_slice()).collect();
+        hachemeister_credibility(&t_sl, &y_sl, &w_sl).unwrap()
+    };
+    let base = fit(0.0);
+    // Projection must be active here (raw A indefinite) for the test to be meaningful.
+    let raw = base.vhm_matrix_raw;
+    assert!(raw[0] * raw[3] - raw[1] * raw[2] < 0.0);
+    for offset in [2020.0, -3.0] {
+        let shifted = fit(offset);
+        assert!((shifted.time_centre - (base.time_centre + offset)).abs() < 1e-9);
+        assert!((shifted.epv - base.epv).abs() < 1e-9 * base.epv);
+        for (g0, g1) in base.groups.iter().zip(&shifted.groups) {
+            // Slopes are origin-free; predictions at matching calendar points must agree.
+            assert!((g0.credibility_beta[1] - g1.credibility_beta[1]).abs() < 1e-9);
+            for t in [0.0, 3.0, 6.0, 10.0] {
+                let (p0, p1) = (g0.predict(t), g1.predict(t + offset));
+                assert!(
+                    (p0 - p1).abs() < 1e-9,
+                    "offset {offset}, t {t}: {p0} vs {p1}"
+                );
+            }
+        }
+        // Reported matrices are in original coordinates: A_shift = S A S^T with S = [[1, o], [0, 1]]
+        // mapping intercept-at-0 under the base origin to intercept-at-0 under the shifted one.
+        let a = base.vhm_matrix;
+        let o = -offset;
+        let a00 = a[0] + 2.0 * o * a[1] + o * o * a[3];
+        let a01 = a[1] + o * a[3];
+        let b = shifted.vhm_matrix;
+        let scale = a00.abs().max(1.0);
+        assert!((b[0] - a00).abs() < 1e-9 * scale, "{} vs {a00}", b[0]);
+        assert!((b[1] - a01).abs() < 1e-9 * scale);
+        assert!((b[3] - a[3]).abs() < 1e-9);
+        assert!(b.iter().any(|&v| v != 0.0));
+    }
+}
+
+/// Heterogeneous designs: every group has its own time grid and per-observation exposures.
+/// Checks the raw VHM / EPV moment estimators and the credibility predictions are unbiased
+/// (the latter exactly, by the reflection symmetry `y -> 2 X b - y` of the estimator).
+#[test]
+fn hachemeister_unbiased_for_heterogeneous_designs() {
+    let times: [&[f64]; 5] = [
+        &[1.0, 2.0, 3.0, 4.0, 5.0],
+        &[3.0, 4.0, 5.0, 6.0, 7.0, 8.0],
+        &[0.0, 2.0, 4.0],
+        &[5.0, 6.0, 7.0, 8.0],
+        &[1.0, 3.0, 5.0, 7.0, 9.0],
+    ];
+    let weights: [&[f64]; 5] = [
+        &[1.0, 2.0, 1.5, 3.0, 2.0],
+        &[10.0, 12.0, 8.0, 9.0, 11.0, 10.0],
+        &[0.5, 0.8, 0.6],
+        &[30.0, 25.0, 40.0, 35.0],
+        &[4.0, 5.0, 6.0, 5.0, 4.0],
+    ];
+    let b = [10.0, 1.0];
+    // A = [[4, 0.6], [0.6, 1]] = L L^T with L = [[2, 0], [0.3, sqrt(0.91)]].
+    let chol_a = [2.0, 0.3, 0.91_f64.sqrt()];
+    let true_a = [4.0, 0.6, 1.0];
+    let s2 = 4.0;
+    let t_pred = 10.0;
+
+    let mut rng = SplitMix64::new(SEED);
+    let mut acc: [MeanSe; 5] = Default::default();
+    for _ in 0..FAST_SIMS {
+        let mut ys: Vec<Vec<f64>> = Vec::with_capacity(times.len());
+        let mut truth = Vec::with_capacity(times.len());
+        for (ts, ws) in times.iter().zip(&weights) {
+            let z0 = rng.normal();
+            let z1 = rng.normal();
+            let beta0 = b[0] + chol_a[0] * z0;
+            let beta1 = b[1] + chol_a[1] * z0 + chol_a[2] * z1;
+            truth.push(beta0 + beta1 * t_pred);
+            ys.push(
+                ts.iter()
+                    .zip(ws.iter())
+                    .map(|(&t, &w)| beta0 + beta1 * t + (s2 / w).sqrt() * rng.normal())
+                    .collect(),
+            );
+        }
+        let y_sl: Vec<&[f64]> = ys.iter().map(Vec::as_slice).collect();
+        let res = hachemeister_credibility(&times, &y_sl, &weights).unwrap();
+        acc[0].push(res.vhm_matrix_raw[0]);
+        acc[1].push(res.vhm_matrix_raw[1]);
+        acc[2].push(res.vhm_matrix_raw[3]);
+        acc[3].push(res.epv);
+        let err: f64 = res
+            .groups
+            .iter()
+            .zip(&truth)
+            .map(|(g, &m)| g.predict(t_pred) - m)
+            .sum::<f64>()
+            / truth.len() as f64;
+        acc[4].push(err);
+    }
+    acc[0].assert_unbiased(true_a[0], "heterogeneous Hachemeister A00");
+    acc[1].assert_unbiased(true_a[1], "heterogeneous Hachemeister A01");
+    acc[2].assert_unbiased(true_a[2], "heterogeneous Hachemeister A11");
+    acc[3].assert_unbiased(s2, "heterogeneous Hachemeister s^2");
+    acc[4].assert_unbiased(0.0, "heterogeneous Hachemeister prediction error");
+}
+
 // ---------------------------------------------------------------------------
 // Bühlmann–Straub & Jewell Monte Carlo unbiasedness (finding 9)
 // ---------------------------------------------------------------------------
@@ -355,7 +479,7 @@ fn credibility_bounded_and_monotone_in_exposure() {
     let mut prev = 0.0;
     for i in 0..500 {
         let n = f64::from(i) * 5.0;
-        let z = cred.credibility(n);
+        let z = cred.credibility(n).unwrap();
         assert!((0.0..=1.0).contains(&z));
         assert!(z >= prev);
         prev = z;
@@ -552,15 +676,15 @@ fn ncci_per_claim_accident_limitation_hand_computation() {
     let res = calculate_ncci_experience_mod_by_accident(&spec, &[&claim], Some(&lim)).unwrap();
     // Ratable = 250,000 -> A_p = 20,000, A_e = 230,000; E_e = 87,500.
     // Mod = (20,000 + 0.2 * 230,000 + 0.8 * 87,500 + 10,000) / (125,000 + 10,000)
-    //     = 146,000 / 135,000 = 1.08148... -> 1.081.
+    //     = 146,000 / 135,000 = 1.08148... -> 1.08 (NCCI 2-dp).
     assert!((res.actual_primary - 20_000.0).abs() < 1e-9);
     assert!((res.actual_excess - 230_000.0).abs() < 1e-9);
     assert!((res.mod_factor_unrounded - 146_000.0 / 135_000.0).abs() < 1e-12);
-    assert!((res.mod_factor - 1.081).abs() < 1e-12);
+    assert!((res.mod_factor - 1.08).abs() < 1e-12);
 
-    // Unlimited: (20,000 + 196,000 + 70,000 + 10,000) / 135,000 = 2.193.
+    // Unlimited: (20,000 + 196,000 + 70,000 + 10,000) / 135,000 = 2.1926 -> 2.19.
     let unlimited = calculate_ncci_experience_mod_by_accident(&spec, &[&claim], None).unwrap();
-    assert!((unlimited.mod_factor - 2.193).abs() < 1e-12);
+    assert!((unlimited.mod_factor - 2.19).abs() < 1e-12);
     let legacy = calculate_ncci_experience_mod(&spec, &claim).unwrap();
     assert_eq!(unlimited, legacy);
 }
@@ -669,4 +793,74 @@ fn parallelogram_identity_and_multiplicativity() {
         let with_early = parallelogram_on_level_factor(year, &changes).unwrap();
         assert!((with_early - scaled).abs() < 1e-12 * scaled.max(1.0));
     }
+}
+
+// ---------------------------------------------------------------------------
+// Round-2 review: Table L near-unit mean, classical credibility limits, NCCI rounding
+// ---------------------------------------------------------------------------
+
+/// `E[Y*]` within `PROBABILITY_SUM_TOL` above 1 is accepted; construction must then imply a
+/// valid `from_rows` / serde round trip (pre-fix: `k` clamped to 0 left `phi*(0) = E[Y*] > 1`).
+#[test]
+fn table_l_mean_slightly_above_one_round_trips() {
+    let tl = TableLEngine::from_limited_discrete_pdf(&[0.5, 1.5001], &[0.5, 0.5]).unwrap();
+    assert_eq!(tl.loss_elimination_ratio, 0.0);
+    assert!((tl.charge_at(0.0) - 1.0).abs() < 1e-12);
+    let json = serde_json::to_string(&tl).unwrap();
+    let back: TableLEngine = serde_json::from_str(&json).unwrap();
+    // serde_json's default float parser may differ in the last ulp; compare to rounding.
+    for (r0, r1) in tl.rows().iter().zip(back.rows()) {
+        assert!((r0.entry_ratio - r1.entry_ratio).abs() < 1e-14);
+        assert!((r0.charge - r1.charge).abs() < 1e-14);
+    }
+    assert!(TableLEngine::from_rows(tl.loss_elimination_ratio, tl.rows().to_vec()).is_ok());
+    // Beyond the tolerance band it is still rejected.
+    assert!(TableLEngine::from_limited_discrete_pdf(&[0.5, 1.6], &[0.5, 0.5]).is_err());
+}
+
+#[test]
+fn classical_credibility_infinite_volume_is_full_and_invalid_is_err() {
+    let cred = ClassicalCredibility::standard_90_5();
+    assert_eq!(cred.credibility(f64::INFINITY).unwrap(), 1.0);
+    assert_eq!(cred.blend(f64::INFINITY, 120.0, 100.0).unwrap(), 120.0);
+    assert!(matches!(
+        cred.credibility(f64::NAN),
+        Err(PricingError::InvalidParameter(_))
+    ));
+    assert!(cred.credibility(-1.0).is_err());
+    assert!(cred.credibility(f64::NEG_INFINITY).is_err());
+    assert!(cred.blend(100.0, f64::NAN, 1.0).is_err());
+    assert!(cred.blend(100.0, 1.0, f64::INFINITY).is_err());
+    let bad = ClassicalCredibility {
+        full_credibility_standard: 0.0,
+    };
+    assert!(bad.credibility(10.0).is_err());
+}
+
+/// NCCI publishes mods to two decimals, rounded half-up.
+#[test]
+fn ncci_mod_rounds_half_up_to_two_decimals() {
+    // E = 100,000, D = 0.5, W = 0, B = 0 -> Mod = (A_p + 50,000) / 100,000; A_p = 35,500
+    // gives 0.855 -> 0.86 (half-up, not banker's rounding or truncation).
+    let spec = NcciErpSpecification {
+        split_point: 1_000_000.0,
+        expected_losses: 100_000.0,
+        d_ratio: 0.5,
+        weight_w: 0.0,
+        ballast_b: 0.0,
+        apply_era: false,
+    };
+    let claim = [ExperienceClaim {
+        incurred: 35_500.0,
+        is_medical_only: false,
+    }];
+    let res = calculate_ncci_experience_mod(&spec, &claim).unwrap();
+    assert!((res.mod_factor_unrounded - 0.855).abs() < 1e-12);
+    assert_eq!(res.mod_factor, 0.86);
+    let claim = [ExperienceClaim {
+        incurred: 35_499.0,
+        is_medical_only: false,
+    }];
+    let res = calculate_ncci_experience_mod(&spec, &claim).unwrap();
+    assert_eq!(res.mod_factor, 0.85);
 }

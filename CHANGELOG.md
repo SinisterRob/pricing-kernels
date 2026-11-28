@@ -16,6 +16,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **ALAE ILFs**: ALAE-Included under bivariate Lognormal uses an exact 1-D conditional-LEV reduction with adaptive Gauss–Kronrod (fixed 32×32 Gauss–Legendre had errors up to 3.8%). Power-Law documented as deterministic ALAE.
 - **Reinsurance**: pro-rata-as-to-amount-and-time reinstatements are exact under compound Poisson with uniform arrivals (Sundt 1991; Mata 2000); the flat 0.5 time factor (first reinstatement −16% at λ=1) is removed.
 - **MBBEFD**: continuous across b=1 and bg=1 via `expm1`/`ln_1p` (removed 1e-12 tolerance branches with 5e-5 cancellation error).
+- **Hachemeister time-origin invariance**: estimation, PSD projection of `A` and credibility matrices now run in centred time `t − t̄` (exposure-weighted collective barycentre, Bühlmann & Gisler 2005 §8.4) and are mapped back; predictions are invariant to time-origin shifts (previously `t = 2021..2025` collapsed `A` to 0 and changed predictions by up to 0.44).
+- **NCCI ERP**: mods are rounded half-up to 2 decimals (`NCCI_MOD_DECIMALS`), as published by NCCI (*ABCs of Experience Rating* worksheet golden: 243,120.72 / 242,971 → 1.00); previously 3 decimals.
+- **Myers–Cohn**: the loss-related underwriting tax shield `τL` is discounted at the risk-adjusted `r_L` (Myers & Cohn 1987; Robbin), not `r_f`; 1-period golden `P` 95.7543 → 1233/13 = 94.8462.
+- **Table L**: `from_limited_discrete_pdf` with `1 < E[Y*] ≤ 1 + 1e-4` rescales entry ratios (k = 0, φ*(0) = 1) and re-validates via `from_rows`, so every constructed engine serde round-trips.
+- **Classical credibility**: `credibility(+∞)` = 1 (was NaN); NaN/negative volume is an error.
+- Docs: `TableMEngine::from_aggregate` normalizes by the renormalized retained-pmf mean, not `agg.mean`.
 
 ### Changed (breaking)
 - YLT `oep_pml`/`aep_pml` default to the rank convention $T = N/r$ and error when $T > N$; `EmpiricalPmlConvention::LowerQuantile` restores the old behaviour.
@@ -25,6 +31,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Spliced EVT SE vectors have length 5 (body_weight included); new field `EvtFitResult.iterations`.
 - `TrendModel::new` and `ClassicalCredibility::from_confidence_and_tolerance` return `Result`; `TableMEngine.rows` / `TableLEngine.rows` are private (`rows()`, validated `from_rows`, validated serde).
 - `HachemeisterResult` adds `vhm_matrix_raw`; Hachemeister numbers change.
+- `HachemeisterResult` adds `time_centre`; results change whenever the raw-origin PSD projection was active (coefficients/matrices still reported in the caller's time coordinates).
+- `NcciErpResult.mod_factor` is 2-decimal (e.g. 0.858 → 0.86); `datasets::ncci_erp_worksheet().expected_mod_rounded` = 0.86. New pub const `NCCI_MOD_DECIMALS`.
+- `myers_cohn_profit_load` fair premium / `pv_underwriting_profit_tax` change whenever `loss_discount_rate ≠ risk_free_rate`.
+- `ClassicalCredibility::credibility` and `blend` return `Result<f64, PricingError>` (FFI `pk_classical_credibility` still returns NaN on error).
 - New fields: `TweediePowerSelection.best_dispersion`, `InformationCriteria.{log_likelihood, ml_dispersion}`, `converged` on `ZeroModifiedPoissonResult` and `RandomInterceptGlmmResult`; new variant `RegularizedGlmFamily::ZeroTruncatedPoisson`.
 - `glm_information_criteria` rejects `QuasiPoisson` (no likelihood); AIC/BIC values change.
 - `bspline_basis` errors outside $[t_d, t_{M-d}]$ and requires `knots.len() >= 2·degree + 2`; `batch_score_into` rejects NaN/negative inputs and min > max.

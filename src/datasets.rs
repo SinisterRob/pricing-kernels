@@ -39,7 +39,7 @@ pub struct NcciWorksheetDataset {
     pub claims: Vec<ExperienceClaim>,
     /// Exact unrounded modification factor (`107_225 / 125_000 = 0.8578`).
     pub expected_mod_unrounded: f64,
-    /// Published 3-decimal rounded modification factor (`0.858`).
+    /// Published NCCI 2-decimal (half-up) rounded modification factor (`0.86`).
     pub expected_mod_rounded: f64,
 }
 
@@ -69,7 +69,7 @@ pub fn ncci_erp_worksheet() -> NcciWorksheetDataset {
             },
         ],
         expected_mod_unrounded: 107_225.0 / 125_000.0,
-        expected_mod_rounded: 0.858,
+        expected_mod_rounded: 0.86,
     }
 }
 
