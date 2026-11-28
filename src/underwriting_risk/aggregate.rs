@@ -23,7 +23,30 @@ use std::f64::consts::TAU;
 /// `1e-6` keeps the lost mass two orders of magnitude below a `1 - 0.9999` (1-in-10,000)
 /// tail probability, so every `VaR` / `TVaR` level used in practice is supported by
 /// retained grid mass. Increase `n_steps` / `fft_size` (or `step`) if this guard fires.
+///
+/// The same tolerance bounds the accepted input severity-PMF mass deficit (see
+/// [`panjer_recursion`]) and the total-mass error of each [`convolve_independent_aggregates`]
+/// component, so an input deficit is never misreported as grid truncation.
 pub const AGGREGATE_GRID_TOLERANCE: f64 = 1e-6;
+
+/// Safety multiple applied to the estimated per-bin floating-point noise of the radix-2 FFT
+/// inversion before untilting.
+///
+/// The per-bin noise in the tilted domain is estimated as
+/// `max(max_k |Im g_tilde_k|, log2(N) * f64::EPSILON * max_k |g_tilde_k|)` (the imaginary part
+/// of the inverse transform is exactly zero in exact arithmetic, so its magnitude measures the
+/// realized round-off; the second term is the standard `O(eps log2 N)` FFT error bound).
+/// Untilting multiplies the noise at bin `k` by `exp(theta * k)` (Embrechts & Frei 2009, §3),
+/// so bins with `|g_k| <= FFT_ROUNDOFF_SAFETY_FACTOR * noise * exp(theta * k)` are set to `0`.
+pub const FFT_ROUNDOFF_SAFETY_FACTOR: f64 = 8.0;
+
+/// Maximum fraction of the `TVaR_alpha` tail mass `1 - alpha` that may be missing from the
+/// aggregate grid (mass lost beyond `(pmf.len() - 1) * step`) before
+/// [`AggregateLossDistribution::tvar`] returns [`PricingError::OutOfBounds`].
+///
+/// At `1e-3` at least 99.9% of the tail is represented on the grid; because missing mass lies
+/// above every grid point, the returned value is then a lower bound on the true `TVaR`.
+pub const TVAR_MAX_LOST_TAIL_FRACTION: f64 = 1e-3;
 
 /// Claim-count frequency distribution in the Panjer `(a, b, 0)` class.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
@@ -261,11 +284,15 @@ impl AggregateLossDistribution {
 
     /// Coherent Tail Value-at-Risk `TVaR_alpha(S) = (1 / (1 - alpha)) * integral_alpha^1 VaR_u(S) du`.
     ///
-    /// Any mass missing from the grid lies above every grid point, i.e. inside every tail, so
-    /// `TVaR` is only computable when `|1 - total_mass()| <= AGGREGATE_GRID_TOLERANCE`; otherwise
-    /// [`PricingError::OutOfBounds`] is returned. The tail integral is normalized by the retained
-    /// tail mass, so the result is a probability-weighted average of grid points at or above
-    /// `VaR_alpha` and `TVaR_alpha >= VaR_alpha` holds by construction.
+    /// Any mass missing from the grid lies above every grid point, i.e. inside every tail. The
+    /// tail integral is normalized by the *retained* tail mass, so the result is a
+    /// probability-weighted average of grid points at or above `VaR_alpha` (`TVaR_alpha >=
+    /// VaR_alpha` by construction) and a lower bound on the true `TVaR` when mass is missing.
+    ///
+    /// Returns [`PricingError::OutOfBounds`] when `|1 - total_mass()| >
+    /// AGGREGATE_GRID_TOLERANCE`, or when the missing mass `1 - total_mass()` exceeds
+    /// [`TVAR_MAX_LOST_TAIL_FRACTION`]` * (1 - alpha)`, i.e. when less than 99.9% of the tail
+    /// is represented on the grid (relevant for `alpha` close to `1`).
     pub fn tvar(&self, alpha: f64) -> Result<f64, PricingError> {
         if !alpha.is_finite() || !(alpha > 0.0) || !(alpha < 1.0) {
             return Err(PricingError::InvalidParameter(
@@ -275,6 +302,12 @@ impl AggregateLossDistribution {
         if (1.0 - self.total_mass()).abs() > AGGREGATE_GRID_TOLERANCE {
             return Err(PricingError::OutOfBounds(
                 "TVaR undefined: aggregate grid total mass differs from 1 by more than AGGREGATE_GRID_TOLERANCE",
+            ));
+        }
+        let lost_mass = (1.0 - self.total_mass()).max(0.0);
+        if lost_mass > TVAR_MAX_LOST_TAIL_FRACTION * (1.0 - alpha) {
+            return Err(PricingError::OutOfBounds(
+                "TVaR undefined: mass lost beyond the grid exceeds TVAR_MAX_LOST_TAIL_FRACTION of the tail mass 1 - alpha; extend the grid",
             ));
         }
         let mut cdf = 0.0;
@@ -377,28 +410,46 @@ fn severity_grid_mean(severity_pmf: &[f64], step: f64) -> f64 {
         .sum()
 }
 
+/// Floating-point round-off allowance carried into [`check_grid_adequacy`].
+#[derive(Debug, Clone, Copy, Default)]
+struct RoundOffAllowance {
+    /// Allowance on total probability mass.
+    mass: f64,
+    /// Allowance on the mean `E[S]` (monetary units).
+    mean: f64,
+}
+
 /// Reject a discretized aggregate whose retained mass or mean shows truncation / aliasing.
 ///
 /// For a finite-support severity PMF the compound mean `E[S] = E[N] E[X]` is exact, so a
 /// relative mean error beyond [`AGGREGATE_GRID_TOLERANCE`] detects mass truncated off the grid
 /// or wrapped around to low indices by circular convolution, even when total mass is `1`.
+/// `round_off` widens both checks by the computed floating-point floor (zero for Panjer).
 fn check_grid_adequacy(
     dist: &AggregateLossDistribution,
     expected_mean: f64,
+    round_off: RoundOffAllowance,
     mass_msg: &'static str,
     mean_msg: &'static str,
 ) -> Result<(), PricingError> {
-    if (1.0 - dist.total_mass()).abs() > AGGREGATE_GRID_TOLERANCE {
+    if (1.0 - dist.total_mass()).abs() > AGGREGATE_GRID_TOLERANCE + round_off.mass {
         return Err(PricingError::OutOfBounds(mass_msg));
     }
     let scale = expected_mean.abs().max(dist.step);
-    if (dist.mean - expected_mean).abs() > AGGREGATE_GRID_TOLERANCE * scale {
+    if (dist.mean - expected_mean).abs() > AGGREGATE_GRID_TOLERANCE * scale + round_off.mean {
         return Err(PricingError::OutOfBounds(mean_msg));
     }
     Ok(())
 }
 
-fn validate_severity_pmf(severity_pmf: &[f64]) -> Result<(), PricingError> {
+/// Validate a severity PMF and return it renormalized to unit mass.
+///
+/// Entries must be finite and non-negative and the total mass must lie within
+/// [`AGGREGATE_GRID_TOLERANCE`] of `1` (otherwise an input-mass error is returned, distinct from
+/// the grid-truncation errors of the aggregate kernels). Accepted rounding-level deficits or
+/// excesses are removed by dividing by the total, so the aggregate guards measure grid
+/// truncation / aliasing only.
+fn normalized_severity_pmf(severity_pmf: &[f64]) -> Result<Vec<f64>, PricingError> {
     if severity_pmf.is_empty() {
         return Err(PricingError::EmptyInput("severity_pmf must not be empty"));
     }
@@ -411,15 +462,21 @@ fn validate_severity_pmf(severity_pmf: &[f64]) -> Result<(), PricingError> {
         }
         sum += p;
     }
-    if (sum - 1.0).abs() > 1e-4 {
+    if !((sum - 1.0).abs() <= AGGREGATE_GRID_TOLERANCE) {
         return Err(PricingError::InvalidParameter(
-            "severity_pmf probabilities must sum to 1.0",
+            "severity_pmf input mass differs from 1 by more than AGGREGATE_GRID_TOLERANCE; normalize the severity input (this is not a grid-truncation error)",
         ));
     }
-    Ok(())
+    if sum == 1.0 {
+        return Ok(severity_pmf.to_vec());
+    }
+    Ok(severity_pmf.iter().map(|&p| p / sum).collect())
 }
 
 /// Exact Panjer `(a, b, 0)` compound aggregate loss recursion (Panjer 1981).
+///
+/// `severity_pmf` must sum to `1` within [`AGGREGATE_GRID_TOLERANCE`] (else
+/// [`PricingError::InvalidParameter`]) and is renormalized to unit mass.
 ///
 /// The recursion is exact on grid points `0..n_steps`; mass beyond `(n_steps - 1) * step` is
 /// truncated. Returns [`PricingError::OutOfBounds`] if the lost mass `1 - sum g_k` or the
@@ -432,7 +489,8 @@ pub fn panjer_recursion(
     n_steps: usize,
 ) -> Result<AggregateLossDistribution, PricingError> {
     freq.validate()?;
-    validate_severity_pmf(severity_pmf)?;
+    let severity = normalized_severity_pmf(severity_pmf)?;
+    let severity_pmf = severity.as_slice();
     if !step.is_finite() || !(step > 0.0) {
         return Err(PricingError::NonPositiveValue(
             "step must be finite and positive",
@@ -472,6 +530,7 @@ pub fn panjer_recursion(
     check_grid_adequacy(
         &dist,
         freq.mean()? * severity_grid_mean(severity_pmf, step),
+        RoundOffAllowance::default(),
         "Panjer grid truncation: lost probability mass exceeds AGGREGATE_GRID_TOLERANCE; increase n_steps",
         "Panjer grid truncation: aggregate mean deficit exceeds AGGREGATE_GRID_TOLERANCE; increase n_steps",
     )?;
@@ -554,10 +613,22 @@ pub(crate) fn radix2_fft(
 /// - `tilt`: Optional exponential tilt `theta >= 0` (`f_tilde_k = exp(-theta * k) * f_k`)
 ///   to suppress circular wrap-around aliasing. Use `None` for no tilting (`theta = 0`).
 ///
-/// Returns [`PricingError::OutOfBounds`] when wrap-around aliasing is detected: total mass
-/// differs from `1` (tilted case) or the PMF mean differs from the exact compound mean
-/// `E[N] E[X]` by more than [`AGGREGATE_GRID_TOLERANCE`] relative (untilted aliasing conserves
-/// mass but moves it to low indices, so the mean check is what detects it).
+/// Untilting multiplies the inverse-FFT round-off at bin `k` by `exp(theta * k)`. Bins whose
+/// magnitude is at or below that amplified noise floor (see [`FFT_ROUNDOFF_SAFETY_FACTOR`])
+/// are set to `0` (this also removes negative round-off), and the root-sum-square of the floor
+/// over retained bins is carried into the guards below as a round-off allowance.
+///
+/// Returns [`PricingError::OutOfBounds`] when
+/// - the round-off allowance itself exceeds [`AGGREGATE_GRID_TOLERANCE`] (tilt too large for
+///   the grid: reduce `tilt`; `tilt * fft_size` of about `10..=20` is typical), or
+/// - wrap-around aliasing / truncation is detected: total mass differs from `1` (tilted case)
+///   or the PMF mean differs from the exact compound mean `E[N] E[X]` by more than
+///   [`AGGREGATE_GRID_TOLERANCE`] relative plus the round-off allowance (untilted aliasing
+///   conserves mass but moves it to low indices, so the mean check is what detects it).
+///   Increase `fft_size` (or `step`) when this fires.
+///
+/// `severity_pmf` must sum to `1` within [`AGGREGATE_GRID_TOLERANCE`] (else
+/// [`PricingError::InvalidParameter`]) and is renormalized to unit mass.
 pub fn fft_aggregate_loss(
     freq: FrequencyDistribution,
     severity_pmf: &[f64],
@@ -566,7 +637,8 @@ pub fn fft_aggregate_loss(
     tilt: Option<f64>,
 ) -> Result<AggregateLossDistribution, PricingError> {
     freq.validate()?;
-    validate_severity_pmf(severity_pmf)?;
+    let severity = normalized_severity_pmf(severity_pmf)?;
+    let severity_pmf = severity.as_slice();
     if !step.is_finite() || !(step > 0.0) {
         return Err(PricingError::NonPositiveValue(
             "step must be finite and positive",
@@ -609,21 +681,50 @@ pub fn fft_aggregate_loss(
 
     radix2_fft(&mut re, &mut im, true)?;
 
+    let max_abs = |v: &[f64]| v.iter().fold(0.0_f64, |m, &x| m.max(x.abs()));
+    let log2_n = f64::from(fft_size.trailing_zeros());
+    let tilted_noise =
+        FFT_ROUNDOFF_SAFETY_FACTOR * max_abs(&im).max(log2_n * f64::EPSILON * max_abs(&re));
+    let mut round_off_mass_sq = 0.0;
+    let mut round_off_mean_sq = 0.0;
     for (k, val) in re.iter_mut().enumerate() {
-        let untilted = if theta == 0.0 {
-            *val
+        let amplification = if theta == 0.0 {
+            1.0
         } else {
-            *val * (theta * (k as f64)).exp()
+            (theta * (k as f64)).exp()
         };
-        *val = untilted.max(0.0);
+        let floor = tilted_noise * amplification;
+        let untilted = *val * amplification;
+        if untilted <= floor {
+            *val = 0.0;
+        } else {
+            *val = untilted;
+            let x = (k as f64) * step;
+            round_off_mass_sq += floor * floor;
+            round_off_mean_sq += (floor * x) * (floor * x);
+        }
+    }
+    let round_off = RoundOffAllowance {
+        mass: round_off_mass_sq.sqrt(),
+        mean: round_off_mean_sq.sqrt(),
+    };
+
+    let expected_mean = freq.mean()? * severity_grid_mean(severity_pmf, step);
+    if round_off.mass > AGGREGATE_GRID_TOLERANCE
+        || round_off.mean > AGGREGATE_GRID_TOLERANCE * expected_mean.abs().max(step)
+    {
+        return Err(PricingError::OutOfBounds(
+            "FFT round-off amplified by exp(tilt * k) exceeds AGGREGATE_GRID_TOLERANCE; reduce tilt (tilt * fft_size of 10-20 is typical) or use panjer_recursion",
+        ));
     }
 
     let dist = AggregateLossDistribution::from_pmf(step, re)?;
     check_grid_adequacy(
         &dist,
-        freq.mean()? * severity_grid_mean(severity_pmf, step),
-        "FFT aliasing: aggregate grid mass differs from 1 by more than AGGREGATE_GRID_TOLERANCE; increase fft_size or tilt",
-        "FFT aliasing: aggregate mean deviates from E[N]E[X] by more than AGGREGATE_GRID_TOLERANCE; increase fft_size or tilt",
+        expected_mean,
+        round_off,
+        "FFT truncation/aliasing: aggregate grid mass differs from 1 by more than AGGREGATE_GRID_TOLERANCE; increase fft_size or step",
+        "FFT truncation/aliasing: aggregate mean deviates from E[N]E[X] by more than AGGREGATE_GRID_TOLERANCE; increase fft_size or step",
     )?;
     Ok(dist)
 }
@@ -639,7 +740,11 @@ fn effective_support_len(pmf: &[f64]) -> usize {
 /// For the circular convolution to equal the linear convolution (no wrap-around), `fft_size`
 /// must be at least the combined support `sum_i (len_i - 1) + 1`, where `len_i` is the
 /// component PMF length after trimming trailing zero masses; otherwise
-/// [`PricingError::InvalidParameter`] is returned.
+/// [`PricingError::InvalidParameter`] is returned. With that sizing the convolution is exact
+/// (no aliasing). Each component must also be a complete distribution:
+/// `|1 - total_mass()| <= AGGREGATE_GRID_TOLERANCE`, otherwise
+/// [`PricingError::InvalidParameter`] is returned (a truncated component would otherwise
+/// silently produce a defective convolution, e.g. `0.8 * 0.8 = 0.64` total mass).
 pub fn convolve_independent_aggregates(
     components: &[&AggregateLossDistribution],
     fft_size: usize,
@@ -670,6 +775,11 @@ pub fn convolve_independent_aggregates(
         if comp.pmf.iter().any(|&p| !p.is_finite() || p < 0.0) {
             return Err(PricingError::InvalidParameter(
                 "aggregate component pmf entries must be finite and non-negative",
+            ));
+        }
+        if !((1.0 - comp.total_mass()).abs() <= AGGREGATE_GRID_TOLERANCE) {
+            return Err(PricingError::InvalidParameter(
+                "aggregate component total mass differs from 1 by more than AGGREGATE_GRID_TOLERANCE (truncated or defective component)",
             ));
         }
         combined_support = combined_support.saturating_add(effective_support_len(&comp.pmf) - 1);
