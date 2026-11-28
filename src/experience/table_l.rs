@@ -127,7 +127,13 @@ impl TableLEngine {
     /// entry ratios `(y*_i, p_i)` normalized by **unlimited** expected loss.
     ///
     /// Automatically sorts entry ratios, merges duplicates, and infers `k = 1 - E[Y*]`.
-    /// Requires `sum p_i ≈ 1.0` and `0 < E[Y*] <= 1.0 + 1e-4`.
+    /// Requires `sum p_i ≈ 1.0` and `0 < E[Y*] <= 1.0 + PROBABILITY_SUM_TOL`. Probabilities are
+    /// renormalized to sum to `1`; when `1 < E[Y*] <= 1 + PROBABILITY_SUM_TOL` (rounding noise in
+    /// the limited mean), entry ratios are rescaled to `y*_i / E[Y*]` exactly as in
+    /// [`super::TableMEngine::from_discrete_pdf`], giving `k = 0` and `phi*(0) = 1`.
+    ///
+    /// The result is re-validated through [`Self::from_rows`], so any successfully constructed
+    /// engine also round-trips through serde.
     pub fn from_limited_discrete_pdf(
         limited_entry_ratios: &[f64],
         probabilities: &[f64],
@@ -173,7 +179,11 @@ impl TableLEngine {
                 "mean limited entry ratio E[Y*] must lie in (0, 1]",
             ));
         }
+        // E[Y*] slightly above 1 is rounding noise: rescale so E[Y*] = 1 (k = 0), matching
+        // Table M; otherwise phi*(0) = E[Y*] + k would exceed 1 and from_rows would reject.
+        let y_scale = if mean_y_star > 1.0 { mean_y_star } else { 1.0 };
         for pair in &mut pairs {
+            pair.0 /= y_scale;
             pair.1 /= sum_p;
         }
 
@@ -192,10 +202,7 @@ impl TableLEngine {
             })
             .collect();
 
-        Ok(Self {
-            loss_elimination_ratio: k,
-            rows,
-        })
+        Self::from_rows(k, rows)
     }
 
     /// Build Skurnick (1974) Table L directly from a per-occurrence-limited

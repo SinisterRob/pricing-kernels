@@ -4,7 +4,7 @@
 //! ```rust
 //! use pricing_kernels::credibility::{ClassicalCredibility, CredibilityPanel};
 //!
-//! let z = ClassicalCredibility::standard_90_5().credibility(400.0);
+//! let z = ClassicalCredibility::standard_90_5().credibility(400.0)?;
 //! assert!(z > 0.6 && z < 0.62);
 //!
 //! let mut panel = CredibilityPanel::new();

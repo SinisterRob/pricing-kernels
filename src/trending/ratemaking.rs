@@ -146,7 +146,8 @@ pub struct MyersCohnSpec {
     /// Corporate federal income tax rate `τ ∈ [0, 1)`.
     pub tax_rate: f64,
     /// Timing `t_tax >= 0` (in periods) when underwriting profit tax `τ(P - L - E)` is paid
-    /// (default `1.0`).
+    /// (default `1.0`). The premium and expense components of this tax are discounted at
+    /// `r_f`; the loss component (tax shield `τ L`) at `r_L` (Myers & Cohn 1987).
     pub uw_tax_time: f64,
 }
 
@@ -159,7 +160,8 @@ pub struct MyersCohnResult {
     pub pv_expenses: f64,
     /// Present value of investment-income tax on surplus `PV(IBT)`.
     pub pv_investment_balance_tax: f64,
-    /// Present value of underwriting profit tax `PV(UWPT)`.
+    /// Present value of underwriting profit tax
+    /// `PV(UWPT) = τ [P / (1 + r_f)^{t_tax} - L / (1 + r_L)^{t_tax} - E / (1 + r_f)^{t_tax}]`.
     pub pv_underwriting_profit_tax: f64,
     /// Fair Myers–Cohn premium `P`.
     pub fair_premium: f64,
@@ -170,8 +172,19 @@ pub struct MyersCohnResult {
 /// Solve the Myers–Cohn (1987) discounted cash-flow model for fair premium `P`
 /// and implied underwriting profit provision `Q_T = 1 - (L + E) / P`.
 ///
-/// Uses the closed-form linear balance equation:
-/// `P = PV(L) + PV(E) + PV(IBT) + τ (P - L - E) / (1 + r_f)^{t_tax}`.
+/// Uses the closed-form linear balance equation
+/// `P = PV(L) + PV(E) + PV(IBT) + PV(UWPT)` with
+/// `PV(UWPT) = τ [P / (1 + r_f)^{t_tax} - L / (1 + r_L)^{t_tax} - E / (1 + r_f)^{t_tax}]`,
+/// i.e. `P = [PV(L) + PV(E) + PV(IBT) - τ L d_L - τ E d_f] / (1 - τ d_f)` with
+/// `d_f = (1 + r_f)^{-t_tax}`, `d_L = (1 + r_L)^{-t_tax}`.
+///
+/// Convention (Myers & Cohn 1987; Robbin, *The Underwriting Profit Provision*, CAS Exam 9
+/// study note, Myers–Cohn section): each cash flow is discounted at a rate reflecting its risk.
+/// Premium and expense flows (and their tax effects) are treated as riskless and discounted at
+/// `r_f`; losses **and the loss-related tax shield** `τ L` carry the systematic risk of losses
+/// and are discounted at the risk-adjusted rate `r_L`. Investment-income tax on surplus is
+/// discounted at `r_f`. With `r_L = r_f` this reduces to discounting the whole underwriting
+/// tax `τ (P - L - E)` at `r_f`.
 pub fn myers_cohn_profit_load(spec: &MyersCohnSpec) -> Result<MyersCohnResult, PricingError> {
     let t_len = spec.loss_payout_pattern.len();
     if t_len == 0 {
@@ -232,15 +245,18 @@ pub fn myers_cohn_profit_load(spec: &MyersCohnSpec) -> Result<MyersCohnResult, P
         None => spec.expected_expenses,
     };
 
+    // Premium/expense tax flows at r_f; loss tax shield at the risk-adjusted r_L.
     let tax_disc = spec.tax_rate / (1.0 + spec.risk_free_rate).powf(spec.uw_tax_time);
+    let loss_tax_disc = spec.tax_rate / (1.0 + spec.loss_discount_rate).powf(spec.uw_tax_time);
     let denom = 1.0 - tax_disc;
     require_positive(denom, "1 - tax_rate / (1 + r_f)^t_tax must be > 0")?;
 
+    let tax_shield = loss_tax_disc * spec.expected_losses + tax_disc * spec.expected_expenses;
     let nom_outflow = spec.expected_losses + spec.expected_expenses;
-    let fair_premium = (pv_losses + pv_expenses + pv_ibt - tax_disc * nom_outflow) / denom;
+    let fair_premium = (pv_losses + pv_expenses + pv_ibt - tax_shield) / denom;
     require_positive(fair_premium, "fair_premium must be > 0")?;
 
-    let pv_uwpt = tax_disc * (fair_premium - nom_outflow);
+    let pv_uwpt = tax_disc * fair_premium - tax_shield;
     let profit_provision = 1.0 - nom_outflow / fair_premium;
 
     Ok(MyersCohnResult {
@@ -655,11 +671,50 @@ mod tests {
         let res = myers_cohn_profit_load(&spec).expect("myers-cohn");
         assert!((res.pv_losses - 100.0 / 1.04).abs() < 1e-12);
         assert!((res.pv_investment_balance_tax - 0.34 * 0.06 * 50.0 / 1.06).abs() < 1e-12);
+        // Hand derivation (Myers & Cohn 1987: loss tax shield discounted at r_L):
+        //   PV(L)    = 100 / 1.04
+        //   PV(IBT)  = 0.34 * 0.06 * 50 / 1.06 = 1.02 / 1.06
+        //   PV(UWPT) = 0.34 P / 1.06 - 0.34 * 100 / 1.04
+        //   P (1 - 0.34 / 1.06) = (100 - 34) / 1.04 + 1.02 / 1.06
+        //   P = [66 * 1.06 / 1.04 + 1.02] / 0.72 = (69.96 / 1.04 + 1.02) / 0.72
+        //     = 71.0208 / 0.7488 = 1233 / 13 = 94.846153846...
+        // (pre-fix r_f-discounted loss shield gave 95.7542735.)
         assert!(
-            (res.fair_premium - 95.754_273_5).abs() < 1e-6,
+            (res.fair_premium - 1233.0 / 13.0).abs() < 1e-10,
             "P={}",
             res.fair_premium
         );
+        assert!(
+            (res.pv_underwriting_profit_tax - (0.34 * res.fair_premium / 1.06 - 34.0 / 1.04)).abs()
+                < 1e-12
+        );
+        // Balance identity P = PV(L) + PV(E) + PV(IBT) + PV(UWPT).
+        let rhs = res.pv_losses
+            + res.pv_expenses
+            + res.pv_investment_balance_tax
+            + res.pv_underwriting_profit_tax;
+        assert!((res.fair_premium - rhs).abs() < 1e-10);
+    }
+
+    #[test]
+    fn myers_cohn_reduces_to_rf_tax_discount_when_rl_equals_rf() {
+        let spec = MyersCohnSpec {
+            expected_losses: 100.0,
+            loss_payout_pattern: vec![0.5, 0.5],
+            expected_expenses: 20.0,
+            pv_expenses: None,
+            surplus_schedule: vec![50.0, 25.0],
+            risk_free_rate: 0.05,
+            loss_discount_rate: 0.05,
+            tax_rate: 0.21,
+            uw_tax_time: 1.0,
+        };
+        let res = myers_cohn_profit_load(&spec).expect("myers-cohn");
+        let d_f = 1.0 / 1.05;
+        let expected = (res.pv_losses + res.pv_expenses + res.pv_investment_balance_tax
+            - 0.21 * d_f * 120.0)
+            / (1.0 - 0.21 * d_f);
+        assert!((res.fair_premium - expected).abs() < 1e-10);
     }
 
     #[test]

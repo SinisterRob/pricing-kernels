@@ -11,8 +11,21 @@ pub const ERA_MEDICAL_ONLY_RATABLE_FACTOR: f64 = 0.30;
 /// this multiple of the state per claim accident limitation.
 pub const NCCI_MULTIPLE_CLAIM_LIMIT_MULTIPLIER: f64 = 2.0;
 
-/// Decimal places used when rounding the published experience modification.
-const MOD_ROUNDING_SCALE: f64 = 1000.0;
+/// Decimal places of the published NCCI experience modification. NCCI rounds the mod to two
+/// decimals, half-up (NCCI, *ABCs of Experience Rating*, worksheet example: `243,120 / 242,971
+/// = 1.0006 -> 1.00`; Experience Rating Plan Manual Rule 3).
+pub const NCCI_MOD_DECIMALS: i32 = 2;
+
+/// Absolute guard (in units of the last published decimal) added before half-up rounding so
+/// that a mod whose exact value lies on a `.xx5` boundary but is represented in binary just
+/// below it still rounds up.
+const MOD_HALF_UP_GUARD: f64 = 1e-9;
+
+/// Round a non-negative modification half-up to [`NCCI_MOD_DECIMALS`] decimals.
+fn round_mod_half_up(x: f64) -> f64 {
+    let scale = 10f64.powi(NCCI_MOD_DECIMALS);
+    (x * scale + 0.5 + MOD_HALF_UP_GUARD).floor() / scale
+}
 
 /// NCCI Experience Rating Plan Manual Rule 2-B accident limitations (state "per claim" and
 /// "multiple claim" accident limitations, published per state in the ERM state values).
@@ -109,7 +122,9 @@ impl NcciErpSpecification {
 /// Detailed result of NCCI Experience Modification calculation.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct NcciErpResult {
-    /// Final Experience Modification Factor rounded to 3 decimal places (e.g., `0.925` or `1.150`).
+    /// Final Experience Modification Factor rounded half-up to [`NCCI_MOD_DECIMALS`] (= 2)
+    /// decimal places as published by NCCI (e.g., `0.93` or `1.15`).
+    /// Use [`Self::mod_factor_unrounded`] for the exact ratio.
     pub mod_factor: f64,
     /// Unrounded Experience Modification Factor (`numerator / denominator`).
     pub mod_factor_unrounded: f64,
@@ -193,7 +208,7 @@ fn finalize_mod(
     let denominator = spec.expected_losses + spec.ballast_b;
 
     let mod_factor_unrounded = numerator / denominator;
-    let mod_factor = (mod_factor_unrounded * MOD_ROUNDING_SCALE).round() / MOD_ROUNDING_SCALE;
+    let mod_factor = round_mod_half_up(mod_factor_unrounded);
 
     NcciErpResult {
         mod_factor,
