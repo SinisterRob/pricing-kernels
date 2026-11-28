@@ -8,8 +8,10 @@
 //!   CAS Monograph No. 5, Ch. 6–7.
 
 use super::irls_glm::GlmFamily;
+use super::tweedie::{TweedieSeries, maximize_over_dispersion, tweedie_log_likelihood};
 use crate::error::PricingError;
 use crate::linalg::cholesky_invert;
+use crate::special::ln_gamma;
 use serde::{Deserialize, Serialize};
 
 /// Point on an exposure-weighted Lorenz curve.
@@ -230,17 +232,96 @@ pub fn double_lift_chart(
 /// Goodness-of-fit information criteria for a fitted GLM.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct InformationCriteria {
-    /// Scaled deviance `D / phi`.
+    /// Scaled deviance `D / phi` using the caller-supplied `dispersion`.
     pub scaled_deviance: f64,
     /// Pearson chi-squared statistic `sum w_i (y_i - mu_i)^2 / V(mu_i)`.
     pub pearson_chi2: f64,
-    /// Akaike Information Criterion (`scaled_deviance + 2 * k`, where `k` includes dispersion if estimated).
+    /// Full log-likelihood `ℓ(μ̂, φ̂)` (including normalizing constants), evaluated at the
+    /// maximum-likelihood dispersion `φ̂` for free-dispersion families.
+    pub log_likelihood: f64,
+    /// Dispersion used in `log_likelihood`: the profile ML estimate `φ̂` for `Gamma`,
+    /// `InverseGaussian`, and `Tweedie`; `1.0` for `Poisson`, `NegativeBinomial`, `Binomial`.
+    pub ml_dispersion: f64,
+    /// Akaike Information Criterion `-2ℓ + 2k` (`k` counts `φ` when it is estimated).
     pub aic: f64,
-    /// Bayesian Information Criterion (`scaled_deviance + ln(n_active) * k`).
+    /// Bayesian Information Criterion `-2ℓ + ln(n_active) k`.
     pub bic: f64,
 }
 
-/// Compute deviance-based `AIC`, `BIC`, and Pearson `chi^2` for a fitted GLM.
+/// Per-observation log-likelihood for fixed-dispersion families with prior weight `w`
+/// treated as a frequency (Poisson, Negative Binomial) or trial count (Binomial, `y` a proportion).
+fn fixed_dispersion_log_lik(family: GlmFamily, yi: f64, mui: f64, wi: f64) -> f64 {
+    match family {
+        GlmFamily::Poisson => wi * (yi * mui.ln() - mui - ln_gamma(yi + 1.0)),
+        GlmFamily::NegativeBinomial { alpha } => {
+            let r = 1.0 / alpha;
+            wi * (ln_gamma(yi + r) - ln_gamma(r) - ln_gamma(yi + 1.0)
+                + yi * (alpha * mui / (1.0 + alpha * mui)).ln()
+                - r * (alpha * mui).ln_1p())
+        }
+        GlmFamily::Binomial => {
+            let successes = wi * yi;
+            let failures = wi * (1.0 - yi);
+            let ln_choose =
+                ln_gamma(wi + 1.0) - ln_gamma(successes + 1.0) - ln_gamma(failures + 1.0);
+            let t1 = if successes > 0.0 {
+                successes * mui.ln()
+            } else {
+                0.0
+            };
+            let t2 = if failures > 0.0 {
+                failures * (-mui).ln_1p()
+            } else {
+                0.0
+            };
+            ln_choose + t1 + t2
+        }
+        // Free-dispersion families are handled by `free_dispersion_log_lik`.
+        GlmFamily::QuasiPoisson
+        | GlmFamily::Gamma
+        | GlmFamily::Tweedie { .. }
+        | GlmFamily::InverseGaussian => f64::NAN,
+    }
+}
+
+/// Gamma or Inverse Gaussian log-likelihood at dispersion `phi` (row dispersion `phi / w_i`).
+fn severity_log_lik(family: GlmFamily, y: &[f64], mu: &[f64], w: &[f64], phi: f64) -> f64 {
+    let mut ll = 0.0;
+    for i in 0..y.len() {
+        let wi = w[i];
+        if wi <= 0.0 {
+            continue;
+        }
+        let (yi, mui) = (y[i], mu[i]);
+        let phi_i = phi / wi;
+        ll += if family == GlmFamily::Gamma {
+            let shape = 1.0 / phi_i;
+            let r = yi / mui;
+            shape * (shape * r).ln() - shape * r - yi.ln() - ln_gamma(shape)
+        } else {
+            // Inverse Gaussian.
+            let ratio = (yi - mui) / mui;
+            -0.5 * (std::f64::consts::TAU * phi_i * yi * yi * yi).ln()
+                - ratio * ratio / (2.0 * phi_i * yi)
+        };
+    }
+    ll
+}
+
+/// Compute likelihood-based `AIC = -2ℓ + 2k`, `BIC = -2ℓ + ln(n) k`, scaled deviance, and
+/// Pearson `chi^2` for a fitted GLM.
+///
+/// The log-likelihood is the full density (normalizing constants included, matching R's
+/// `logLik.glm`/`AIC`):
+/// - `Poisson`, `NegativeBinomial` (fixed `alpha`): prior weights act as frequency weights.
+/// - `Binomial`: `y` is a proportion and `w` the number of trials.
+/// - `Gamma`, `InverseGaussian`, `Tweedie` (Dunn & Smyth 2005 series density): row dispersion
+///   `φ / w_i`, with `φ` set to its profile maximum-likelihood estimate given `mu`
+///   (closed form `Σ w d / n` for Inverse Gaussian; golden-section on `ln φ` otherwise).
+///   `k = n_features + 1` for these families.
+///
+/// The supplied `dispersion` only scales `scaled_deviance`. `QuasiPoisson` has no likelihood
+/// and is rejected.
 pub fn glm_information_criteria(
     family: GlmFamily,
     y: &[f64],
@@ -250,6 +331,11 @@ pub fn glm_information_criteria(
     n_features: usize,
 ) -> Result<InformationCriteria, PricingError> {
     family.validate()?;
+    if matches!(family, GlmFamily::QuasiPoisson) {
+        return Err(PricingError::InvalidParameter(
+            "QuasiPoisson is a quasi-likelihood: AIC/BIC are undefined",
+        ));
+    }
     let n = y.len();
     if n == 0 || mu.len() != n || weights.len() != n {
         return Err(PricingError::DimensionMismatch(
@@ -265,6 +351,7 @@ pub fn glm_information_criteria(
     let mut deviance = 0.0;
     let mut pearson_chi2 = 0.0;
     let mut n_active = 0usize;
+    let mut fixed_ll = 0.0;
 
     for i in 0..n {
         let yi = y[i];
@@ -305,10 +392,57 @@ pub fn glm_information_criteria(
         deviance += wi * family.unit_deviance(yi, mui);
         let diff = yi - mui;
         pearson_chi2 += wi * (diff * diff) / family.variance_fn(mui);
+        if !family.has_free_dispersion() {
+            fixed_ll += fixed_dispersion_log_lik(family, yi, mui, wi);
+        }
     }
     if n_active == 0 {
         return Err(PricingError::EmptyInput(
             "at least one positively weighted observation is required",
+        ));
+    }
+    let n_eff = n_active as f64;
+
+    let (log_likelihood, ml_dispersion) = match family {
+        GlmFamily::InverseGaussian => {
+            let phi = deviance / n_eff;
+            if !(phi > 0.0) {
+                return Err(PricingError::NonPositiveValue(
+                    "Inverse Gaussian ML dispersion is zero (perfect fit)",
+                ));
+            }
+            (severity_log_lik(family, y, mu, weights, phi), phi)
+        }
+        GlmFamily::Gamma => {
+            let phi0 = deviance / n_eff;
+            if !(phi0 > 0.0) {
+                return Err(PricingError::NonPositiveValue(
+                    "Gamma ML dispersion is zero (perfect fit)",
+                ));
+            }
+            let (phi, ll) = maximize_over_dispersion(phi0, |phi| {
+                Ok(severity_log_lik(family, y, mu, weights, phi))
+            })?;
+            (ll, phi)
+        }
+        GlmFamily::Tweedie { power } => {
+            let phi0 = deviance / n_eff;
+            if !(phi0 > 0.0) {
+                return Err(PricingError::NonPositiveValue(
+                    "Tweedie ML dispersion is zero (perfect fit)",
+                ));
+            }
+            let mut series = TweedieSeries::new(power)?;
+            let (phi, ll) = maximize_over_dispersion(phi0, |phi| {
+                tweedie_log_likelihood(&mut series, y, mu, weights, phi)
+            })?;
+            (ll, phi)
+        }
+        _ => (fixed_ll, 1.0),
+    };
+    if !log_likelihood.is_finite() {
+        return Err(PricingError::NonConvergence(
+            "GLM log-likelihood is not finite",
         ));
     }
 
@@ -319,12 +453,14 @@ pub fn glm_information_criteria(
         0.0
     };
     let k = (n_features as f64) + extra_disp_param;
-    let aic = scaled_deviance + 2.0 * k;
-    let bic = scaled_deviance + (n_active as f64).ln() * k;
+    let aic = -2.0 * log_likelihood + 2.0 * k;
+    let bic = -2.0 * log_likelihood + n_eff.ln() * k;
 
     Ok(InformationCriteria {
         scaled_deviance,
         pearson_chi2,
+        log_likelihood,
+        ml_dispersion,
         aic,
         bic,
     })

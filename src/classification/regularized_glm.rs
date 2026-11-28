@@ -11,6 +11,78 @@ use crate::validate::{
 };
 use serde::{Deserialize, Serialize};
 
+/// Overflow-safe bound on the linear predictor `|η|` (`exp(709.78)` is the `f64` limit).
+/// A fit whose linear predictor leaves `[-ETA_OVERFLOW_BOUND, ETA_OVERFLOW_BOUND]` is
+/// reported as [`PricingError::NonConvergence`] (prediction: [`PricingError::OutOfBounds`]).
+pub const ETA_OVERFLOW_BOUND: f64 = 700.0;
+/// Columns with weighted standard deviation below this are treated as constant and dropped.
+const ZERO_SD_TOL: f64 = 1e-12;
+/// Inner coordinate-descent stopping threshold on the largest coordinate change.
+const CD_INNER_TOL: f64 = 1e-10;
+/// Initial Negative Binomial dispersion `θ` when estimated by profile MLE.
+const NB_THETA_INIT: f64 = 5.0;
+/// Floor on the initial zero-truncated Poisson rate `λ_0 = max(ȳ - 1, floor)`.
+const ZTP_INIT_RATE_FLOOR: f64 = 0.1;
+/// Below this rate `λ`, zero-truncated Poisson mean/variance use their Taylor series.
+const ZTP_SERIES_THRESHOLD: f64 = 1e-4;
+/// Floor on IRLS working weights `V(μ)` used as divisors.
+const IRLS_WEIGHT_FLOOR: f64 = 1e-12;
+/// Floor on the initial mean `ȳ` used to set the intercept start `ln(ȳ)`.
+const MEAN_INIT_FLOOR: f64 = 1e-4;
+/// Probability clamp for ZIP E-step structural-zero probabilities and M-step weights.
+const ZIP_PROB_EPS: f64 = 1e-9;
+/// EM convergence threshold on the largest change in ZIP posterior structural-zero probabilities.
+const ZIP_EM_TOL: f64 = 1e-6;
+/// Relative convergence threshold on the GLMM Laplace marginal log-likelihood.
+const GLMM_OUTER_RTOL: f64 = 1e-6;
+/// Maximum Newton iterations for each GLMM group posterior mode.
+const GLMM_MODE_MAX_ITER: usize = 50;
+/// Newton step threshold for each GLMM group posterior mode.
+const GLMM_MODE_TOL: f64 = 1e-10;
+/// Newton step clamp for GLMM group posterior modes (log scale).
+const GLMM_MODE_MAX_STEP: f64 = 2.0;
+/// Golden-section iterations on `ln τ²` per GLMM outer iteration.
+const GLMM_TAU_GOLDEN_ITERS: usize = 24;
+/// Search bracket for `ln τ²` in the GLMM.
+const GLMM_LN_TAU2_BRACKET: (f64, f64) = (-16.0, 2.0);
+/// Lower bound on the GLMM random-effect variance `τ²`.
+const GLMM_TAU2_FLOOR: f64 = 1e-8;
+
+/// Return `lin` if it is finite and within [`ETA_OVERFLOW_BOUND`], else `NonConvergence`.
+#[inline]
+fn checked_eta(lin: f64) -> Result<f64, PricingError> {
+    if lin.is_finite() && lin.abs() <= ETA_OVERFLOW_BOUND {
+        Ok(lin)
+    } else {
+        Err(PricingError::NonConvergence(
+            "linear predictor left the overflow-safe range |eta| <= ETA_OVERFLOW_BOUND",
+        ))
+    }
+}
+
+/// Zero-truncated Poisson conditional mean `m = λ / (1 - e^{-λ})` and variance
+/// `v = m (1 + λ - m)` (`= dm/dη` for `η = ln λ`), with Taylor series for small `λ`.
+#[inline]
+fn ztp_mean_var(lambda: f64) -> (f64, f64) {
+    if lambda < ZTP_SERIES_THRESHOLD {
+        let l2 = lambda * lambda;
+        (1.0 + 0.5 * lambda + l2 / 12.0, 0.5 * lambda + l2 / 6.0)
+    } else {
+        let m = lambda / -(-lambda).exp_m1();
+        (m, m * (1.0 + lambda - m))
+    }
+}
+
+/// Inverse link / conditional mean for a regularized family at linear predictor `e`.
+#[inline]
+fn family_mean(family: RegularizedGlmFamily, e: f64) -> f64 {
+    match family {
+        RegularizedGlmFamily::BinomialLogit => 1.0 / (1.0 + (-e).exp()),
+        RegularizedGlmFamily::ZeroTruncatedPoisson => ztp_mean_var(e.exp()).0,
+        _ => e.exp(),
+    }
+}
+
 // ===========================================================================
 // 3.1 Penalized IRLS + Cyclic Coordinate Descent (Elastic Net GLM)
 // ===========================================================================
@@ -35,6 +107,11 @@ pub enum RegularizedGlmFamily {
     },
     /// Binary Logistic (`logit(π) = η`, used internally by Hurdle/ZIP and standalone).
     BinomialLogit,
+    /// Zero-truncated Poisson for positive counts `y >= 1` (`ln λ = η`,
+    /// `E[Y | Y > 0] = λ / (1 - e^{-λ})`), fitted by exact Fisher scoring on
+    /// `Σ w [y η - e^η - ln(1 - e^{-e^η})]`. Used by the Hurdle count part.
+    /// `fitted_means` / `predict` return the conditional mean `E[Y | Y > 0]`.
+    ZeroTruncatedPoisson,
 }
 
 /// Configuration for [`fit_regularized_glm`].
@@ -129,12 +206,12 @@ impl RegularizedGlmResult {
             for j in 0..p {
                 eta += row[j] * self.coefficients[j];
             }
-            let e = eta.clamp(-20.0, 20.0);
-            let mu = match family {
-                RegularizedGlmFamily::BinomialLogit => 1.0 / (1.0 + (-e).exp()),
-                _ => e.exp(),
-            };
-            preds.push(mu);
+            if !(eta.is_finite() && eta.abs() <= ETA_OVERFLOW_BOUND) {
+                return Err(PricingError::OutOfBounds(
+                    "linear predictor outside |eta| <= ETA_OVERFLOW_BOUND",
+                ));
+            }
+            preds.push(family_mean(family, eta));
         }
         Ok(preds)
     }
@@ -186,7 +263,7 @@ fn eval_neg_ll(
     for i in 0..y.len() {
         let wi = weights[i];
         let yi = y[i];
-        let ei = eta[i].clamp(-20.0, 20.0);
+        let ei = eta[i];
         let term = match family {
             RegularizedGlmFamily::Poisson => ei.exp() - yi * ei,
             RegularizedGlmFamily::Gamma => yi * (-ei).exp() + ei,
@@ -208,6 +285,11 @@ fn eval_neg_ll(
                     ei.exp().ln_1p()
                 };
                 log1p_exp - yi * ei
+            }
+            RegularizedGlmFamily::ZeroTruncatedPoisson => {
+                // e^η - y η + ln(1 - e^{-e^η})
+                let lam = ei.exp();
+                lam - yi * ei + (-(-lam).exp_m1()).ln()
             }
         };
         nll += wi * term;
@@ -339,6 +421,13 @@ pub fn fit_regularized_glm(
             RegularizedGlmFamily::BinomialLogit => {
                 require_unit_interval(yi, "Binomial response must be in [0, 1]")?;
             }
+            RegularizedGlmFamily::ZeroTruncatedPoisson => {
+                if !(yi >= 1.0) {
+                    return Err(PricingError::InvalidParameter(
+                        "ZeroTruncatedPoisson response must be >= 1",
+                    ));
+                }
+            }
             _ => require_non_negative(yi, "count/Tweedie response must be >= 0")?,
         }
     }
@@ -364,7 +453,7 @@ pub fn fit_regularized_glm(
         }
         let sd = (var / total_w).sqrt();
         col_sds[j] = sd;
-        if sd >= 1e-12 {
+        if sd >= ZERO_SD_TOL {
             for i in 0..n {
                 x_std[j * n + i] = (x[i * p + j] - m) / sd;
             }
@@ -388,11 +477,18 @@ pub fn fit_regularized_glm(
             .map(|(oi, wi)| oi * wi)
             .sum::<f64>()
             / total_w;
-        y_bar.max(1e-4).ln() - off_bar
+        let start_mean = if options.family == RegularizedGlmFamily::ZeroTruncatedPoisson {
+            (y_bar - 1.0).max(ZTP_INIT_RATE_FLOOR)
+        } else {
+            y_bar.max(MEAN_INIT_FLOOR)
+        };
+        start_mean.ln() - off_bar
     };
     let mut beta = vec![0.0; p];
     let mut nb_theta = match options.family {
-        RegularizedGlmFamily::NegativeBinomial { fixed_theta } => fixed_theta.unwrap_or(5.0),
+        RegularizedGlmFamily::NegativeBinomial { fixed_theta } => {
+            fixed_theta.unwrap_or(NB_THETA_INIT)
+        }
         _ => 1.0,
     };
 
@@ -422,32 +518,41 @@ pub fn fit_regularized_glm(
                     lin += x_std[j * n + i] * beta[j];
                 }
             }
-            let e = lin.clamp(-20.0, 20.0);
+            let e = checked_eta(lin)?;
             eta[i] = e;
             match options.family {
                 RegularizedGlmFamily::Poisson => {
                     let m = e.exp();
                     mu[i] = m;
                     irls_w[i] = w_vec[i] * m;
-                    z_work[i] = e + (y[i] - m) / m.max(1e-12);
+                    z_work[i] = e + (y[i] - m) / m.max(IRLS_WEIGHT_FLOOR);
                 }
                 RegularizedGlmFamily::Gamma => {
                     let m = e.exp();
                     mu[i] = m;
                     irls_w[i] = w_vec[i];
-                    z_work[i] = e + (y[i] - m) / m.max(1e-12);
+                    z_work[i] = e + (y[i] - m) / m.max(IRLS_WEIGHT_FLOOR);
                 }
                 RegularizedGlmFamily::Tweedie { power } => {
                     let m = e.exp();
                     mu[i] = m;
                     irls_w[i] = w_vec[i] * m.powf(2.0 - power);
-                    z_work[i] = e + (y[i] - m) / m.max(1e-12);
+                    z_work[i] = e + (y[i] - m) / m.max(IRLS_WEIGHT_FLOOR);
                 }
                 RegularizedGlmFamily::NegativeBinomial { .. } => {
                     let m = e.exp();
                     mu[i] = m;
                     irls_w[i] = w_vec[i] * m / (1.0 + m / nb_theta);
-                    z_work[i] = e + (y[i] - m) / m.max(1e-12);
+                    z_work[i] = e + (y[i] - m) / m.max(IRLS_WEIGHT_FLOOR);
+                }
+                RegularizedGlmFamily::ZeroTruncatedPoisson => {
+                    // Canonical (natural-parameter) family in η: Newton = Fisher scoring,
+                    // score y - m, information Var(Y | Y > 0) = m (1 + λ - m).
+                    let (m, v) = ztp_mean_var(e.exp());
+                    let v = v.max(IRLS_WEIGHT_FLOOR);
+                    mu[i] = m;
+                    irls_w[i] = w_vec[i] * v;
+                    z_work[i] = e + (y[i] - m) / v;
                 }
                 RegularizedGlmFamily::BinomialLogit => {
                     let prob = 1.0 / (1.0 + (-e).exp());
@@ -484,7 +589,7 @@ pub fn fit_regularized_glm(
 
             // 2. Penalized coordinates j = 0..p.
             for j in 0..p {
-                if col_sds[j] < 1e-12 {
+                if col_sds[j] < ZERO_SD_TOL {
                     continue;
                 }
                 let col = &x_std[j * n..(j + 1) * n];
@@ -510,7 +615,7 @@ pub fn fit_regularized_glm(
                 }
             }
 
-            if max_delta < 1e-10 {
+            if max_delta < CD_INNER_TOL {
                 break;
             }
         }
@@ -522,7 +627,7 @@ pub fn fit_regularized_glm(
                 for j in 0..p {
                     lin += x_std[j * n + i] * beta[j];
                 }
-                mu[i] = lin.clamp(-20.0, 20.0).exp();
+                mu[i] = checked_eta(lin)?.exp();
             }
             nb_theta = update_nb_theta(y, &mu, &w_vec, nb_theta);
         }
@@ -533,7 +638,7 @@ pub fn fit_regularized_glm(
             for j in 0..p {
                 lin += x_std[j * n + i] * beta[j];
             }
-            eta[i] = lin.clamp(-20.0, 20.0);
+            eta[i] = checked_eta(lin)?;
         }
         let nll = eval_neg_ll(options.family, y, &eta, &w_vec, nb_theta) / total_w;
         let l1: f64 = beta.iter().map(|b| b.abs()).sum();
@@ -546,7 +651,13 @@ pub fn fit_regularized_glm(
                 .map(|(a, b)| (a - b).abs())
                 .fold(0.0_f64, f64::max),
         );
-        if (obj - prev_obj).abs() <= options.tolerance * (1.0 + obj.abs()) && max_param_diff < 1e-7
+        if !obj.is_finite() {
+            return Err(PricingError::NonConvergence(
+                "penalized objective became non-finite",
+            ));
+        }
+        if (obj - prev_obj).abs() <= options.tolerance * (1.0 + obj.abs())
+            && max_param_diff <= options.tolerance
         {
             prev_obj = obj;
             converged = true;
@@ -559,25 +670,20 @@ pub fn fit_regularized_glm(
     let mut orig_beta = vec![0.0; p];
     let mut orig_intercept = beta0;
     for j in 0..p {
-        if col_sds[j] >= 1e-12 {
+        if col_sds[j] >= ZERO_SD_TOL {
             orig_beta[j] = beta[j] / col_sds[j];
             orig_intercept -= col_means[j] * orig_beta[j];
         }
     }
 
-    let fitted_means: Vec<f64> = (0..n)
-        .map(|i| {
-            let mut lin = orig_intercept + o_vec[i];
-            for j in 0..p {
-                lin += x[i * p + j] * orig_beta[j];
-            }
-            let e = lin.clamp(-20.0, 20.0);
-            match options.family {
-                RegularizedGlmFamily::BinomialLogit => 1.0 / (1.0 + (-e).exp()),
-                _ => e.exp(),
-            }
-        })
-        .collect();
+    let mut fitted_means = Vec::with_capacity(n);
+    for i in 0..n {
+        let mut lin = orig_intercept + o_vec[i];
+        for j in 0..p {
+            lin += x[i * p + j] * orig_beta[j];
+        }
+        fitted_means.push(family_mean(options.family, checked_eta(lin)?));
+    }
 
     Ok(RegularizedGlmResult {
         intercept: orig_intercept,
@@ -603,16 +709,67 @@ pub fn fit_regularized_glm(
 pub struct ZeroModifiedPoissonResult {
     /// Binary logistic part (`P(Y > 0)` for Hurdle; structural-zero probability `π` for ZIP).
     pub zero_part: RegularizedGlmResult,
-    /// Count Poisson part (truncated-count rate for Hurdle; Poisson component rate for ZIP).
+    /// Count part: zero-truncated Poisson fit on `y > 0` for Hurdle
+    /// ([`RegularizedGlmFamily::ZeroTruncatedPoisson`]; `intercept`/`coefficients` are on
+    /// `ln λ`, `fitted_means` are `E[Y | Y > 0]` on the positive rows); Poisson component for ZIP.
     pub count_part: RegularizedGlmResult,
     /// Predicted unconditional means `E[Y_i]` on training observations.
     pub fitted_means: Vec<f64>,
     /// EM iterations executed (`1` for Hurdle).
     pub iterations: usize,
+    /// `true` iff every inner GLM fit converged and (ZIP) the EM loop met its tolerance.
+    pub converged: bool,
+}
+
+/// Validate `x`/`y` dimensions plus optional `weights` (finite, `>= 0`) and `offsets` (finite).
+fn validate_zero_modified_inputs(
+    x: &[f64],
+    n: usize,
+    p: usize,
+    y: &[f64],
+    weights: Option<&[f64]>,
+    offsets: Option<&[f64]>,
+) -> Result<(), PricingError> {
+    if n == 0 || p == 0 {
+        return Err(PricingError::EmptyInput("n and p must be >= 1"));
+    }
+    if n.checked_mul(p) != Some(x.len()) || y.len() != n {
+        return Err(PricingError::DimensionMismatch(
+            "x must have length n * p and y must have length n",
+        ));
+    }
+    if let Some(ws) = weights {
+        if ws.len() != n {
+            return Err(PricingError::DimensionMismatch(
+                "weights length must equal n",
+            ));
+        }
+        for &wi in ws {
+            require_non_negative(wi, "weights must be finite and >= 0")?;
+        }
+    }
+    if let Some(os) = offsets {
+        if os.len() != n {
+            return Err(PricingError::DimensionMismatch(
+                "offsets length must equal n",
+            ));
+        }
+        for &oi in os {
+            require_finite(oi, "offsets must be finite")?;
+        }
+    }
+    for &yi in y {
+        require_non_negative(yi, "count response must be finite and >= 0")?;
+    }
+    Ok(())
 }
 
 /// Fit a Hurdle Poisson model: (1) Binary Logistic GLM for `P(Y > 0)` and
-/// (2) Zero-Truncated Poisson GLM on positive counts `y_i > 0` via IRLS.
+/// (2) a true zero-truncated Poisson GLM ([`RegularizedGlmFamily::ZeroTruncatedPoisson`])
+/// on the positive counts `y_i > 0`, so that `E[Y | Y > 0] = λ / (1 - e^{-λ})` is
+/// calibrated to the observed positive counts (intercept score equation).
+///
+/// `E[Y_i] = P(Y_i > 0) · λ_i / (1 - e^{-λ_i})`.
 #[allow(clippy::too_many_arguments)]
 pub fn fit_hurdle_poisson(
     x: &[f64],
@@ -624,11 +781,7 @@ pub fn fit_hurdle_poisson(
     lambda: f64,
     alpha: f64,
 ) -> Result<ZeroModifiedPoissonResult, PricingError> {
-    if n == 0 || p == 0 || x.len() != n * p || y.len() != n {
-        return Err(PricingError::DimensionMismatch(
-            "invalid dimensions for Hurdle Poisson",
-        ));
-    }
+    validate_zero_modified_inputs(x, n, p, y, weights, offsets)?;
     let y_bin: Vec<f64> = y.iter().map(|&v| if v > 0.0 { 1.0 } else { 0.0 }).collect();
     let zero_part = fit_regularized_glm(
         x,
@@ -662,6 +815,7 @@ pub fn fit_hurdle_poisson(
             "Hurdle Poisson requires at least one positive count observation",
         ));
     }
+    let count_family = RegularizedGlmFamily::ZeroTruncatedPoisson;
     let count_part = fit_regularized_glm(
         &pos_x,
         pos_y.len(),
@@ -670,35 +824,36 @@ pub fn fit_hurdle_poisson(
         Some(&pos_w),
         Some(&pos_o),
         RegularizedGlmOptions {
-            family: RegularizedGlmFamily::Poisson,
+            family: count_family,
             lambda,
             alpha,
             ..RegularizedGlmOptions::default()
         },
     )?;
 
-    let fitted_means: Vec<f64> = (0..n)
-        .map(|i| {
-            let pi_pos = zero_part.fitted_means[i];
-            let mut lin = count_part.intercept + offsets.map_or(0.0, |o| o[i]);
-            for j in 0..p {
-                lin += x[i * p + j] * count_part.coefficients[j];
-            }
-            let mu = lin.clamp(-20.0, 20.0).exp();
-            let ztp_mean = mu / (1.0 - (-mu).exp()).max(1e-12);
-            pi_pos * ztp_mean
-        })
+    let ztp_means = count_part.predict(count_family, x, n, p, offsets)?;
+    let fitted_means: Vec<f64> = zero_part
+        .fitted_means
+        .iter()
+        .zip(ztp_means.iter())
+        .map(|(&pi_pos, &m)| pi_pos * m)
         .collect();
+    let converged = zero_part.converged && count_part.converged;
 
     Ok(ZeroModifiedPoissonResult {
         zero_part,
         count_part,
         fitted_means,
         iterations: 1,
+        converged,
     })
 }
 
 /// Fit a Zero-Inflated Poisson (ZIP) model via Expectation-Maximization (EM).
+///
+/// The EM loop stops once the largest change in posterior structural-zero probabilities
+/// falls below `1e-6`; `converged` reports whether that happened within `max_em_iter`
+/// and all final inner fits converged.
 #[allow(clippy::too_many_arguments)]
 pub fn fit_zero_inflated_poisson(
     x: &[f64],
@@ -711,11 +866,7 @@ pub fn fit_zero_inflated_poisson(
     alpha: f64,
     max_em_iter: usize,
 ) -> Result<ZeroModifiedPoissonResult, PricingError> {
-    if n == 0 || p == 0 || x.len() != n * p || y.len() != n {
-        return Err(PricingError::DimensionMismatch(
-            "invalid dimensions for ZIP",
-        ));
-    }
+    validate_zero_modified_inputs(x, n, p, y, weights, offsets)?;
     if max_em_iter == 0 {
         return Err(PricingError::InvalidParameter("max_em_iter must be >= 1"));
     }
@@ -723,48 +874,35 @@ pub fn fit_zero_inflated_poisson(
         Some(w) => w.to_vec(),
         None => vec![1.0; n],
     };
+    let zero_opts = RegularizedGlmOptions {
+        family: RegularizedGlmFamily::BinomialLogit,
+        lambda,
+        alpha,
+        ..RegularizedGlmOptions::default()
+    };
+    let count_opts = RegularizedGlmOptions {
+        family: RegularizedGlmFamily::Poisson,
+        lambda,
+        alpha,
+        ..RegularizedGlmOptions::default()
+    };
 
     // Initialize posterior structural-zero probabilities gamma_i.
     let mut gamma: Vec<f64> = y
         .iter()
         .map(|&v| if v == 0.0 { 0.5 } else { 0.0 })
         .collect();
-    let mut zero_part = fit_regularized_glm(
-        x,
-        n,
-        p,
-        &gamma,
-        Some(&base_w),
-        None,
-        RegularizedGlmOptions {
-            family: RegularizedGlmFamily::BinomialLogit,
-            lambda,
-            alpha,
-            ..RegularizedGlmOptions::default()
-        },
-    )?;
-    let mut count_part = fit_regularized_glm(
-        x,
-        n,
-        p,
-        y,
-        Some(&base_w),
-        offsets,
-        RegularizedGlmOptions {
-            family: RegularizedGlmFamily::Poisson,
-            lambda,
-            alpha,
-            ..RegularizedGlmOptions::default()
-        },
-    )?;
+    let mut zero_part = fit_regularized_glm(x, n, p, &gamma, Some(&base_w), None, zero_opts)?;
+    let mut count_part = fit_regularized_glm(x, n, p, y, Some(&base_w), offsets, count_opts)?;
 
     let mut iterations = 0usize;
+    let mut em_converged = false;
     for iter in 0..max_em_iter {
         iterations = iter + 1;
         let mut max_diff = 0.0_f64;
         for i in 0..n {
             let new_g = if y[i] == 0.0 {
-                let pi_i = zero_part.fitted_means[i].clamp(1e-9, 1.0 - 1e-9);
+                let pi_i = zero_part.fitted_means[i].clamp(ZIP_PROB_EPS, 1.0 - ZIP_PROB_EPS);
                 let p0 = (-count_part.fitted_means[i]).exp();
                 pi_i / (pi_i + (1.0 - pi_i) * p0).max(1e-300)
             } else {
@@ -774,41 +912,16 @@ pub fn fit_zero_inflated_poisson(
             gamma[i] = new_g;
         }
 
-        zero_part = fit_regularized_glm(
-            x,
-            n,
-            p,
-            &gamma,
-            Some(&base_w),
-            None,
-            RegularizedGlmOptions {
-                family: RegularizedGlmFamily::BinomialLogit,
-                lambda,
-                alpha,
-                ..RegularizedGlmOptions::default()
-            },
-        )?;
+        zero_part = fit_regularized_glm(x, n, p, &gamma, Some(&base_w), None, zero_opts)?;
         let count_w: Vec<f64> = base_w
             .iter()
             .zip(gamma.iter())
-            .map(|(&w, &g)| w * (1.0 - g).max(1e-9))
+            .map(|(&w, &g)| w * (1.0 - g).max(ZIP_PROB_EPS))
             .collect();
-        count_part = fit_regularized_glm(
-            x,
-            n,
-            p,
-            y,
-            Some(&count_w),
-            offsets,
-            RegularizedGlmOptions {
-                family: RegularizedGlmFamily::Poisson,
-                lambda,
-                alpha,
-                ..RegularizedGlmOptions::default()
-            },
-        )?;
+        count_part = fit_regularized_glm(x, n, p, y, Some(&count_w), offsets, count_opts)?;
 
-        if max_diff < 1e-6 {
+        if max_diff < ZIP_EM_TOL {
+            em_converged = true;
             break;
         }
     }
@@ -816,12 +929,14 @@ pub fn fit_zero_inflated_poisson(
     let fitted_means: Vec<f64> = (0..n)
         .map(|i| (1.0 - zero_part.fitted_means[i]) * count_part.fitted_means[i])
         .collect();
+    let converged = em_converged && zero_part.converged && count_part.converged;
 
     Ok(ZeroModifiedPoissonResult {
         zero_part,
         count_part,
         fitted_means,
         iterations,
+        converged,
     })
 }
 
@@ -831,7 +946,15 @@ pub fn fit_zero_inflated_poisson(
 
 /// Evaluate the B-spline basis of degree `degree` at points `xs` over
 /// non-decreasing knot vector `knots` (`t_0 <= t_1 <= ... <= t_M`) via the
-/// Cox–de Boor recursion (`0/0 ≡ 0`, right boundary `B_{M-d-1, d}(t_M) = 1`).
+/// Cox–de Boor recursion (`0/0 ≡ 0`).
+///
+/// The basis is a partition of unity only on the valid domain
+/// `[t_degree, t_{M-degree}]`; points outside it return [`PricingError::OutOfBounds`].
+/// Each `x` is located in the knot span `[t_k, t_{k+1})` (half-open, `t_k < t_{k+1}`,
+/// `degree <= k < M - degree`); at the right endpoint `x = t_{M-degree}` the last non-empty
+/// span is used, i.e. the left limit (de Boor 1978). For clamped knots (end multiplicity
+/// `degree + 1`) this gives `B_{last}(t_M) = 1`; for unclamped knots it is the continuous
+/// left-limit value.
 ///
 /// Returns `(n_basis, row_major_matrix)` where `n_basis = knots.len() - degree - 1`.
 pub fn bspline_basis(
@@ -842,9 +965,9 @@ pub fn bspline_basis(
     if xs.is_empty() {
         return Err(PricingError::EmptyInput("xs must not be empty"));
     }
-    if knots.len() < degree + 2 {
+    if knots.len() < 2 * degree + 2 {
         return Err(PricingError::InvalidParameter(
-            "knots.len() must be at least degree + 2",
+            "knots.len() must be at least 2 * degree + 2",
         ));
     }
     for w in knots.windows(2) {
@@ -856,26 +979,36 @@ pub fn bspline_basis(
     }
     let m = knots.len() - 1;
     let n_basis = m - degree;
+    let lo = knots[degree];
+    let hi = knots[n_basis];
+    if !(hi > lo) {
+        return Err(PricingError::InvalidParameter(
+            "B-spline valid domain [t_degree, t_{M-degree}] must have positive length",
+        ));
+    }
     let n = xs.len();
     let mut out = vec![0.0; n * n_basis];
-    let t_max = knots[m];
 
     let mut b_prev = vec![0.0; m];
     let mut b_curr = vec![0.0; m];
 
     for (row, &x) in xs.iter().enumerate() {
         require_finite(x, "evaluation point x must be finite")?;
-        if (x - t_max).abs() <= 1e-15 {
-            out[row * n_basis + (n_basis - 1)] = 1.0;
-            continue;
+        if x < lo || x > hi {
+            return Err(PricingError::OutOfBounds(
+                "B-spline evaluation point outside valid domain [t_degree, t_{M-degree}]",
+            ));
         }
-        for j in 0..m {
-            b_prev[j] = if x >= knots[j] && x < knots[j + 1] {
-                1.0
-            } else {
-                0.0
-            };
+        // Largest non-empty span k in [degree, n_basis) with t_k <= x (x < t_{k+1}
+        // automatically, except at x = hi where this selects the last non-empty span).
+        let mut span = degree;
+        for k in degree..n_basis {
+            if knots[k] < knots[k + 1] && knots[k] <= x {
+                span = k;
+            }
         }
+        b_prev.fill(0.0);
+        b_prev[span] = 1.0;
         for k in 1..=degree {
             let len = m - k;
             for j in 0..len {
@@ -970,6 +1103,17 @@ pub struct RandomInterceptGlmmResult {
     pub laplace_log_likelihood: f64,
     /// Outer alternating iterations executed.
     pub iterations: usize,
+    /// `true` iff the outer Laplace log-likelihood met its relative tolerance (`1e-6`)
+    /// within `max_iter`, the final fixed-effect refit converged, and every final group
+    /// posterior-mode Newton solve converged.
+    pub converged: bool,
+}
+
+/// Group posterior modes, Laplace marginal log-likelihood, and whether all mode solves converged.
+struct GroupModes {
+    modes: Vec<f64>,
+    laplace_ll: f64,
+    all_converged: bool,
 }
 
 /// Fit a Laplace-approximated Poisson random-intercept GLMM
@@ -1000,6 +1144,7 @@ pub fn fit_random_intercept_glmm(
             "x, y, and group_ids dimensions must match",
         ));
     }
+    validate_zero_modified_inputs(x, n, p, y, weights, offsets)?;
     for &g in group_ids {
         if g >= n_groups {
             return Err(PricingError::OutOfBounds("group_id >= n_groups"));
@@ -1019,102 +1164,104 @@ pub fn fit_random_intercept_glmm(
         members[g].push(i);
     }
 
+    let fixed_opts = RegularizedGlmOptions {
+        family: RegularizedGlmFamily::Poisson,
+        ..RegularizedGlmOptions::default()
+    };
     // Initialize fixed effects with a standard Poisson GLM.
-    let mut fixed = fit_regularized_glm(
-        x,
-        n,
-        p,
-        y,
-        Some(&w_vec),
-        Some(&o_vec),
-        RegularizedGlmOptions {
-            family: RegularizedGlmFamily::Poisson,
-            ..RegularizedGlmOptions::default()
-        },
-    )?;
+    let mut fixed = fit_regularized_glm(x, n, p, y, Some(&w_vec), Some(&o_vec), fixed_opts)?;
 
     let mut u_hat = vec![0.0; n_groups];
     let mut tau_sq = 0.1_f64;
     let mut laplace_ll = f64::NEG_INFINITY;
     let mut iterations = 0usize;
+    let mut outer_converged = false;
+    let mut modes_converged = false;
 
-    let solve_group_modes = |base_eta: &[f64], t2: f64| -> (Vec<f64>, Vec<f64>, f64) {
+    let solve_group_modes = |base_eta: &[f64], t2: f64| -> Result<GroupModes, PricingError> {
         let inv_t2 = 1.0 / t2;
         let mut u = vec![0.0; n_groups];
-        let mut h = vec![0.0; n_groups];
         let mut ll = 0.0;
+        let mut all_converged = true;
         for g in 0..n_groups {
             let mut ug = 0.0_f64;
-            for _ in 0..25 {
+            let mut mode_converged = false;
+            for _ in 0..GLMM_MODE_MAX_ITER {
                 let mut g1 = -ug * inv_t2;
                 let mut g2 = inv_t2;
                 for &i in &members[g] {
-                    let mu = (base_eta[i] + ug).clamp(-20.0, 20.0).exp();
+                    let mu = checked_eta(base_eta[i] + ug)?.exp();
                     g1 += w_vec[i] * (y[i] - mu);
                     g2 += w_vec[i] * mu;
                 }
-                let step = (g1 / g2.max(1e-12)).clamp(-2.0, 2.0);
+                let step =
+                    (g1 / g2.max(IRLS_WEIGHT_FLOOR)).clamp(-GLMM_MODE_MAX_STEP, GLMM_MODE_MAX_STEP);
                 ug += step;
-                if step.abs() < 1e-10 {
+                if step.abs() < GLMM_MODE_TOL {
+                    mode_converged = true;
                     break;
                 }
             }
+            all_converged &= mode_converged;
             let mut g_val = -0.5 * ug * ug * inv_t2;
             let mut hg = inv_t2;
             for &i in &members[g] {
-                let eta_i = (base_eta[i] + ug).clamp(-20.0, 20.0);
+                let eta_i = checked_eta(base_eta[i] + ug)?;
                 let mu = eta_i.exp();
                 g_val += w_vec[i] * (y[i] * eta_i - mu);
                 hg += w_vec[i] * mu;
             }
             u[g] = ug;
-            h[g] = hg;
             ll += g_val - 0.5 * (t2 * hg).max(1e-300).ln();
         }
-        (u, h, ll)
+        Ok(GroupModes {
+            modes: u,
+            laplace_ll: ll,
+            all_converged,
+        })
     };
 
-    for iter in 0..max_iter.max(1) {
+    for iter in 0..max_iter {
         iterations = iter + 1;
         let prev_ll = laplace_ll;
 
-        let base_eta: Vec<f64> = (0..n)
-            .map(|i| {
-                let mut lin = fixed.intercept + o_vec[i];
-                for j in 0..p {
-                    lin += x[i * p + j] * fixed.coefficients[j];
-                }
-                lin.clamp(-20.0, 20.0)
-            })
-            .collect();
+        let mut base_eta = Vec::with_capacity(n);
+        for i in 0..n {
+            let mut lin = fixed.intercept + o_vec[i];
+            for j in 0..p {
+                lin += x[i * p + j] * fixed.coefficients[j];
+            }
+            base_eta.push(checked_eta(lin)?);
+        }
 
         // Optimize log(tau_sq) via golden-section search on Laplace marginal log-likelihood.
-        let mut a = (-16.0_f64).max(1e-8_f64.ln());
-        let mut b = 2.0_f64;
+        let mut a = GLMM_LN_TAU2_BRACKET.0.max(GLMM_TAU2_FLOOR.ln());
+        let mut b = GLMM_LN_TAU2_BRACKET.1;
         let gr = 0.5 * (5.0_f64.sqrt() - 1.0);
         let mut c = b - gr * (b - a);
         let mut d = a + gr * (b - a);
-        let mut fc = solve_group_modes(&base_eta, c.exp()).2;
-        let mut fd = solve_group_modes(&base_eta, d.exp()).2;
-        for _ in 0..24 {
+        let mut fc = solve_group_modes(&base_eta, c.exp())?.laplace_ll;
+        let mut fd = solve_group_modes(&base_eta, d.exp())?.laplace_ll;
+        for _ in 0..GLMM_TAU_GOLDEN_ITERS {
             if fc < fd {
                 a = c;
                 c = d;
                 fc = fd;
                 d = a + gr * (b - a);
-                fd = solve_group_modes(&base_eta, d.exp()).2;
+                fd = solve_group_modes(&base_eta, d.exp())?.laplace_ll;
             } else {
                 b = d;
                 d = c;
                 fd = fc;
                 c = b - gr * (b - a);
-                fc = solve_group_modes(&base_eta, c.exp()).2;
+                fc = solve_group_modes(&base_eta, c.exp())?.laplace_ll;
             }
         }
-        tau_sq = f64::midpoint(a, b).exp().max(1e-8);
-        let (u_new, _h_new, ll_new) = solve_group_modes(&base_eta, tau_sq);
-        u_hat = u_new;
-        laplace_ll = ll_new;
+        tau_sq = f64::midpoint(a, b).exp().max(GLMM_TAU2_FLOOR);
+        let modes = solve_group_modes(&base_eta, tau_sq)?;
+        u_hat = modes.modes;
+        laplace_ll = modes.laplace_ll;
+        modes_converged = modes.all_converged;
 
         // Refit fixed effects holding random intercepts as offsets.
         let combined_offsets: Vec<f64> = (0..n).map(|i| o_vec[i] + u_hat[group_ids[i]]).collect();
@@ -1125,13 +1272,11 @@ pub fn fit_random_intercept_glmm(
             y,
             Some(&w_vec),
             Some(&combined_offsets),
-            RegularizedGlmOptions {
-                family: RegularizedGlmFamily::Poisson,
-                ..RegularizedGlmOptions::default()
-            },
+            fixed_opts,
         )?;
 
-        if (laplace_ll - prev_ll).abs() < 1e-6 * (1.0 + laplace_ll.abs()) {
+        if (laplace_ll - prev_ll).abs() < GLMM_OUTER_RTOL * (1.0 + laplace_ll.abs()) {
+            outer_converged = true;
             break;
         }
     }
@@ -1145,10 +1290,11 @@ pub fn fit_random_intercept_glmm(
             for j in 0..p {
                 lin += x[i * p + j] * fixed.coefficients[j];
             }
-            sum_mu += w_vec[i] * lin.clamp(-20.0, 20.0).exp();
+            sum_mu += w_vec[i] * checked_eta(lin)?.exp();
         }
         group_credibilities[g] = sum_mu / (sum_mu + inv_t2);
     }
+    let converged = outer_converged && modes_converged && fixed.converged;
 
     Ok(RandomInterceptGlmmResult {
         intercept: fixed.intercept,
@@ -1158,6 +1304,7 @@ pub fn fit_random_intercept_glmm(
         group_credibilities,
         laplace_log_likelihood: laplace_ll,
         iterations,
+        converged,
     })
 }
 
