@@ -25,6 +25,10 @@ pub mod fitting;
 pub mod ilf;
 /// Bernegger (1997) MBBEFD and Swiss Re exposure rating curves.
 pub mod mbbefd;
+/// Closed-form truncated power moments of the severity families.
+mod moments;
+/// Globally adaptive, scale-aware Gauss–Kronrod quadrature.
+mod quadrature;
 /// Treaty reinsurance pricing (burning cost, reinstatements, sliding scale, corridors, profit commission).
 pub mod reinsurance;
 

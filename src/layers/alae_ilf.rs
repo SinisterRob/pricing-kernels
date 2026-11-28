@@ -8,9 +8,10 @@
 //! * **ALAE-Pro-Rata (Defense Outside Limits, Proportional):** `E[(X ∧ L) + A * (X ∧ L) / X]`.
 //! * **ALAE-In-Addition (Uncapped Defense Outside Limits):** `E[X ∧ L] + E[A]`.
 //!
-//! Uses exact closed-form formulas for proportional ALAE (`A = k X`), adaptive
-//! 15-point Gauss–Kronrod quadrature (`G7-K15`) for general conditional ALAE
-//! expectations `m(x) = E[A | X = x]`, and — for ALAE-included limits with a
+//! Uses exact closed-form formulas for proportional ALAE (`A = k X`), closed-form
+//! truncated power moments `E[X^p; X <= y]`, `E[X^p; X > y]` for power-law ALAE
+//! (globally adaptive, scale-aware 15-point Gauss–Kronrod quadrature only as a
+//! fallback), and — for ALAE-included limits with a
 //! random conditional ALAE (`PowerLawLognormal`, `BivariateLognormal`) — the
 //! exact 1-D reduction
 //! `E[(X + A) ∧ L] = E[X ∧ L] + ∫_0^L E[A ∧ (L - x) | X = x] f_X(x) dx`
@@ -18,7 +19,9 @@
 
 use crate::error::PricingError;
 use crate::layers::SeverityDistribution;
-use crate::special::normal_cdf_exact;
+use crate::layers::moments::{power_moment_is_finite, truncated_power_moment};
+use crate::layers::quadrature::{QUAD_REL_TOL, integrate_finite, integrate_semi_infinite};
+use crate::special::{ln_gamma, normal_cdf_exact};
 use crate::validate::{require_finite, require_non_negative, require_positive};
 use serde::{Deserialize, Serialize};
 
@@ -106,99 +109,46 @@ pub struct AlaeIlfResult {
 }
 
 // ===========================================================================
-// 4.4 Adaptive 15-Point Gauss–Kronrod Quadrature (G7-K15)
+// 4.4 Globally Adaptive, Scale-Aware 15-Point Gauss–Kronrod Quadrature (G7-K15)
 // ===========================================================================
 
-const GK15_X: [f64; 8] = [
-    0.0,
-    0.207_784_955_007_898_5,
-    0.405_845_151_377_397_2,
-    0.586_087_235_467_691_1,
-    0.741_531_185_599_394_5,
-    0.864_864_423_359_769_1,
-    0.949_107_912_342_758_5,
-    0.991_455_371_120_812_6,
-];
-
-const GK15_W: [f64; 8] = [
-    0.209_482_141_084_727_82,
-    0.204_432_940_075_298_89,
-    0.190_350_578_064_785_42,
-    0.169_004_726_639_267_9,
-    0.140_653_259_715_525_92,
-    0.104_790_010_322_250_18,
-    0.063_092_092_629_978_55,
-    0.022_935_322_010_529_224,
-];
-
-const G7_W: [f64; 4] = [
-    0.417_959_183_673_469_4,
-    0.381_830_050_505_118_9,
-    0.279_705_391_489_276_64,
-    0.129_484_966_168_869_7,
-];
-
-fn gk15_panel<F: Fn(f64) -> f64>(f: &F, a: f64, b: f64) -> (f64, f64) {
-    let mid = f64::midpoint(a, b);
-    let half = 0.5 * (b - a);
-    let f_mid = f(mid);
-    let mut k15 = GK15_W[0] * f_mid;
-    let mut g7 = G7_W[0] * f_mid;
-    for i in 1..8 {
-        let dx = half * GK15_X[i];
-        let f_sum = f(mid - dx) + f(mid + dx);
-        k15 += GK15_W[i] * f_sum;
-        if i % 2 == 0 {
-            g7 += G7_W[i / 2] * f_sum;
-        }
-    }
-    (k15 * half, (k15 - g7).abs() * half)
+/// Integrate `f(x)` on `[a, b]` (finite) with globally adaptive 15-point Gauss–Kronrod
+/// quadrature started from breakpoints graded geometrically (14 decades) towards both
+/// endpoints, so integrands whose mass sits on a scale much smaller than `|b - a|` are
+/// resolved. Target relative accuracy `1e-12` of the global estimate.
+///
+/// # Errors
+/// [`PricingError::InvalidParameter`] for non-finite bounds or a non-finite integrand value;
+/// [`PricingError::NonConvergence`] if the global error estimate cannot be brought below
+/// `1e-9` relative.
+pub fn gauss_kronrod_integrate<F: Fn(f64) -> f64>(
+    f: F,
+    a: f64,
+    b: f64,
+) -> Result<f64, PricingError> {
+    integrate_finite(f, a, b, &[], 0.0)
 }
 
-fn gk15_adaptive<F: Fn(f64) -> f64>(f: &F, a: f64, b: f64, tol: f64, depth: usize) -> f64 {
-    let (val, err) = gk15_panel(f, a, b);
-    if err <= tol.max(1e-10 * val.abs()) || depth == 0 || (b - a).abs() <= 1e-14 {
-        return val;
-    }
-    let mid = f64::midpoint(a, b);
-    gk15_adaptive(f, a, mid, 0.5 * tol, depth - 1) + gk15_adaptive(f, mid, b, 0.5 * tol, depth - 1)
-}
-
-/// Integrate `f(x)` on `[a, b]` using adaptive 15-point Gauss–Kronrod quadrature.
-pub fn gauss_kronrod_integrate<F: Fn(f64) -> f64>(f: F, a: f64, b: f64) -> f64 {
-    if !a.is_finite() || !b.is_finite() {
-        return f64::NAN;
-    }
-    if (b - a).abs() <= 1e-15 {
-        return 0.0;
-    }
-    gk15_adaptive(&f, a, b, 1e-11, 20)
-}
-
-/// Integrate `f(x)` on `[lower, ∞)` via transformation `x = lower + (1 - t) / t`, `t ∈ (0, 1]`.
-pub fn gauss_kronrod_integrate_semi_infinite<F: Fn(f64) -> f64>(f: F, lower: f64) -> f64 {
-    if !lower.is_finite() {
-        return f64::NAN;
-    }
-    let transformed = |t: f64| -> f64 {
-        if !(t > 1e-14) {
-            return 0.0;
-        }
-        let x = lower + (1.0 - t) / t;
-        let val = f(x) / (t * t);
-        if val.is_finite() { val } else { 0.0 }
-    };
-    gk15_adaptive(&transformed, 0.0, 1.0, 1e-11, 20)
+/// Integrate `f(x)` on `[lower, ∞)` via `x = lower + scale (1 - t) / t`, `t ∈ (0, 1]`,
+/// with breakpoints at `x - lower = scale · 10^j`, `|j| <= 14`. `scale` should be the
+/// integrand's natural scale (e.g. the severity median); any value within a few decades works.
+///
+/// # Errors
+/// [`PricingError::InvalidParameter`] for a non-finite `lower`, a non-positive or non-finite
+/// `scale`, or a non-finite integrand value; [`PricingError::NonConvergence`] as for
+/// [`gauss_kronrod_integrate`].
+pub fn gauss_kronrod_integrate_semi_infinite<F: Fn(f64) -> f64>(
+    f: F,
+    lower: f64,
+    scale: f64,
+) -> Result<f64, PricingError> {
+    integrate_semi_infinite(f, lower, scale, &[], 0.0)
 }
 
 // ===========================================================================
 // Conditional Lognormal Limited Expected Value & 1-D ALAE-Included Reduction
 // ===========================================================================
 
-/// Relative tolerance target of the 1-D ALAE-included quadratures.
-const INCLUDED_QUAD_REL_TOL: f64 = 1e-12;
-/// Maximum bisection depth of the adaptive ALAE-included quadratures.
-const INCLUDED_QUAD_MAX_DEPTH: usize = 30;
 /// Standard-normal half-width beyond which the integrand mass is below `1e-31`.
 const STD_NORMAL_TAIL_Z: f64 = 12.0;
 /// Relative tolerance for matching `severity` to the bivariate-Lognormal marginal.
@@ -218,15 +168,6 @@ fn lognormal_lev(m: f64, mu: f64, sigma: f64) -> f64 {
 fn lognormal_from_mean_cv(mean: f64, cv: f64) -> (f64, f64) {
     let s2 = (cv * cv).ln_1p();
     (mean.ln() - 0.5 * s2, s2.sqrt())
-}
-
-/// Adaptive Gauss–Kronrod with an absolute tolerance `tol_abs` (relative to the caller's
-/// magnitude scale) and an explicit depth cap.
-fn integrate_to_tol<F: Fn(f64) -> f64>(f: F, a: f64, b: f64, tol_abs: f64) -> f64 {
-    if !(b > a) {
-        return 0.0;
-    }
-    gk15_adaptive(&f, a, b, tol_abs, INCLUDED_QUAD_MAX_DEPTH)
 }
 
 // ===========================================================================
@@ -311,26 +252,131 @@ fn require_matching_marginal(
     }
 }
 
+/// GPD shapes with `|xi|` at or below this are treated as exponential (matches `ilf.rs`).
+const GPD_EXPONENTIAL_XI_TOL: f64 = 1e-10;
+/// Bisection iterations for the ALAE-included kink `x* + c (x*)^gamma = L`.
+const KINK_BISECTION_MAX_ITER: usize = 200;
+/// Relative bracket width at which the kink bisection stops.
+const KINK_BISECTION_REL_TOL: f64 = 1e-15;
+
+fn gamma_pdf(shape: f64, scale: f64, x: f64) -> f64 {
+    ((shape - 1.0) * x.ln() - x / scale - shape * scale.ln() - ln_gamma(shape)).exp()
+}
+
+/// Exact density `f(x)` of every [`SeverityDistribution`] family (`0` outside the support).
 fn severity_pdf(severity: &SeverityDistribution, x: f64) -> f64 {
     if !(x > 0.0) || !x.is_finite() {
         return 0.0;
     }
-    match severity {
+    let d = match severity {
         SeverityDistribution::Lognormal { mu, sigma } => {
             let z = (x.ln() - mu) / sigma;
             (-0.5 * z * z).exp() / (x * sigma * std::f64::consts::TAU.sqrt())
         }
         SeverityDistribution::Lomax { alpha, theta } => {
-            (alpha / theta) * (1.0 + x / theta).powf(-(alpha + 1.0))
+            (alpha / theta) * (-(alpha + 1.0) * (x / theta).ln_1p()).exp()
+        }
+        SeverityDistribution::SingleParameterPareto { alpha, x_m } => {
+            if x <= *x_m {
+                0.0
+            } else {
+                (alpha / x) * (x_m / x).powf(*alpha)
+            }
         }
         SeverityDistribution::Exponential { lambda } => lambda * (-lambda * x).exp(),
-        _ => {
-            let h = (1e-6 * x).max(1e-9);
-            let s_hi = severity.survival(x + h).unwrap_or(0.0);
-            let s_lo = severity.survival((x - h).max(0.0)).unwrap_or(1.0);
-            let denom = (x + h) - (x - h).max(0.0);
-            ((s_lo - s_hi) / denom).max(0.0)
+        SeverityDistribution::MixedExponential { weights, means } => weights
+            .iter()
+            .zip(means.iter())
+            .map(|(&w, &m)| (w / m) * (-x / m).exp())
+            .sum(),
+        SeverityDistribution::GeneralizedPareto { xi, beta } => {
+            if xi.abs() <= GPD_EXPONENTIAL_XI_TOL {
+                (-x / beta).exp() / beta
+            } else {
+                (-(1.0 / xi + 1.0) * (xi * x / beta).ln_1p()).exp() / beta
+            }
         }
+        SeverityDistribution::Gamma { shape, scale } => gamma_pdf(*shape, *scale, x),
+        SeverityDistribution::SplicedGammaPareto {
+            shape,
+            scale,
+            splice,
+            tail_alpha,
+        } => {
+            let (w, f_u) =
+                crate::layers::ilf::spliced_body_weight(*shape, *scale, *splice, *tail_alpha);
+            if x <= *splice {
+                if f_u > 0.0 {
+                    (w / f_u) * gamma_pdf(*shape, *scale, x)
+                } else {
+                    0.0
+                }
+            } else {
+                (1.0 - w) * (tail_alpha / x) * (splice / x).powf(*tail_alpha)
+            }
+        }
+    };
+    if d.is_finite() { d.max(0.0) } else { 0.0 }
+}
+
+/// Natural scale points (median, mean, scale, threshold, support start, component means)
+/// used to seed the quadrature subdivision.
+fn severity_anchors(severity: &SeverityDistribution) -> Vec<f64> {
+    match severity {
+        SeverityDistribution::Lognormal { mu, sigma } => {
+            vec![
+                mu.exp(),
+                (mu + 0.5 * sigma * sigma).exp(),
+                (mu - sigma * sigma).exp(),
+            ]
+        }
+        SeverityDistribution::Lomax { theta, .. } => vec![*theta],
+        SeverityDistribution::SingleParameterPareto { x_m, .. } => vec![*x_m],
+        SeverityDistribution::Exponential { lambda } => vec![1.0 / lambda],
+        SeverityDistribution::MixedExponential { means, .. } => means.clone(),
+        SeverityDistribution::GeneralizedPareto { xi, beta } => {
+            if xi.abs() > GPD_EXPONENTIAL_XI_TOL {
+                vec![*beta, beta / xi]
+            } else {
+                vec![*beta]
+            }
+        }
+        SeverityDistribution::Gamma { shape, scale } => vec![*scale, shape * scale],
+        SeverityDistribution::SplicedGammaPareto {
+            shape,
+            scale,
+            splice,
+            ..
+        } => vec![*splice, *scale, shape * scale],
+    }
+}
+
+/// `E[X^p; X <= y]` (`upper = false`) or `E[X^p; X > y]` (`upper = true`): closed form when
+/// available, else scale-aware quadrature of `x^p f(x)` (caller guarantees finiteness).
+fn truncated_moment(
+    severity: &SeverityDistribution,
+    p: f64,
+    y: f64,
+    upper: bool,
+) -> Result<f64, PricingError> {
+    if !upper && p == 1.0 {
+        // E[X; X <= y] = E[X ∧ y] - y S(y), exact for every family.
+        let v = severity.limited_expected_value(y)? - y * severity.survival(y)?;
+        return Ok(v.max(0.0));
+    }
+    if let Some(v) = truncated_power_moment(severity, p, y, upper) {
+        return Ok(v);
+    }
+    let anchors = severity_anchors(severity);
+    let g = |x: f64| -> f64 {
+        let d = severity_pdf(severity, x);
+        if d > 0.0 { x.powf(p) * d } else { 0.0 }
+    };
+    if upper {
+        let scale = anchors.iter().copied().fold(y, f64::max);
+        integrate_semi_infinite(g, y, scale, &anchors, 0.0)
+    } else {
+        integrate_finite(g, 0.0, y, &anchors, 0.0)
     }
 }
 
@@ -379,53 +425,32 @@ pub fn alae_loss_severity(
             let m_fn = |x: f64| c * x.powf(gamma);
             match treatment {
                 AlaePolicyTreatment::ProRata => {
-                    let below = gauss_kronrod_integrate(
-                        |x| {
-                            let pdf = severity_pdf(severity, x);
-                            if x > 0.0 && pdf.is_finite() {
-                                m_fn(x) * pdf
-                            } else {
-                                0.0
-                            }
-                        },
-                        0.0,
-                        limit,
-                    );
-                    let above = gauss_kronrod_integrate_semi_infinite(
-                        |x| {
-                            let pdf = severity_pdf(severity, x);
-                            if x > 0.0 && pdf.is_finite() {
-                                (m_fn(x) / x) * pdf
-                            } else {
-                                0.0
-                            }
-                        },
-                        limit,
-                    );
+                    // E[c X^g; X <= L] + L E[c X^(g-1); X > L] (finite for g ∈ (0, 1]).
+                    let below = c * truncated_moment(severity, gamma, limit, false)?;
+                    let above = c * truncated_moment(severity, gamma - 1.0, limit, true)?;
                     Ok(lev_l + below + limit * above)
                 }
                 AlaePolicyTreatment::InAddition => {
-                    let e_a = gauss_kronrod_integrate_semi_infinite(
-                        |x| {
-                            let pdf = severity_pdf(severity, x);
-                            if x > 0.0 && pdf.is_finite() {
-                                m_fn(x) * pdf
-                            } else {
-                                0.0
-                            }
-                        },
-                        0.0,
-                    );
-                    Ok(lev_l + e_a)
+                    if c == 0.0 {
+                        return Ok(lev_l);
+                    }
+                    if !power_moment_is_finite(severity, gamma) {
+                        return Err(PricingError::InvalidParameter(
+                            "ALAE-in-addition with power-law ALAE requires a severity distribution with finite E[X^gamma]",
+                        ));
+                    }
+                    Ok(lev_l + c * truncated_moment(severity, gamma, 0.0, true)?)
                 }
                 AlaePolicyTreatment::Included if cv > 0.0 && c > 0.0 => {
                     // E[(X + A) ∧ L] = E[X ∧ L] + ∫_0^L E[A ∧ (L - x) | x] f(x) dx with
                     // A | x Lognormal(mean c x^gamma, CV cv) in closed form.
-                    let alae_part = gauss_kronrod_integrate(
+                    let mut anchors = severity_anchors(severity);
+                    anchors.push(limit);
+                    let alae_part = integrate_finite(
                         |x| {
                             let pdf = severity_pdf(severity, x);
                             let mean_a = m_fn(x);
-                            if !(x > 0.0) || !pdf.is_finite() || !(mean_a > 0.0) {
+                            if !(x > 0.0) || !(pdf > 0.0) || !(mean_a > 0.0) {
                                 return 0.0;
                             }
                             let (mu_c, sigma_c) = lognormal_from_mean_cv(mean_a, cv);
@@ -433,45 +458,40 @@ pub fn alae_loss_severity(
                         },
                         0.0,
                         limit,
-                    );
+                        &anchors,
+                        QUAD_REL_TOL * lev_l,
+                    )?;
                     Ok(lev_l + alae_part)
                 }
                 AlaePolicyTreatment::Included => {
-                    // Analytic kink-split: solve x* + c * (x*)^gamma = limit (monotone
-                    // strictly increasing on [0, limit]), integrate smoothly on [0, x*],
-                    // and add limit * S(x*) analytically to avoid integrand kink error.
+                    // Analytic kink-split: solve x* + c (x*)^gamma = L (strictly increasing),
+                    // then E[(X + A) ∧ L] = E[X; X <= x*] + c E[X^gamma; X <= x*] + L S(x*).
                     let x_star = if c == 0.0 {
                         limit
                     } else {
                         let mut lo = 0.0_f64;
                         let mut hi = limit;
-                        for _ in 0..80 {
+                        for _ in 0..KINK_BISECTION_MAX_ITER {
                             let mid = f64::midpoint(lo, hi);
                             if mid + m_fn(mid) < limit {
                                 lo = mid;
                             } else {
                                 hi = mid;
                             }
-                            if (hi - lo) <= 1e-13 * hi.max(1.0) {
+                            if (hi - lo) <= KINK_BISECTION_REL_TOL * hi {
                                 break;
                             }
                         }
                         f64::midpoint(lo, hi)
                     };
-                    let body = gauss_kronrod_integrate(
-                        |x| {
-                            let pdf = severity_pdf(severity, x);
-                            if x > 0.0 && pdf.is_finite() {
-                                (x + m_fn(x)) * pdf
-                            } else {
-                                0.0
-                            }
-                        },
-                        0.0,
-                        x_star,
-                    );
+                    let body_x = truncated_moment(severity, 1.0, x_star, false)?;
+                    let body_a = if c == 0.0 {
+                        0.0
+                    } else {
+                        c * truncated_moment(severity, gamma, x_star, false)?
+                    };
                     let tail = limit * severity.survival(x_star)?;
-                    Ok(body + tail)
+                    Ok(body_x + body_a + tail)
                 }
             }
         }
@@ -521,9 +541,8 @@ pub fn alae_loss_severity(
                         let phi = inv_sqrt_tau * (-0.5 * z * z).exp();
                         lognormal_lev(limit - x, mu_c, cond_sd) * phi
                     };
-                    let scale = e_a.min(limit);
                     let alae_part =
-                        integrate_to_tol(integrand, z_lo, z_l, INCLUDED_QUAD_REL_TOL * scale);
+                        integrate_finite(integrand, z_lo, z_l, &[], QUAD_REL_TOL * lev_l)?;
                     Ok(lev_l + alae_part)
                 }
             }

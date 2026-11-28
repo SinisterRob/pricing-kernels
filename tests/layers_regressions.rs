@@ -8,8 +8,8 @@ use pricing_kernels::layers::{
     AlaeDependenceModel, AlaePolicyTreatment, EvtFamily, FittedEvtDistribution, MbbefdCurve,
     ReinstatementBasis, SeverityDistribution, SeverityObservation, SpliceBodyFamily,
     SpliceContinuity, alae_loss_severity, compound_poisson_reinstatement_slices, fit_evt_mle,
-    fit_evt_mle_with_options, goodness_of_fit, price_reinstatements,
-    price_reinstatements_compound_poisson,
+    fit_evt_mle_with_options, gauss_kronrod_integrate, gauss_kronrod_integrate_semi_infinite,
+    goodness_of_fit, price_reinstatements, price_reinstatements_compound_poisson,
 };
 
 const SEED: u64 = 42069;
@@ -768,4 +768,354 @@ fn time_basis_slices_match_seeded_monte_carlo() {
     // The flat 0.5 factor is wrong in both directions across slices.
     assert!(exact.time_weighted_layer_losses[0] > 0.5 * exact.expected_layer_losses[0]);
     assert!(exact.time_weighted_layer_losses[2] < 0.5 * exact.expected_layer_losses[2]);
+}
+
+// ===========================================================================
+// Round 2: scale-aware quadrature, closed-form LEVs, power-law ALAE moments
+// ===========================================================================
+
+const ALL_TREATMENTS: [AlaePolicyTreatment; 3] = [
+    AlaePolicyTreatment::Included,
+    AlaePolicyTreatment::ProRata,
+    AlaePolicyTreatment::InAddition,
+];
+
+#[test]
+fn power_law_gamma_one_equals_proportional_for_all_treatments_and_scales() {
+    let sevs = [
+        SeverityDistribution::Lognormal {
+            mu: 11.0,
+            sigma: 2.5,
+        },
+        SeverityDistribution::Lognormal {
+            mu: 15.0,
+            sigma: 1.0,
+        },
+        SeverityDistribution::Lognormal {
+            mu: 20.0,
+            sigma: 1.0,
+        },
+        SeverityDistribution::SingleParameterPareto {
+            alpha: 1.5,
+            x_m: 1e5,
+        },
+        SeverityDistribution::Lomax {
+            alpha: 1.8,
+            theta: 2e5,
+        },
+        SeverityDistribution::Gamma {
+            shape: 2.0,
+            scale: 5e4,
+        },
+    ];
+    let c = 0.35;
+    for sev in &sevs {
+        for lim in [1e5, 1e6, 1e7] {
+            for tr in ALL_TREATMENTS {
+                let prop =
+                    alae_loss_severity(sev, lim, AlaeDependenceModel::Proportional { k: c }, tr)
+                        .expect("proportional");
+                let pw = alae_loss_severity(
+                    sev,
+                    lim,
+                    AlaeDependenceModel::PowerLaw { c, gamma: 1.0 },
+                    tr,
+                )
+                .expect("power law");
+                assert!(
+                    rel(pw, prop) < 1e-8,
+                    "{sev:?} L={lim} {tr:?}: power-law {pw} vs proportional {prop}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn power_law_lognormal_matches_bivariate_lognormal_at_realistic_scale() {
+    let (mu_x, s_x, c, g, cv): (f64, f64, f64, f64, f64) = (15.0, 1.0, 0.5, 0.8, 1.0);
+    let s2 = (cv * cv).ln_1p();
+    let sigma_a = (g * g * s_x * s_x + s2).sqrt();
+    let biv = AlaeDependenceModel::BivariateLognormal {
+        mu_x,
+        sigma_x: s_x,
+        mu_a: c.ln() + g * mu_x - 0.5 * s2,
+        sigma_a,
+        rho: g * s_x / sigma_a,
+    };
+    let sev = biv.indemnity_marginal().expect("marginal");
+    let plln = AlaeDependenceModel::PowerLawLognormal { c, gamma: g, cv };
+    for lim in [1e5, 1e6, 1e7, 1e8, 1e9] {
+        for tr in ALL_TREATMENTS {
+            let a = alae_loss_severity(&sev, lim, plln, tr).expect("plln");
+            let b = alae_loss_severity(&sev, lim, biv, tr).expect("biv");
+            assert!(rel(a, b) < 1e-7, "L={lim:e} {tr:?}: {a} vs {b}");
+        }
+    }
+}
+
+#[test]
+fn power_law_in_addition_and_pro_rata_are_exact_at_dollar_scale() {
+    let (c, g) = (0.5, 0.8);
+    let dep = AlaeDependenceModel::PowerLaw { c, gamma: g };
+    // Lognormal(15, 1): E[X^g] = exp(g mu + g^2 sigma^2 / 2).
+    let ln = SeverityDistribution::Lognormal {
+        mu: 15.0,
+        sigma: 1.0,
+    };
+    // SPP(1.5, 1e5): E[X^g] = alpha x_m^g / (alpha - g).
+    let spp = SeverityDistribution::SingleParameterPareto {
+        alpha: 1.5,
+        x_m: 1e5,
+    };
+    let cases = [
+        (ln.clone(), (g * 15.0 + 0.5 * g * g).exp()),
+        (spp.clone(), 1.5 * 1e5_f64.powf(g) / (1.5 - g)),
+    ];
+    for (sev, moment) in &cases {
+        for lim in [1e5, 1e6, 1e7] {
+            let lev = sev.limited_expected_value(lim).expect("lev");
+            let add =
+                alae_loss_severity(sev, lim, dep, AlaePolicyTreatment::InAddition).expect("add");
+            let expected = lev + c * moment;
+            assert!(
+                rel(add, expected) < 1e-10,
+                "{sev:?} L={lim}: {add} vs {expected}"
+            );
+        }
+    }
+    // SPP pro-rata: E[c X^g; X <= L] + L E[c X^(g-1); X > L] in closed form.
+    let (a, xm, lim) = (1.5_f64, 1e5_f64, 1e7_f64);
+    let below = a * xm.powf(g) * ((lim / xm).powf(g - a) - 1.0) / (g - a);
+    let above = a * xm.powf(g - 1.0) * (lim / xm).powf(g - 1.0 - a) / (a + 1.0 - g);
+    let expected = spp.limited_expected_value(lim).expect("lev") + c * (below + lim * above);
+    let got = alae_loss_severity(&spp, lim, dep, AlaePolicyTreatment::ProRata).expect("pro");
+    assert!(rel(got, expected) < 1e-10, "{got} vs {expected}");
+}
+
+#[test]
+fn power_law_in_addition_rejects_infinite_alae_moment() {
+    let dep = AlaeDependenceModel::PowerLaw {
+        c: 2.0,
+        gamma: 0.75,
+    };
+    let heavy = [
+        SeverityDistribution::Lomax {
+            alpha: 0.5,
+            theta: 1e5,
+        },
+        SeverityDistribution::SingleParameterPareto {
+            alpha: 0.6,
+            x_m: 1e5,
+        },
+        SeverityDistribution::GeneralizedPareto { xi: 2.0, beta: 1e5 },
+    ];
+    for sev in &heavy {
+        assert!(
+            matches!(
+                alae_loss_severity(sev, 1e6, dep, AlaePolicyTreatment::InAddition),
+                Err(PricingError::InvalidParameter(_))
+            ),
+            "{sev:?}: infinite E[X^gamma] must be rejected"
+        );
+        let plln = AlaeDependenceModel::PowerLawLognormal {
+            c: 2.0,
+            gamma: 0.75,
+            cv: 0.5,
+        };
+        assert!(alae_loss_severity(sev, 1e6, plln, AlaePolicyTreatment::InAddition).is_err());
+        // Capped treatments stay finite.
+        for tr in [AlaePolicyTreatment::Included, AlaePolicyTreatment::ProRata] {
+            let v = alae_loss_severity(sev, 1e6, dep, tr).expect("capped treatment");
+            assert!(v.is_finite() && v > 0.0, "{sev:?} {tr:?}: {v}");
+        }
+    }
+}
+
+/// Independent reference `∫_a^b S(x) dx` by composite Simpson in `t = ln x`
+/// (starting 60 e-folds below `b` when `a == 0`).
+fn lev_reference(d: &FittedEvtDistribution, a: f64, b: f64) -> f64 {
+    const N: usize = 400_000;
+    const LOG_SPAN: f64 = 60.0;
+    if !(b > a) {
+        return 0.0;
+    }
+    let t_lo = if a > 0.0 { a.ln() } else { b.ln() - LOG_SPAN };
+    simpson(
+        |t| {
+            let x = t.exp();
+            x * d.log_survival(x).exp()
+        },
+        t_lo,
+        b.ln(),
+        N,
+    )
+}
+
+fn assert_lev(d: &FittedEvtDistribution, lim: f64, expected: f64) {
+    let got = d.limited_expected_value(lim).expect("lev");
+    assert!(
+        rel(got, expected) < 1e-8,
+        "{d:?} L={lim:e}: got {got}, expected {expected}, rel {}",
+        rel(got, expected)
+    );
+}
+
+#[test]
+fn evt_lev_weibull_burr_inverse_gaussian_match_closed_forms_up_to_1e9() {
+    let limits = [1e2, 1e3, 1e5, 1e7, 1e9];
+    let lam = 1000.0;
+    let w1 = FittedEvtDistribution::Weibull {
+        k: 1.0,
+        lambda: lam,
+    };
+    let w_half = FittedEvtDistribution::Weibull {
+        k: 0.5,
+        lambda: lam,
+    };
+    for lim in limits {
+        assert_lev(&w1, lim, -lam * (-lim / lam).exp_m1());
+        let s = (lim / lam).sqrt();
+        assert_lev(&w_half, lim, 2.0 * lam * (1.0 - (1.0 + s) * (-s).exp()));
+    }
+    // Weibull k = 2: λ √π / 2 erf(L / λ); erf(2) = 0.995_322_265_018_952_7.
+    let w2 = FittedEvtDistribution::Weibull {
+        k: 2.0,
+        lambda: lam,
+    };
+    let half_sqrt_pi = 0.886_226_925_452_758;
+    assert_lev(&w2, 2.0 * lam, lam * half_sqrt_pi * 0.995_322_265_018_952_7);
+    assert_lev(&w2, 1e9, lam * half_sqrt_pi);
+
+    // Burr XII S(x) = (λ / (λ + x^γ))^α.
+    let lb: f64 = 1e6;
+    let rl = lb.sqrt();
+    let burr_atan = FittedEvtDistribution::BurrXii {
+        alpha: 1.0,
+        gamma: 2.0,
+        lambda: lb,
+    };
+    let burr_asinh = FittedEvtDistribution::BurrXii {
+        alpha: 0.5,
+        gamma: 2.0,
+        lambda: lb,
+    };
+    let burr_lomax = FittedEvtDistribution::BurrXii {
+        alpha: 2.0,
+        gamma: 1.0,
+        lambda: 5e4,
+    };
+    for lim in limits {
+        assert_lev(&burr_atan, lim, rl * (lim / rl).atan());
+        assert_lev(&burr_asinh, lim, rl * (lim / rl).asinh());
+        assert_lev(&burr_lomax, lim, 5e4 * (1.0 - 5e4 / (5e4 + lim)));
+    }
+
+    // Inverse Gaussian: LEV -> mu as L -> ∞; intermediate limits vs Simpson reference.
+    for (mu, shape) in [(1000.0, 500.0), (1000.0, 5000.0), (2e5, 1e5)] {
+        let ig = FittedEvtDistribution::InverseGaussian { mu, lambda: shape };
+        assert_lev(&ig, 1e9, mu);
+        for lim in [0.3 * mu, mu, 4.0 * mu, 1e7] {
+            assert_lev(&ig, lim, lev_reference(&ig, 0.0, lim));
+        }
+    }
+}
+
+#[test]
+fn evt_lev_gpd_and_spliced_respect_finite_support_and_thresholds() {
+    // Shifted GPD with xi < 0: support ends at u + β / |ξ| = 2000.
+    let (u, xi, beta) = (1000.0, -0.5, 500.0);
+    let gpd_neg = FittedEvtDistribution::Gpd {
+        threshold: u,
+        xi,
+        beta,
+    };
+    let full = u + beta / (1.0 - xi);
+    for lim in [2000.0, 1e4, 1e6, 1e9] {
+        assert_lev(&gpd_neg, lim, full);
+    }
+    assert_lev(
+        &gpd_neg,
+        1200.0,
+        u + beta / (1.0 - xi) * (1.0 - 0.8_f64.powi(3)),
+    );
+    assert_lev(&gpd_neg, 500.0, 500.0);
+
+    // Shifted GPD with xi > 0.
+    let (xi_p, beta_p) = (0.3, 2000.0);
+    let gpd_pos = FittedEvtDistribution::Gpd {
+        threshold: u,
+        xi: xi_p,
+        beta: beta_p,
+    };
+    for lim in [1e4, 1e6, 1e9] {
+        let y: f64 = lim - u;
+        let tail = (1.0 + xi_p * y / beta_p).powf(1.0 - 1.0 / xi_p);
+        assert_lev(&gpd_pos, lim, u + beta_p / (1.0 - xi_p) * (1.0 - tail));
+    }
+
+    // Spliced Lognormal body + GPD tail with xi < 0 (finite support end).
+    let (u_s, w_s, xi_s, beta_s) = (2000.0, 0.8, -0.25, 800.0);
+    let spl_ln = FittedEvtDistribution::SplicedBodyGpd {
+        body: SpliceBodyFamily::Lognormal,
+        threshold: u_s,
+        continuity: SpliceContinuity::C0Continuous,
+        body_param1: 7.0,
+        body_param2: 1.0,
+        body_weight: w_s,
+        xi: xi_s,
+        beta: beta_s,
+    };
+    let body_ref = lev_reference(&spl_ln, 0.0, u_s);
+    for lim in [1e4, 1e6, 1e9] {
+        assert_lev(&spl_ln, lim, body_ref + (1.0 - w_s) * beta_s / (1.0 - xi_s));
+    }
+    assert_lev(&spl_ln, 900.0, lev_reference(&spl_ln, 0.0, 900.0));
+
+    // Spliced Weibull body + GPD tail with xi > 0.
+    let (u_w, w_w, xi_w, beta_w) = (3000.0, 0.7, 0.4, 2000.0);
+    let spl_w = FittedEvtDistribution::SplicedBodyGpd {
+        body: SpliceBodyFamily::Weibull,
+        threshold: u_w,
+        continuity: SpliceContinuity::C0Continuous,
+        body_param1: 0.8,
+        body_param2: 1500.0,
+        body_weight: w_w,
+        xi: xi_w,
+        beta: beta_w,
+    };
+    let body_w = lev_reference(&spl_w, 0.0, u_w);
+    for lim in [1e5, 1e7, 1e9] {
+        let y: f64 = lim - u_w;
+        let tail = (1.0 + xi_w * y / beta_w).powf(1.0 - 1.0 / xi_w);
+        let expected = body_w + (1.0 - w_w) * beta_w / (1.0 - xi_w) * (1.0 - tail);
+        assert_lev(&spl_w, lim, expected);
+    }
+    assert_lev(&spl_w, 1000.0, lev_reference(&spl_w, 0.0, 1000.0));
+}
+
+#[test]
+fn gauss_kronrod_public_api_is_scale_aware_and_reports_errors() {
+    // Mass on scale 1e3 inside [0, 1e9] (a single panel sees ~0).
+    let v = gauss_kronrod_integrate(|x| (-x / 1e3).exp(), 0.0, 1e9).expect("finite");
+    assert!(rel(v, 1e3) < 1e-10, "v={v}");
+    let r = gauss_kronrod_integrate(|x| (-x / 1e3).exp(), 1e9, 0.0).expect("reversed");
+    assert!(rel(r, -1e3) < 1e-10, "r={r}");
+    assert_eq!(gauss_kronrod_integrate(|x| x, 2.0, 2.0), Ok(0.0));
+    // Semi-infinite with a scale 6 decades off the integrand's.
+    let s = gauss_kronrod_integrate_semi_infinite(|x| (-x / 1e6).exp(), 0.0, 1.0).expect("semi");
+    assert!(rel(s, 1e6) < 1e-10, "s={s}");
+    let s2 = gauss_kronrod_integrate_semi_infinite(|x| (-(x - 5e5) / 1e3).exp(), 5e5, 1e3)
+        .expect("shifted");
+    assert!(rel(s2, 1e3) < 1e-10, "s2={s2}");
+
+    assert!(gauss_kronrod_integrate(|x| x, f64::NAN, 1.0).is_err());
+    assert!(gauss_kronrod_integrate(|x| x, 0.0, f64::INFINITY).is_err());
+    assert!(gauss_kronrod_integrate(|_| f64::NAN, 0.0, 1.0).is_err());
+    assert!(gauss_kronrod_integrate_semi_infinite(|x| x, f64::NAN, 1.0).is_err());
+    assert!(gauss_kronrod_integrate_semi_infinite(|x| x, 0.0, 0.0).is_err());
+    assert!(gauss_kronrod_integrate_semi_infinite(|x| x, 0.0, -1.0).is_err());
+    assert!(gauss_kronrod_integrate_semi_infinite(|_| f64::NAN, 0.0, 1.0).is_err());
+    // A divergent integral is reported, not silently truncated.
+    assert!(gauss_kronrod_integrate_semi_infinite(|x| 1.0 / (1.0 + x), 0.0, 1.0).is_err());
 }
