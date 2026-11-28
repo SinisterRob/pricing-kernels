@@ -143,6 +143,9 @@ fn gk15_adaptive<F: Fn(f64) -> f64>(f: &F, a: f64, b: f64, tol: f64, depth: usiz
 
 /// Integrate `f(x)` on `[a, b]` using adaptive 15-point Gauss–Kronrod quadrature.
 pub fn gauss_kronrod_integrate<F: Fn(f64) -> f64>(f: F, a: f64, b: f64) -> f64 {
+    if !a.is_finite() || !b.is_finite() {
+        return f64::NAN;
+    }
     if (b - a).abs() <= 1e-15 {
         return 0.0;
     }
@@ -151,6 +154,9 @@ pub fn gauss_kronrod_integrate<F: Fn(f64) -> f64>(f: F, a: f64, b: f64) -> f64 {
 
 /// Integrate `f(x)` on `[lower, ∞)` via transformation `x = lower + (1 - t) / t`, `t ∈ (0, 1]`.
 pub fn gauss_kronrod_integrate_semi_infinite<F: Fn(f64) -> f64>(f: F, lower: f64) -> f64 {
+    if !lower.is_finite() {
+        return f64::NAN;
+    }
     let transformed = |t: f64| -> f64 {
         if !(t > 1e-14) {
             return 0.0;
@@ -166,38 +172,40 @@ pub fn gauss_kronrod_integrate_semi_infinite<F: Fn(f64) -> f64>(f: F, lower: f64
 // 32-Point Gauss–Legendre Nodes/Weights on [-1, 1] for 2D Bivariate Integration
 // ===========================================================================
 
-/// Compute `n`-point Gauss–Legendre nodes and weights on `[-1, 1]` via Newton
-/// iteration on Legendre polynomials.
-fn gauss_legendre_nodes_weights(n: usize) -> (Vec<f64>, Vec<f64>) {
-    let mut nodes = vec![0.0; n];
-    let mut weights = vec![0.0; n];
-    let m = n.div_ceil(2);
-    for i in 0..m {
-        let mut z = (std::f64::consts::PI * (i as f64 + 0.75) / (n as f64 + 0.5)).cos();
-        let mut dp = 0.0;
-        for _ in 0..50 {
-            let mut p0 = 1.0;
-            let mut p1 = z;
-            for k in 2..=n {
-                let kf = k as f64;
-                let pk = ((2.0 * kf - 1.0) * z * p1 - (kf - 1.0) * p0) / kf;
-                p0 = p1;
-                p1 = pk;
+fn gauss_legendre_32() -> &'static ([f64; 32], [f64; 32]) {
+    static GL32: std::sync::OnceLock<([f64; 32], [f64; 32])> = std::sync::OnceLock::new();
+    GL32.get_or_init(|| {
+        const N: usize = 32;
+        let mut nodes = [0.0; N];
+        let mut weights = [0.0; N];
+        let m = N / 2;
+        for i in 0..m {
+            let mut z = (std::f64::consts::PI * (i as f64 + 0.75) / (N as f64 + 0.5)).cos();
+            let mut dp = 0.0;
+            for _ in 0..50 {
+                let mut p0 = 1.0;
+                let mut p1 = z;
+                for k in 2..=N {
+                    let kf = k as f64;
+                    let pk = ((2.0 * kf - 1.0) * z * p1 - (kf - 1.0) * p0) / kf;
+                    p0 = p1;
+                    p1 = pk;
+                }
+                dp = (N as f64) * (z * p1 - p0) / (z * z - 1.0);
+                let dz = p1 / dp;
+                z -= dz;
+                if dz.abs() < 1e-15 {
+                    break;
+                }
             }
-            dp = (n as f64) * (z * p1 - p0) / (z * z - 1.0);
-            let dz = p1 / dp;
-            z -= dz;
-            if dz.abs() < 1e-15 {
-                break;
-            }
+            nodes[i] = -z;
+            nodes[N - 1 - i] = z;
+            let w = 2.0 / ((1.0 - z * z) * dp * dp);
+            weights[i] = w;
+            weights[N - 1 - i] = w;
         }
-        nodes[i] = -z;
-        nodes[n - 1 - i] = z;
-        let w = 2.0 / ((1.0 - z * z) * dp * dp);
-        weights[i] = w;
-        weights[n - 1 - i] = w;
-    }
-    (nodes, weights)
+        (nodes, weights)
+    })
 }
 
 // ===========================================================================
@@ -341,20 +349,41 @@ pub fn alae_loss_severity(
                     Ok(lev_l + e_a)
                 }
                 AlaePolicyTreatment::Included => {
-                    // Deterministic conditional-mean eroding-limit evaluation
-                    // E[(X + c X^gamma) ∧ L] integrated against f_X(x).
-                    let val = gauss_kronrod_integrate_semi_infinite(
+                    // Analytic kink-split: solve x* + c * (x*)^gamma = limit (monotone
+                    // strictly increasing on [0, limit]), integrate smoothly on [0, x*],
+                    // and add limit * S(x*) analytically to avoid integrand kink error.
+                    let x_star = if c == 0.0 {
+                        limit
+                    } else {
+                        let mut lo = 0.0_f64;
+                        let mut hi = limit;
+                        for _ in 0..80 {
+                            let mid = f64::midpoint(lo, hi);
+                            if mid + m_fn(mid) < limit {
+                                lo = mid;
+                            } else {
+                                hi = mid;
+                            }
+                            if (hi - lo) <= 1e-13 * hi.max(1.0) {
+                                break;
+                            }
+                        }
+                        f64::midpoint(lo, hi)
+                    };
+                    let body = gauss_kronrod_integrate(
                         |x| {
                             let pdf = severity_pdf(severity, x);
                             if x > 0.0 && pdf.is_finite() {
-                                (x + m_fn(x)).min(limit) * pdf
+                                (x + m_fn(x)) * pdf
                             } else {
                                 0.0
                             }
                         },
                         0.0,
+                        x_star,
                     );
-                    Ok(val)
+                    let tail = limit * severity.survival(x_star)?;
+                    Ok(body + tail)
                 }
             }
         }
@@ -393,8 +422,8 @@ pub fn alae_loss_severity(
                 }
                 AlaePolicyTreatment::Included => {
                     // Exact 2D 32-point Gauss–Legendre quadrature over standard normal
-                    // (z1, z2) ∈ [-7, 7]^2 for E[(exp(mu_x + sigma_x z1) + exp(mu_a + sigma_a (rho z1 + sqrt(1-rho^2) z2))) ∧ L].
-                    let (nodes, weights) = gauss_legendre_nodes_weights(32);
+                    // (z1, z2) ∈ [-7.5, 7.5]^2 for E[(exp(mu_x + sigma_x z1) + exp(mu_a + sigma_a (rho z1 + sqrt(1-rho^2) z2))) ∧ L].
+                    let (nodes, weights) = gauss_legendre_32();
                     let bound = 7.5_f64;
                     let cond_sd = (1.0 - rho * rho).sqrt();
                     let inv_sqrt_2pi = 1.0 / (SQRT_2 * std::f64::consts::PI.sqrt());

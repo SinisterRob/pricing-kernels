@@ -1,4 +1,14 @@
 //! Classification ratemaking, IRLS GLMs, and actuarial lift diagnostics.
+//!
+//! # Example
+//! ```rust
+//! use pricing_kernels::classification::{DesignMatrix, GlmFamily, GlmFit};
+//!
+//! let dm = DesignMatrix::try_from_rows(&[[1.0, 0.0], [1.0, 1.0], [1.0, 2.0]])?;
+//! let fit = GlmFit::new(GlmFamily::Poisson, &dm, &[2.0, 4.0, 8.0]).fit()?;
+//! assert!(fit.coefficients[1] > 0.6);
+//! # Ok::<(), pricing_kernels::error::PricingError>(())
+//! ```
 
 /// Actuarial lift and model diagnostics (Gini, Lorenz, double-lift, AIC/BIC, VIF).
 pub mod diagnostics;

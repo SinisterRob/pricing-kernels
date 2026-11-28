@@ -547,6 +547,11 @@ pub fn convolve_independent_aggregates(
                 "fft_size must be >= every component pmf length",
             ));
         }
+        if comp.pmf.iter().any(|&p| !p.is_finite() || p < 0.0) {
+            return Err(PricingError::InvalidParameter(
+                "aggregate component pmf entries must be finite and non-negative",
+            ));
+        }
     }
 
     let mut prod_re = vec![1.0; fft_size];

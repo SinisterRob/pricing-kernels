@@ -4,8 +4,8 @@
 //! Reference: D. Skurnick (1974), *"Measuring the Effect of Loss Limitations on Retrospective
 //! Rating"*, *Proceedings of the Casualty Actuarial Society (PCAS)*, Vol. LXI, pp. 1–28.
 
-use super::retrospective::{RetroPlanResult, RetroPlanSpec};
-use crate::error::PricingError;
+use super::retrospective::{RetroPlanResult, RetroPlanSpec, solve_balanced_retro_plan_with};
+use crate::error::{PricingError, SolverOptions};
 use crate::underwriting_risk::AggregateLossDistribution;
 use serde::{Deserialize, Serialize};
 
@@ -245,91 +245,13 @@ pub fn solve_balanced_retro_plan_table_l(
     max_iter: usize,
     tol: f64,
 ) -> Result<RetroPlanResult, PricingError> {
-    if max_iter == 0 {
-        return Err(PricingError::InvalidParameter("max_iter must be > 0"));
-    }
-    if !tol.is_finite() || !(tol > 0.0) {
-        return Err(PricingError::InvalidParameter(
-            "tolerance must be finite and positive",
-        ));
-    }
-    if !spec.standard_premium.is_finite()
-        || !spec.expected_loss_ratio.is_finite()
-        || !(spec.standard_premium > 0.0)
-        || !(spec.expected_loss_ratio > 0.0)
-    {
-        return Err(PricingError::NonPositiveValue(
-            "standard premium and ELR must be finite and positive",
-        ));
-    }
-    if !spec.max_retro_ratio.is_finite()
-        || !spec.min_retro_ratio.is_finite()
-        || !(spec.max_retro_ratio > spec.min_retro_ratio)
-        || !(spec.min_retro_ratio >= 0.0)
-    {
-        return Err(PricingError::InvalidParameter(
-            "retro ratios must be finite with max_retro_ratio > min_retro_ratio >= 0",
-        ));
-    }
-    if !spec.tax_multiplier.is_finite()
-        || !spec.lcf.is_finite()
-        || !spec.expense_ratio.is_finite()
-        || !(spec.tax_multiplier > 0.0)
-        || !(spec.lcf > 0.0)
-    {
-        return Err(PricingError::NonPositiveValue(
-            "tax multiplier and LCF must be finite and positive, and expense_ratio finite",
-        ));
-    }
-
-    let e_lcf = spec.lcf * spec.expected_loss_ratio;
-    let non_loss_cost = spec.expense_ratio - (spec.lcf - 1.0) * spec.expected_loss_ratio;
-
-    let mut bpf = spec.expense_ratio + table_l.loss_elimination_ratio * e_lcf;
-    let mut converged = false;
-
-    for _ in 0..max_iter {
-        let r_g = (((spec.max_retro_ratio / spec.tax_multiplier) - bpf) / e_lcf).max(0.0);
-        let r_h = (((spec.min_retro_ratio / spec.tax_multiplier) - bpf) / e_lcf).max(0.0);
-
-        let phi_g = table_l.charge_at(r_g);
-        let psi_h = table_l.savings_at(r_h);
-        let net_charge = phi_g - psi_h;
-
-        let new_bpf = non_loss_cost + net_charge * e_lcf;
-        let diff = (new_bpf - bpf).abs();
-        bpf = f64::midpoint(bpf, new_bpf);
-
-        if diff <= tol {
-            converged = true;
-            break;
-        }
-    }
-
-    if !converged {
-        return Err(PricingError::NonConvergence(
-            "Table L retro plan basic premium solver failed to converge",
-        ));
-    }
-
-    let r_g_raw = ((spec.max_retro_ratio / spec.tax_multiplier) - bpf) / e_lcf;
-    if r_g_raw < 0.0 {
-        return Err(PricingError::OutOfBounds(
-            "infeasible Table L retro plan: max_retro_ratio / tax_multiplier is below balanced basic premium",
-        ));
-    }
-    let r_h = (((spec.min_retro_ratio / spec.tax_multiplier) - bpf) / e_lcf).max(0.0);
-    let phi_g = table_l.charge_at(r_g_raw);
-    let psi_h = table_l.savings_at(r_h);
-    let net_charge = phi_g - psi_h;
-
-    Ok(RetroPlanResult {
-        basic_premium_factor: bpf,
-        basic_premium_dollars: bpf * spec.standard_premium,
-        entry_ratio_max: r_g_raw,
-        entry_ratio_min: r_h,
-        charge_at_max: phi_g,
-        savings_at_min: psi_h,
-        net_insurance_charge: net_charge,
-    })
+    solve_balanced_retro_plan_with(
+        spec,
+        table_l.loss_elimination_ratio,
+        |r| table_l.charge_at(r),
+        |r| table_l.savings_at(r),
+        SolverOptions { max_iter, tol },
+        "Table L retro plan basic premium solver failed to converge",
+        "infeasible Table L retro plan: max_retro_ratio / tax_multiplier is below balanced basic premium",
+    )
 }

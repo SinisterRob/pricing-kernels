@@ -108,6 +108,35 @@ fn bench_classification(c: &mut Criterion) {
         });
     });
 
+    let reg_x: Vec<f64> = (0..40)
+        .flat_map(|i| {
+            let f = f64::from(i) / 10.0;
+            [f, f * f, f64::from(i % 3)]
+        })
+        .collect();
+    let reg_y: Vec<f64> = (0..40)
+        .map(|i| (0.5 + 0.2 * (f64::from(i) / 10.0)).exp().round())
+        .collect();
+    let reg_opts = RegularizedGlmOptions {
+        family: RegularizedGlmFamily::Poisson,
+        lambda: 0.1,
+        alpha: 0.5,
+        ..RegularizedGlmOptions::default()
+    };
+    group.bench_function("regularized_glm_elastic_net_40x3", |b| {
+        b.iter(|| {
+            fit_regularized_glm(
+                black_box(&reg_x),
+                40,
+                3,
+                black_box(&reg_y),
+                None,
+                None,
+                black_box(reg_opts),
+            )
+        });
+    });
+
     group.finish();
 }
 
@@ -138,6 +167,56 @@ fn bench_credibility_and_trending(c: &mut Criterion) {
     ];
     group.bench_function("parallelogram_on_level_3_changes", |b| {
         b.iter(|| parallelogram_on_level_factor(black_box(2022.0), black_box(&changes)));
+    });
+
+    let cap_curr = [100.0, 200.0, 300.0, 400.0, 500.0, 600.0];
+    let cap_ind = [80.0, 250.0, 310.0, 520.0, 470.0, 720.0];
+    group.bench_function("rate_capping_off_balance_6", |b| {
+        b.iter(|| {
+            solve_capped_rate_off_balance(
+                black_box(&cap_curr),
+                black_box(&cap_ind),
+                black_box(0.05),
+                black_box(-0.10),
+                black_box(0.15),
+            )
+        });
+    });
+
+    let hier_sectors = vec![
+        HierarchicalSector {
+            label: None,
+            risks: vec![
+                HierarchicalRisk {
+                    label: None,
+                    losses: vec![80.0, 84.0, 76.0],
+                    weights: vec![10.0, 12.0, 10.0],
+                },
+                HierarchicalRisk {
+                    label: None,
+                    losses: vec![110.0, 118.0, 112.0],
+                    weights: vec![15.0, 15.0, 14.0],
+                },
+            ],
+        },
+        HierarchicalSector {
+            label: None,
+            risks: vec![
+                HierarchicalRisk {
+                    label: None,
+                    losses: vec![160.0, 170.0, 165.0],
+                    weights: vec![20.0, 22.0, 18.0],
+                },
+                HierarchicalRisk {
+                    label: None,
+                    losses: vec![210.0, 200.0, 215.0],
+                    weights: vec![5.0, 6.0, 5.0],
+                },
+            ],
+        },
+    ];
+    group.bench_function("jewell_hierarchical_credibility_2x2", |b| {
+        b.iter(|| jewell_hierarchical_credibility(black_box(&hier_sectors)));
     });
 
     group.finish();
@@ -201,6 +280,36 @@ fn bench_layers_and_reinsurance(c: &mut Criterion) {
         });
     });
 
+    let evt_obs: Vec<SeverityObservation> = [
+        27.0, 82.0, 115.0, 126.0, 155.0, 161.0, 243.0, 294.0, 340.0, 384.0, 457.0, 680.0, 855.0,
+        877.0, 974.0, 1193.0, 1340.0, 1884.0, 2558.0, 15743.0,
+    ]
+    .iter()
+    .map(|&x| SeverityObservation::exact(x))
+    .collect();
+    group.bench_function("fit_evt_mle_pareto_ii_20", |b| {
+        b.iter(|| fit_evt_mle(black_box(EvtFamily::ParetoII), black_box(&evt_obs)));
+    });
+
+    let biv_dep = AlaeDependenceModel::BivariateLognormal {
+        mu_x: 10.0,
+        sigma_x: 1.0,
+        mu_a: 8.5,
+        sigma_a: 0.8,
+        rho: 0.65,
+    };
+    group.bench_function("alae_aware_ilf_bivariate_included", |b| {
+        b.iter(|| {
+            alae_aware_ilf(
+                black_box(&lognormal),
+                black_box(100_000.0),
+                black_box(500_000.0),
+                black_box(biv_dep),
+                AlaePolicyTreatment::Included,
+            )
+        });
+    });
+
     group.finish();
 }
 
@@ -256,6 +365,10 @@ fn bench_underwriting_risk(c: &mut Criterion) {
 
     group.bench_function("euler_tvar_500_scenarios", |b| {
         b.iter(|| euler_tvar_allocation(black_box(&lines), black_box(0.95)));
+    });
+
+    group.bench_function("simulate_ylt_from_elt_1000y", |b| {
+        b.iter(|| simulate_ylt_from_elt(black_box(&elt), black_box(1_000), black_box(42069)));
     });
 
     group.finish();

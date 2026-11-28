@@ -13,10 +13,12 @@
 //! * AIC, BIC, Kaplan–Meier Kolmogorov–Smirnov (`D_n`), PIT Anderson–Darling (`A^2`),
 //!   and empirical mean-excess `e_n(u)`.
 
-use crate::error::PricingError;
+use crate::error::{PricingError, SolverOptions};
+use crate::layers::alae_ilf::gauss_kronrod_integrate;
 use crate::layers::fitting::SeverityObservation;
+use crate::layers::ilf::{SeverityDistribution, ilf_from_lev};
 use crate::linalg::cholesky_invert;
-use crate::special::{gamma_p, gamma_q, ln_gamma, log_normal_survival, normal_cdf_exact};
+use crate::special::{gamma_p, ln_gamma, log_gamma_q, log_normal_survival, normal_cdf_exact};
 use serde::{Deserialize, Serialize};
 use std::f64::consts::TAU;
 
@@ -341,7 +343,7 @@ impl FittedEvtDistribution {
                 alpha * (lambda / (lambda + xg)).ln()
             }
             Self::Weibull { k, lambda } => -(x / lambda).powf(k),
-            Self::Gamma { alpha, beta } => gamma_q(alpha, beta * x).max(1e-300).ln(),
+            Self::Gamma { alpha, beta } => log_gamma_q(alpha, beta * x),
             Self::InverseGaussian { mu, lambda } => {
                 let sq = (lambda / x).sqrt();
                 let z1 = sq * (x / mu - 1.0);
@@ -388,6 +390,9 @@ impl FittedEvtDistribution {
 
     /// Evaluate CDF `F(x) = 1 - S(x)`.
     pub fn cdf(&self, x: f64) -> f64 {
+        if !x.is_finite() {
+            return f64::NAN;
+        }
         if x <= 0.0 {
             return 0.0;
         }
@@ -396,6 +401,101 @@ impl FittedEvtDistribution {
             Self::Gamma { alpha, beta } => gamma_p(alpha, beta * x),
             _ => (1.0 - self.log_survival(x).exp()).clamp(0.0, 1.0),
         }
+    }
+
+    /// Evaluate Limited Expected Value `E[X ∧ L] = ∫_0^L S(x) dx` for `L >= 0`.
+    ///
+    /// Uses exact closed-form formulas via [`SeverityDistribution`] when available
+    /// (`Lognormal`, `ParetoII`, `Gamma`, `Gpd` with `threshold == 0, xi >= 0`) and
+    /// adaptive 15-point Gauss–Kronrod quadrature (split cleanly at the splice/threshold
+    /// point to avoid kinks) for `BurrXii`, `Weibull`, `InverseGaussian`, general `Gpd`,
+    /// and `SplicedBodyGpd`.
+    pub fn limited_expected_value(&self, limit: f64) -> Result<f64, PricingError> {
+        if !limit.is_finite() || !(limit >= 0.0) {
+            return Err(PricingError::InvalidParameter(
+                "limit must be finite and non-negative",
+            ));
+        }
+        if limit == 0.0 {
+            return Ok(0.0);
+        }
+        if let Ok(sev) = SeverityDistribution::try_from(*self) {
+            return sev.limited_expected_value(limit);
+        }
+        let surv = |x: f64| -> f64 {
+            let ls = self.log_survival(x);
+            if ls.is_finite() { ls.exp() } else { 0.0 }
+        };
+        let lev = match *self {
+            Self::Gpd { threshold, .. } | Self::SplicedBodyGpd { threshold, .. }
+                if limit > threshold && threshold > 0.0 =>
+            {
+                let part1 = if matches!(*self, Self::Gpd { .. }) {
+                    threshold
+                } else {
+                    gauss_kronrod_integrate(surv, 0.0, threshold)
+                };
+                part1 + gauss_kronrod_integrate(surv, threshold, limit)
+            }
+            Self::Gpd { threshold, .. } if limit <= threshold => limit,
+            _ => gauss_kronrod_integrate(surv, 0.0, limit),
+        };
+        Ok(lev.clamp(0.0, limit))
+    }
+
+    /// Pure-loss Increased Limits Factor `ILF(L; B) = E[X ∧ L] / E[X ∧ B]`.
+    pub fn increased_limits_factor(
+        &self,
+        limit: f64,
+        basic_limit: f64,
+    ) -> Result<f64, PricingError> {
+        ilf_from_lev(limit, basic_limit, |x| self.limited_expected_value(x))
+    }
+
+    /// Expected loss in a 100%-participation excess layer `limit xs attachment`:
+    /// `E[X ∧ (attachment + limit)] - E[X ∧ attachment]`.
+    pub fn layer_expected_loss(&self, attachment: f64, limit: f64) -> Result<f64, PricingError> {
+        if !attachment.is_finite() || !limit.is_finite() || !(attachment >= 0.0) || !(limit > 0.0) {
+            return Err(PricingError::InvalidParameter(
+                "attachment must be >= 0 and limit must be > 0",
+            ));
+        }
+        let top = self.limited_expected_value(attachment + limit)?;
+        let bot = self.limited_expected_value(attachment)?;
+        Ok((top - bot).max(0.0))
+    }
+}
+
+impl TryFrom<FittedEvtDistribution> for SeverityDistribution {
+    type Error = PricingError;
+
+    /// Convert overlapping [`FittedEvtDistribution`] variants (`Lognormal`, `ParetoII`,
+    /// `Gamma`, and `Gpd` with `threshold == 0.0 && xi >= 0.0`) directly into a
+    /// [`SeverityDistribution`] for downstream `LayerTower`, deductible, and ALAE pricing.
+    fn try_from(value: FittedEvtDistribution) -> Result<Self, Self::Error> {
+        let dist = match value {
+            FittedEvtDistribution::Lognormal { mu, sigma } => Self::Lognormal { mu, sigma },
+            FittedEvtDistribution::ParetoII { alpha, lambda } => Self::Lomax {
+                alpha,
+                theta: lambda,
+            },
+            FittedEvtDistribution::Gamma { alpha, beta } => Self::Gamma {
+                shape: alpha,
+                scale: 1.0 / beta,
+            },
+            FittedEvtDistribution::Gpd {
+                threshold,
+                xi,
+                beta,
+            } if threshold == 0.0 && xi >= 0.0 => Self::GeneralizedPareto { xi, beta },
+            _ => {
+                return Err(PricingError::InvalidParameter(
+                    "FittedEvtDistribution variant has no direct SeverityDistribution equivalent; use FittedEvtDistribution::limited_expected_value directly",
+                ));
+            }
+        };
+        dist.validate()?;
+        Ok(dist)
     }
 }
 
@@ -982,8 +1082,16 @@ pub fn goodness_of_fit(
     n_params: usize,
 ) -> GoodnessOfFitDiagnostics {
     let n = observations.len();
-    let n_f = n as f64;
     let aic = 2.0 * n_params as f64 - 2.0 * log_likelihood;
+    if n == 0 {
+        return GoodnessOfFitDiagnostics {
+            aic,
+            bic: f64::NAN,
+            ks_statistic: 0.0,
+            anderson_darling: None,
+        };
+    }
+    let n_f = n as f64;
     let bic = (n_params as f64) * n_f.ln() - 2.0 * log_likelihood;
 
     let has_censored = observations.iter().any(|o| o.is_censored);
@@ -1057,17 +1165,40 @@ pub fn goodness_of_fit(
 // ===========================================================================
 
 /// Fit any of the 7 parametric severity/EVT distributions or a $C^0$/$C^1$
-/// spliced body + GPD tail model via left-truncated, right-censored MLE.
+/// spliced body + GPD tail model via left-truncated, right-censored MLE
+/// using default solver tolerances.
 pub fn fit_evt_mle(
     family: EvtFamily,
     observations: &[SeverityObservation],
 ) -> Result<EvtFitResult, PricingError> {
+    fit_evt_mle_with_options(
+        family,
+        observations,
+        &SolverOptions {
+            max_iter: 500,
+            tol: 1e-8,
+        },
+    )
+}
+
+/// Fit any of the 7 parametric severity/EVT distributions or a $C^0$/$C^1$
+/// spliced body + GPD tail model via left-truncated, right-censored MLE
+/// with explicit [`SolverOptions`].
+pub fn fit_evt_mle_with_options(
+    family: EvtFamily,
+    observations: &[SeverityObservation],
+    options: &SolverOptions,
+) -> Result<EvtFitResult, PricingError> {
+    if options.max_iter == 0 || !options.tol.is_finite() || !(options.tol > 0.0) {
+        return Err(PricingError::InvalidParameter(
+            "solver options require max_iter > 0 and finite tol > 0",
+        ));
+    }
     if observations.is_empty() {
         return Err(PricingError::EmptyInput(
             "at least one observation is required for MLE",
         ));
     }
-    let mut n_censored = 0usize;
     let mut n_uncensored = 0usize;
     for o in observations {
         if !o.loss.is_finite() || !o.deductible.is_finite() || !o.weight.is_finite() {
@@ -1085,9 +1216,7 @@ pub fn fit_evt_mle(
                 "observed loss must be strictly greater than deductible",
             ));
         }
-        if o.is_censored {
-            n_censored += 1;
-        } else {
+        if !o.is_censored {
             n_uncensored += 1;
         }
     }
@@ -1120,6 +1249,11 @@ pub fn fit_evt_mle(
                     "no observations exceed GPD threshold",
                 ));
             }
+            if !v.iter().any(|o| !o.is_censored) {
+                return Err(PricingError::InvalidParameter(
+                    "at least one uncensored observation must exceed GPD threshold",
+                ));
+            }
             v
         }
         EvtFamily::SplicedBodyGpd { threshold, .. } => {
@@ -1132,6 +1266,7 @@ pub fn fit_evt_mle(
         }
         _ => observations.to_vec(),
     };
+    let n_censored = filtered.iter().filter(|o| o.is_censored).count();
 
     let phi0 = mom_initial_phi(family, &filtered);
     let neg_ll = |phi: &[f64]| -> f64 {
@@ -1144,14 +1279,16 @@ pub fn fit_evt_mle(
         }
     };
 
-    let (mut best_phi, mut best_nll, mut converged) = lbfgs_minimize(&neg_ll, phi0.clone(), 500);
+    let (mut best_phi, mut best_nll, mut converged) =
+        lbfgs_minimize(&neg_ll, phi0.clone(), options.max_iter);
     if !converged || !best_nll.is_finite() {
         let start = if best_nll.is_finite() {
             best_phi.as_slice()
         } else {
             phi0.as_slice()
         };
-        let (nm_phi, nm_nll, nm_conv) = nelder_mead_minimize(&neg_ll, start, 1500);
+        let nm_iters = options.max_iter.saturating_mul(3).max(500);
+        let (nm_phi, nm_nll, nm_conv) = nelder_mead_minimize(&neg_ll, start, nm_iters);
         if nm_nll < best_nll || !best_nll.is_finite() {
             best_phi = nm_phi;
             best_nll = nm_nll;
@@ -1161,7 +1298,8 @@ pub fn fit_evt_mle(
 
     // One L-BFGS polish pass if Nelder–Mead improved the point.
     if best_nll.is_finite() {
-        let (pol_phi, pol_nll, pol_conv) = lbfgs_minimize(&neg_ll, best_phi.clone(), 200);
+        let polish_iters = (options.max_iter / 2).max(50);
+        let (pol_phi, pol_nll, pol_conv) = lbfgs_minimize(&neg_ll, best_phi.clone(), polish_iters);
         if pol_nll <= best_nll {
             best_phi = pol_phi;
             best_nll = pol_nll;

@@ -114,10 +114,14 @@ impl ScenarioMatrix {
         euler_sd_allocation(&slices, multiplier)
     }
 
-    /// Allocate portfolio surplus via the Myers & Read (2001) marginal default-put method.
-    pub fn myers_read(&self, surplus: f64) -> Result<MyersReadAllocationResult, PricingError> {
+    /// Allocate portfolio surplus at total asset level `portfolio_assets` (`A = L + Q`)
+    /// via the Myers & Read (2001) marginal default-put method.
+    pub fn myers_read(
+        &self,
+        portfolio_assets: f64,
+    ) -> Result<MyersReadAllocationResult, PricingError> {
         let slices = self.as_slices();
-        myers_read_allocation(&slices, surplus)
+        myers_read_allocation(&slices, portfolio_assets)
     }
 }
 

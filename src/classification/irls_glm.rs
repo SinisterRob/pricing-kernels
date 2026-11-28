@@ -460,6 +460,49 @@ impl DesignMatrix {
             )
         }
     }
+
+    /// Fit an Elastic Net / Ridge / LASSO penalized GLM directly on this [`DesignMatrix`]
+    /// (treat columns as predictor features; intercept is added automatically).
+    pub fn fit_regularized(
+        &self,
+        y: &[f64],
+        weights: Option<&[f64]>,
+        offsets: Option<&[f64]>,
+        options: super::regularized_glm::RegularizedGlmOptions,
+    ) -> Result<super::regularized_glm::RegularizedGlmResult, PricingError> {
+        super::regularized_glm::fit_regularized_glm(
+            &self.data,
+            self.n_samples,
+            self.n_features,
+            y,
+            weights,
+            offsets,
+            options,
+        )
+    }
+
+    /// Fit a Laplace-approximated Poisson random-intercept GLMM directly on this [`DesignMatrix`].
+    pub fn fit_random_intercept_glmm(
+        &self,
+        y: &[f64],
+        group_ids: &[usize],
+        n_groups: usize,
+        weights: Option<&[f64]>,
+        offsets: Option<&[f64]>,
+        max_iter: usize,
+    ) -> Result<super::regularized_glm::RandomInterceptGlmmResult, PricingError> {
+        super::regularized_glm::fit_random_intercept_glmm(
+            &self.data,
+            self.n_samples,
+            self.n_features,
+            y,
+            group_ids,
+            n_groups,
+            weights,
+            offsets,
+            max_iter,
+        )
+    }
 }
 
 /// Fluent builder for fitting an unpenalized or L2-penalized GLM via Householder QR IRLS.
@@ -633,7 +676,7 @@ pub fn fit_glm_irls_with_options(
             "number of samples must be >= features for unpenalized GLM",
         ));
     }
-    if design_matrix.len() != n_samples * n_features {
+    if n_samples.checked_mul(n_features) != Some(design_matrix.len()) {
         return Err(PricingError::DimensionMismatch(
             "design matrix length != n_samples * n_features",
         ));
@@ -879,7 +922,7 @@ pub fn predict_glm(
             "samples and features must be non-zero",
         ));
     }
-    if design_matrix.len() != n_samples * n_features
+    if n_samples.checked_mul(n_features) != Some(design_matrix.len())
         || coefficients.len() != n_features
         || offsets.len() != n_samples
     {

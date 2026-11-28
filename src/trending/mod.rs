@@ -1,4 +1,13 @@
 //! Historical rate-level on-leveling and loss trending kernels.
+//!
+//! # Example
+//! ```rust
+//! use pricing_kernels::trending::pure_premium_indication;
+//!
+//! let ind = pure_premium_indication(450.0, 45.0, 0.15, 0.05, 580.0)?;
+//! assert!((ind.indicated_rate - 618.75).abs() < 1e-12);
+//! # Ok::<(), pricing_kernels::error::PricingError>(())
+//! ```
 
 /// Overall rate level indication (Loss Ratio and Pure Premium methods, Werner & Modlin Ch. 8).
 pub mod indication;

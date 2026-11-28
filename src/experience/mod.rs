@@ -1,5 +1,15 @@
 //! Commercial experience rating plans, Table M / Table L aggregate loss charges,
 //! retrospective rating plans, large deductibles, and ISO commercial ERP/IRPM.
+//!
+//! # Example
+//! ```rust
+//! use pricing_kernels::datasets::ncci_erp_worksheet;
+//!
+//! let data = ncci_erp_worksheet();
+//! let res = data.spec.calculate(&data.claims)?;
+//! assert!((res.mod_factor - data.expected_mod_rounded).abs() < 1e-12);
+//! # Ok::<(), pricing_kernels::error::PricingError>(())
+//! ```
 
 /// Commercial large deductible pricing with ALAE treatment and aggregate caps.
 pub mod deductible;

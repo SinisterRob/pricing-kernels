@@ -86,6 +86,84 @@ pub struct RegularizedGlmResult {
     pub converged: bool,
 }
 
+impl RegularizedGlmResult {
+    /// Predict expected responses `μ_i = g⁻¹(β_0 + x_i^T β + offset_i)` on new data.
+    pub fn predict(
+        &self,
+        family: RegularizedGlmFamily,
+        x: &[f64],
+        n: usize,
+        p: usize,
+        offsets: Option<&[f64]>,
+    ) -> Result<Vec<f64>, PricingError> {
+        if n == 0 || p == 0 {
+            return Err(PricingError::EmptyInput("n and p must be >= 1"));
+        }
+        if p != self.coefficients.len() || n.checked_mul(p) != Some(x.len()) {
+            return Err(PricingError::DimensionMismatch(
+                "x dimensions must match n * coefficients.len()",
+            ));
+        }
+        if let Some(os) = offsets
+            && os.len() != n
+        {
+            return Err(PricingError::DimensionMismatch(
+                "offsets length must match n",
+            ));
+        }
+        if x.iter().any(|v| !v.is_finite()) {
+            return Err(PricingError::InvalidParameter(
+                "design matrix entries must be finite",
+            ));
+        }
+        if let Some(os) = offsets
+            && os.iter().any(|v| !v.is_finite())
+        {
+            return Err(PricingError::InvalidParameter("offsets must be finite"));
+        }
+
+        let mut preds = Vec::with_capacity(n);
+        for i in 0..n {
+            let mut eta = self.intercept + offsets.map_or(0.0, |os| os[i]);
+            let row = &x[i * p..(i + 1) * p];
+            for j in 0..p {
+                eta += row[j] * self.coefficients[j];
+            }
+            let e = eta.clamp(-20.0, 20.0);
+            let mu = match family {
+                RegularizedGlmFamily::BinomialLogit => 1.0 / (1.0 + (-e).exp()),
+                _ => e.exp(),
+            };
+            preds.push(mu);
+        }
+        Ok(preds)
+    }
+
+    /// Return `(name, exp(beta_j))` multiplicative relativities (intercept first, then slopes).
+    pub fn relativities(
+        &self,
+        feature_names: Option<&[&str]>,
+    ) -> Result<Vec<(String, f64)>, PricingError> {
+        if let Some(names) = feature_names
+            && names.len() != self.coefficients.len()
+        {
+            return Err(PricingError::DimensionMismatch(
+                "feature_names length must match number of slope coefficients",
+            ));
+        }
+        let mut out = Vec::with_capacity(self.coefficients.len() + 1);
+        out.push(("intercept".to_owned(), self.intercept.exp()));
+        for (j, &b) in self.coefficients.iter().enumerate() {
+            let name = match feature_names {
+                Some(names) => names[j].to_owned(),
+                None => format!("x{}", j + 1),
+            };
+            out.push((name, b.exp()));
+        }
+        Ok(out)
+    }
+}
+
 #[inline]
 fn soft_threshold(u: f64, tau: f64) -> f64 {
     if u > tau {
@@ -195,7 +273,7 @@ pub fn fit_regularized_glm(
             "design matrix must have n > 0 and p > 0",
         ));
     }
-    if x.len() != n * p || y.len() != n {
+    if n.checked_mul(p) != Some(x.len()) || y.len() != n {
         return Err(PricingError::DimensionMismatch(
             "x must have length n * p and y must have length n",
         ));
@@ -914,7 +992,10 @@ pub fn fit_random_intercept_glmm(
             "n, p, and n_groups must all be >= 1",
         ));
     }
-    if x.len() != n * p || y.len() != n || group_ids.len() != n {
+    if max_iter == 0 {
+        return Err(PricingError::InvalidParameter("max_iter must be >= 1"));
+    }
+    if n.checked_mul(p) != Some(x.len()) || y.len() != n || group_ids.len() != n {
         return Err(PricingError::DimensionMismatch(
             "x, y, and group_ids dimensions must match",
         ));

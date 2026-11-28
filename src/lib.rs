@@ -105,7 +105,9 @@ pub mod prelude {
     };
     pub use crate::credibility::{
         BuhlmannStraubResult, ClassicalCredibility, CredibilityGroup, CredibilityPanel,
-        HachemeisterGroupResult, HachemeisterResult, buhlmann_straub, hachemeister_credibility,
+        HachemeisterGroupResult, HachemeisterResult, HierarchicalCredibilityResult,
+        HierarchicalRisk, HierarchicalRiskResult, HierarchicalSector, HierarchicalSectorResult,
+        buhlmann_straub, hachemeister_credibility, jewell_hierarchical_credibility,
     };
     pub use crate::error::{PricingError, SolverOptions};
     pub use crate::experience::{
@@ -120,13 +122,14 @@ pub mod prelude {
         AlaeDependenceModel, AlaeIlfResult, AlaePolicyTreatment, BlendCredibilityRule,
         BurningCostResult, BurningCostYearResult, CommercialLayer, EvtFamily, EvtFitResult,
         ExposureExperienceBlendResult, FittedEvtDistribution, GoodnessOfFitDiagnostics,
-        HistoricalTreatyClaim, HistoricalTreatyYear, LayerTower, MbbefdCurve, ReinstatementBasis,
-        ReinstatementPricingResult, SeverityDistribution, SeverityFamily, SeverityFitResult,
-        SeverityObservation, SlidingScaleSpec, SpliceBodyFamily, SpliceContinuity, SwissReCurve,
+        HistoricalTreatyClaim, HistoricalTreatyYear, LayerTower, MbbefdCurve,
+        ProportionalTreatyResult, QuotaShareSpec, ReinstatementBasis, ReinstatementPricingResult,
+        SeverityDistribution, SeverityFamily, SeverityFitResult, SeverityObservation,
+        SlidingScaleSpec, SpliceBodyFamily, SpliceContinuity, SurplusShareSpec, SwissReCurve,
         TreatyExperience, alae_aware_ilf, alae_excess_layer_expected_loss, alae_loss_severity,
         blend_exposure_and_experience, burning_cost_xl, empirical_mean_excess,
         expected_loss_corridor_retention, expected_profit_commission, fit_best_severity,
-        fit_evt_mle, fit_severity_mle, gauss_kronrod_integrate,
+        fit_evt_mle, fit_evt_mle_with_options, fit_severity_mle, gauss_kronrod_integrate,
         gauss_kronrod_integrate_semi_infinite, goodness_of_fit, price_reinstatements,
     };
     pub use crate::trending::{
@@ -143,11 +146,11 @@ pub mod prelude {
         AggregateLossDistribution, DistortionOperator, DistortionPricingResult, EltSummary,
         EulerAllocationResult, EventLossEntry, EventLossTable, FrequencyDistribution,
         KrepsRiskLoadResult, MyersReadAllocationResult, RmkPricingResult, ScenarioMatrix,
-        convolve_independent_aggregates, discretize_severity_mean_preserving,
-        distortion_price_aggregate, distortion_price_discrete, elt_aggregate_distribution,
-        elt_occurrence_layer_expected_loss, elt_oep, elt_oep_pml, elt_summary,
-        euler_rvar_allocation, euler_sd_allocation, euler_tvar_allocation, fft_aggregate_loss,
-        kreps_marginal_risk_load, myers_read_allocation, panjer_recursion,
-        rmk_risk_adjusted_pricing, sample_rvar, sample_tvar, sample_var,
+        YearLossTable, YltEvent, convolve_independent_aggregates,
+        discretize_severity_mean_preserving, distortion_price_aggregate, distortion_price_discrete,
+        elt_aggregate_distribution, elt_occurrence_layer_expected_loss, elt_oep, elt_oep_pml,
+        elt_summary, euler_rvar_allocation, euler_sd_allocation, euler_tvar_allocation,
+        fft_aggregate_loss, kreps_marginal_risk_load, myers_read_allocation, panjer_recursion,
+        rmk_risk_adjusted_pricing, sample_rvar, sample_tvar, sample_var, simulate_ylt_from_elt,
     };
 }

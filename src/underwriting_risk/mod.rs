@@ -1,5 +1,19 @@
-//! Prospective underwriting-risk capital modeling, catastrophe exceedance probability (ELT),
+//! Prospective underwriting-risk capital modeling, catastrophe exceedance probability (ELT/YLT),
 //! pricing risk loads (Wang, PH, Kreps, RMK), and coherent capital allocation (Euler, Myers–Read).
+//!
+//! # Example
+//! ```rust
+//! use pricing_kernels::underwriting_risk::{FrequencyDistribution, panjer_recursion};
+//!
+//! let agg = panjer_recursion(
+//!     FrequencyDistribution::Poisson { lambda: 2.0 },
+//!     &[0.0, 0.5, 0.5],
+//!     100.0,
+//!     64,
+//! )?;
+//! assert!((agg.mean - 300.0).abs() < 1e-6);
+//! # Ok::<(), pricing_kernels::error::PricingError>(())
+//! ```
 
 /// Compound aggregate underwriting loss distributions (Panjer recursion & tilted radix-2 FFT).
 pub mod aggregate;
@@ -20,8 +34,9 @@ pub use capital::{
     sample_var,
 };
 pub use catastrophe::{
-    EltSummary, EventLossEntry, EventLossTable, elt_aggregate_distribution,
-    elt_occurrence_layer_expected_loss, elt_oep, elt_oep_pml, elt_summary,
+    EltSummary, EventLossEntry, EventLossTable, YearLossTable, YltEvent,
+    elt_aggregate_distribution, elt_occurrence_layer_expected_loss, elt_oep, elt_oep_pml,
+    elt_summary, simulate_ylt_from_elt,
 };
 pub use risk_load::{
     DistortionOperator, DistortionPricingResult, KrepsRiskLoadResult, RmkPricingResult,

@@ -655,3 +655,206 @@ pub fn expected_profit_commission(
     let psi = table_m.savings_at(r_be);
     Ok(profit_commission_rate * expected_lr * psi)
 }
+
+// ===========================================================================
+// Proportional Treaty Economics: Quota Share & Surplus Share (Clark 2014)
+// ===========================================================================
+
+/// Financial summary of a proportional reinsurance treaty (Quota Share or Surplus Share).
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct ProportionalTreatyResult {
+    /// Total gross subject premium.
+    pub gross_premium: f64,
+    /// Total gross subject loss.
+    pub gross_loss: f64,
+    /// Total ceded premium to the reinsurer.
+    pub ceded_premium: f64,
+    /// Total ceded loss to the reinsurer (after any event limit).
+    pub ceded_loss: f64,
+    /// Ceding commission paid by reinsurer back to cedent.
+    pub ceding_commission_dollars: f64,
+    /// Net premium retained by cedent (`gross_premium - ceded_premium`).
+    pub retained_premium: f64,
+    /// Net loss retained by cedent (`gross_loss - ceded_loss`).
+    pub retained_loss: f64,
+    /// Reinsurer net underwriting margin (`ceded_premium - ceded_loss - ceding_commission_dollars`).
+    pub reinsurer_margin: f64,
+    /// Average cession share across the portfolio (`ceded_premium / gross_premium`).
+    pub effective_cession_share: f64,
+}
+
+/// Quota Share proportional treaty specification (Clark 2014).
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct QuotaShareSpec {
+    /// Fixed cession share `c in (0, 1]` ceded to the reinsurer.
+    pub cession_share: f64,
+    /// Flat ceding commission ratio `comm in [0, 1)` paid on ceded premium.
+    pub ceding_commission: f64,
+    /// Optional per-event or aggregate ceded loss cap (`None` = uncapped).
+    pub ceded_loss_cap: Option<f64>,
+}
+
+impl QuotaShareSpec {
+    /// Validate Quota Share treaty parameters.
+    pub fn validate(&self) -> Result<(), PricingError> {
+        if !self.cession_share.is_finite()
+            || !self.ceding_commission.is_finite()
+            || !(self.cession_share > 0.0)
+            || !(self.cession_share <= 1.0)
+            || !(self.ceding_commission >= 0.0)
+            || !(self.ceding_commission < 1.0)
+        {
+            return Err(PricingError::InvalidParameter(
+                "QuotaShare requires cession_share in (0, 1] and ceding_commission in [0, 1)",
+            ));
+        }
+        if let Some(cap) = self.ceded_loss_cap
+            && (!cap.is_finite() || !(cap > 0.0))
+        {
+            return Err(PricingError::NonPositiveValue(
+                "ceded_loss_cap must be finite and positive",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Apply this Quota Share treaty to a portfolio `(gross_premium, gross_loss)`.
+    pub fn apply(
+        &self,
+        gross_premium: f64,
+        gross_loss: f64,
+    ) -> Result<ProportionalTreatyResult, PricingError> {
+        self.validate()?;
+        if !gross_premium.is_finite()
+            || !gross_loss.is_finite()
+            || !(gross_premium > 0.0)
+            || !(gross_loss >= 0.0)
+        {
+            return Err(PricingError::InvalidParameter(
+                "gross_premium must be finite > 0 and gross_loss finite >= 0",
+            ));
+        }
+        let ceded_premium = gross_premium * self.cession_share;
+        let raw_ceded_loss = gross_loss * self.cession_share;
+        let ceded_loss = match self.ceded_loss_cap {
+            Some(cap) => raw_ceded_loss.min(cap),
+            None => raw_ceded_loss,
+        };
+        let ceding_commission_dollars = ceded_premium * self.ceding_commission;
+        Ok(ProportionalTreatyResult {
+            gross_premium,
+            gross_loss,
+            ceded_premium,
+            ceded_loss,
+            ceding_commission_dollars,
+            retained_premium: gross_premium - ceded_premium,
+            retained_loss: gross_loss - ceded_loss,
+            reinsurer_margin: ceded_premium - ceded_loss - ceding_commission_dollars,
+            effective_cession_share: ceded_premium / gross_premium,
+        })
+    }
+}
+
+/// Surplus Share proportional treaty specification (Clark 2014).
+///
+/// For each risk with Total Insured Value `tiv_i`, the cedent retains `retention_line`
+/// and cedes up to `number_of_lines * retention_line`:
+/// `cession_share_i = clamp((tiv_i - retention_line) / tiv_i, 0, max_treaty_limit / tiv_i)`.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct SurplusShareSpec {
+    /// Cedent's maximum per-risk retention ("one line") `R > 0`.
+    pub retention_line: f64,
+    /// Treaty capacity expressed as a multiple of `retention_line` (`> 0`, e.g., `9.0` for a 9-line surplus).
+    pub number_of_lines: f64,
+    /// Flat ceding commission ratio `comm in [0, 1)` paid on ceded premium.
+    pub ceding_commission: f64,
+}
+
+impl SurplusShareSpec {
+    /// Validate Surplus Share treaty parameters.
+    pub fn validate(&self) -> Result<(), PricingError> {
+        if !self.retention_line.is_finite()
+            || !self.number_of_lines.is_finite()
+            || !self.ceding_commission.is_finite()
+            || !(self.retention_line > 0.0)
+            || !(self.number_of_lines > 0.0)
+            || !(self.ceding_commission >= 0.0)
+            || !(self.ceding_commission < 1.0)
+        {
+            return Err(PricingError::InvalidParameter(
+                "SurplusShare requires retention_line > 0, number_of_lines > 0, and ceding_commission in [0, 1)",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Cession share for a single risk with insured value `tiv > 0`.
+    pub fn risk_cession_share(&self, tiv: f64) -> Result<f64, PricingError> {
+        self.validate()?;
+        if !tiv.is_finite() || !(tiv > 0.0) {
+            return Err(PricingError::NonPositiveValue(
+                "risk TIV must be finite and positive",
+            ));
+        }
+        if tiv <= self.retention_line {
+            return Ok(0.0);
+        }
+        let ceded_amount =
+            (tiv - self.retention_line).min(self.number_of_lines * self.retention_line);
+        Ok((ceded_amount / tiv).clamp(0.0, 1.0))
+    }
+
+    /// Apply this Surplus Share treaty across a portfolio of risks `(tivs, premiums, losses)`.
+    pub fn apply_to_risks(
+        &self,
+        tivs: &[f64],
+        premiums: &[f64],
+        losses: &[f64],
+    ) -> Result<ProportionalTreatyResult, PricingError> {
+        self.validate()?;
+        let n = tivs.len();
+        if n == 0 {
+            return Err(PricingError::EmptyInput(
+                "at least one risk is required for SurplusShare evaluation",
+            ));
+        }
+        if premiums.len() != n || losses.len() != n {
+            return Err(PricingError::DimensionMismatch(
+                "tivs, premiums, and losses must have equal length",
+            ));
+        }
+
+        let mut gross_premium = 0.0;
+        let mut gross_loss = 0.0;
+        let mut ceded_premium = 0.0;
+        let mut ceded_loss = 0.0;
+
+        for i in 0..n {
+            let p = premiums[i];
+            let l = losses[i];
+            if !p.is_finite() || !l.is_finite() || !(p > 0.0) || !(l >= 0.0) {
+                return Err(PricingError::InvalidParameter(
+                    "risk premiums must be finite > 0 and losses finite >= 0",
+                ));
+            }
+            let c = self.risk_cession_share(tivs[i])?;
+            gross_premium += p;
+            gross_loss += l;
+            ceded_premium += c * p;
+            ceded_loss += c * l;
+        }
+
+        let ceding_commission_dollars = ceded_premium * self.ceding_commission;
+        Ok(ProportionalTreatyResult {
+            gross_premium,
+            gross_loss,
+            ceded_premium,
+            ceded_loss,
+            ceding_commission_dollars,
+            retained_premium: gross_premium - ceded_premium,
+            retained_loss: gross_loss - ceded_loss,
+            reinsurer_margin: ceded_premium - ceded_loss - ceding_commission_dollars,
+            effective_cession_share: ceded_premium / gross_premium,
+        })
+    }
+}

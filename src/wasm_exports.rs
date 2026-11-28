@@ -40,49 +40,35 @@ pub extern "C" fn pk_claim_med_only_ptr() -> *mut u8 {
     core::ptr::addr_of_mut!(CLAIM_MED_ONLY).cast()
 }
 
-/// Compute Increased Limit Factor for a Lomax (Pareto Type II) severity distribution.
-#[unsafe(no_mangle)]
-pub extern "C" fn pk_ilf_lomax(alpha: f64, theta: f64, limit: f64, basic_limit: f64) -> f64 {
-    let dist = SeverityDistribution::Lomax { alpha, theta };
-    dist.increased_limits_factor(limit, basic_limit)
-        .unwrap_or(f64::NAN)
-}
-
-/// Compute Increased Limit Factor for a Lognormal severity distribution.
-#[unsafe(no_mangle)]
-pub extern "C" fn pk_ilf_lognormal(mu: f64, sigma: f64, limit: f64, basic_limit: f64) -> f64 {
-    let dist = SeverityDistribution::Lognormal { mu, sigma };
-    dist.increased_limits_factor(limit, basic_limit)
-        .unwrap_or(f64::NAN)
-}
-
-/// Compute Increased Limit Factor for a Gamma severity distribution.
-#[unsafe(no_mangle)]
-pub extern "C" fn pk_ilf_gamma(shape: f64, scale: f64, limit: f64, basic_limit: f64) -> f64 {
-    let dist = SeverityDistribution::Gamma { shape, scale };
-    dist.increased_limits_factor(limit, basic_limit)
-        .unwrap_or(f64::NAN)
-}
-
-/// Compute Increased Limit Factor for a composite Spliced Gamma–Pareto severity distribution.
-#[unsafe(no_mangle)]
-pub extern "C" fn pk_ilf_spliced_gamma_pareto(
-    shape: f64,
-    scale: f64,
-    splice: f64,
-    tail_alpha: f64,
-    limit: f64,
-    basic_limit: f64,
-) -> f64 {
-    let dist = SeverityDistribution::SplicedGammaPareto {
-        shape,
-        scale,
-        splice,
-        tail_alpha,
+macro_rules! pk_ilf_export {
+    ($(#[$meta:meta])* $fn_name:ident ( $($arg:ident : f64),+ ) => $variant:ident { $($field:ident),+ }) => {
+        $(#[$meta])*
+        #[unsafe(no_mangle)]
+        pub extern "C" fn $fn_name($($arg: f64),+, limit: f64, basic_limit: f64) -> f64 {
+            SeverityDistribution::$variant { $($field),+ }
+                .increased_limits_factor(limit, basic_limit)
+                .unwrap_or(f64::NAN)
+        }
     };
-    dist.increased_limits_factor(limit, basic_limit)
-        .unwrap_or(f64::NAN)
 }
+
+pk_ilf_export!(
+    /// Compute Increased Limit Factor for a Lomax (Pareto Type II) severity distribution.
+    pk_ilf_lomax(alpha: f64, theta: f64) => Lomax { alpha, theta }
+);
+pk_ilf_export!(
+    /// Compute Increased Limit Factor for a Lognormal severity distribution.
+    pk_ilf_lognormal(mu: f64, sigma: f64) => Lognormal { mu, sigma }
+);
+pk_ilf_export!(
+    /// Compute Increased Limit Factor for a Gamma severity distribution.
+    pk_ilf_gamma(shape: f64, scale: f64) => Gamma { shape, scale }
+);
+pk_ilf_export!(
+    /// Compute Increased Limit Factor for a composite Spliced Gamma–Pareto severity distribution.
+    pk_ilf_spliced_gamma_pareto(shape: f64, scale: f64, splice: f64, tail_alpha: f64)
+        => SplicedGammaPareto { shape, scale, splice, tail_alpha }
+);
 
 /// Evaluate Swiss Re / Bernegger (1997) MBBEFD exposure curve `G(d)` for continuous `c >= 0`.
 #[unsafe(no_mangle)]

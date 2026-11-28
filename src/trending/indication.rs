@@ -216,6 +216,12 @@ pub fn calculate_rate_indication(
         ));
     }
 
+    let has_custom_weights = spec.periods.iter().any(|p| p.weight.is_some());
+    if has_custom_weights && spec.periods.iter().any(|p| p.weight.is_none()) {
+        return Err(PricingError::InvalidParameter(
+            "period weights must be either all Some or all None",
+        ));
+    }
     let mut raw_weights = Vec::with_capacity(spec.periods.len());
     let mut proj_prems = Vec::with_capacity(spec.periods.len());
     let mut proj_losses = Vec::with_capacity(spec.periods.len());
@@ -290,7 +296,6 @@ pub fn calculate_rate_indication(
     let mut weighted_lr = 0.0;
     let mut weighted_pp = 0.0;
     let mut weighted_rate = 0.0;
-    let has_custom_weights = spec.periods.iter().any(|p| p.weight.is_some());
     for (i, p) in spec.periods.iter().enumerate() {
         let proj_prem = proj_prems[i];
         let proj_loss = proj_losses[i];

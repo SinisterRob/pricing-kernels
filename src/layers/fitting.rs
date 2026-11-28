@@ -6,7 +6,7 @@
 
 use crate::error::{PricingError, SolverOptions};
 use crate::layers::SeverityDistribution;
-use crate::special::{gamma_p, ln_gamma, normal_cdf_exact};
+use crate::special::{ln_gamma, log_gamma_q, log_normal_survival};
 use serde::{Deserialize, Serialize};
 use std::f64::consts::TAU;
 
@@ -179,8 +179,7 @@ fn log_survival(dist: &SeverityDistribution, x: f64) -> f64 {
         SeverityDistribution::Exponential { lambda } => -lambda * x,
         SeverityDistribution::Lognormal { mu, sigma } => {
             let z = (x.ln() - mu) / sigma;
-            let s = normal_cdf_exact(-z);
-            if s > 0.0 { s.ln() } else { -1e30 }
+            log_normal_survival(z)
         }
         SeverityDistribution::Lomax { alpha, theta } => -alpha * (x / theta).ln_1p(),
         SeverityDistribution::SingleParameterPareto { alpha, x_m } => {
@@ -190,10 +189,7 @@ fn log_survival(dist: &SeverityDistribution, x: f64) -> f64 {
                 -alpha * (x / x_m).ln()
             }
         }
-        SeverityDistribution::Gamma { shape, scale } => {
-            let s = (1.0 - gamma_p(*shape, x / *scale)).clamp(0.0, 1.0);
-            if s > 0.0 { s.ln() } else { -1e30 }
-        }
+        SeverityDistribution::Gamma { shape, scale } => log_gamma_q(*shape, x / *scale),
         _ => f64::NEG_INFINITY,
     }
 }

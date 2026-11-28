@@ -3,7 +3,7 @@
 //! and commercial excess layer towers.
 
 use crate::error::PricingError;
-use crate::special::{gamma_p, ln_gamma, normal_cdf_exact};
+use crate::special::{gamma_p, gamma_q, ln_gamma, log_normal_survival, normal_cdf_exact};
 use serde::{Deserialize, Serialize};
 
 /// Continuous density `f_G(x)` for `Gamma(shape, scale)` at `x > 0`.
@@ -98,6 +98,24 @@ pub enum SeverityDistribution {
         /// Pareto tail index `tail_alpha > 0` (`> 1` for finite mean).
         tail_alpha: f64,
     },
+}
+
+/// Shared ILF ratio helper `E[X ∧ limit] / E[X ∧ basic_limit]`.
+pub(crate) fn ilf_from_lev<F>(limit: f64, basic_limit: f64, lev: F) -> Result<f64, PricingError>
+where
+    F: Fn(f64) -> Result<f64, PricingError>,
+{
+    if !basic_limit.is_finite() || !(basic_limit > 0.0) {
+        return Err(PricingError::NonPositiveValue(
+            "base limit must be finite and positive",
+        ));
+    }
+    let lev_limit = lev(limit)?;
+    let lev_base = lev(basic_limit)?;
+    if !(lev_base > 0.0) {
+        return Err(PricingError::SingularMatrix("base limit LEV is zero"));
+    }
+    Ok(lev_limit / lev_base)
 }
 
 impl SeverityDistribution {
@@ -296,7 +314,7 @@ impl SeverityDistribution {
                     (-(1.0 / xi) * (xi * x / beta).ln_1p()).exp()
                 }
             }
-            Self::Gamma { shape, scale } => 1.0 - gamma_p(*shape, x / scale),
+            Self::Gamma { shape, scale } => gamma_q(*shape, x / scale),
             Self::SplicedGammaPareto {
                 shape,
                 scale,
@@ -388,16 +406,25 @@ impl SeverityDistribution {
         let lev = match self {
             Self::Lognormal { mu, sigma } => {
                 let z = (limit.ln() - mu) / sigma;
-                let mean = (mu + 0.5 * sigma * sigma).exp();
-                let cdf_shifted = normal_cdf_exact(z - sigma);
-                let body = if cdf_shifted == 0.0 {
-                    0.0
-                } else if !mean.is_finite() {
-                    return Err(PricingError::OutOfBounds(
-                        "lognormal mean overflowed floating-point range",
-                    ));
+                let log_mean = mu + 0.5 * sigma * sigma;
+                let body = if log_mean > 700.0 || (sigma - z) > 25.0 {
+                    // Evaluate exp(mu + 0.5*sigma^2) * Phi(z - sigma) in log-domain so
+                    // large sigma never overflows when the product is finite.
+                    let log_body = log_mean + log_normal_survival(sigma - z);
+                    if !log_body.is_finite() {
+                        return Err(PricingError::OutOfBounds(
+                            "lognormal LEV overflowed floating-point range",
+                        ));
+                    }
+                    let b = log_body.exp();
+                    if !b.is_finite() {
+                        return Err(PricingError::OutOfBounds(
+                            "lognormal LEV overflowed floating-point range",
+                        ));
+                    }
+                    b
                 } else {
-                    mean * cdf_shifted
+                    log_mean.exp() * normal_cdf_exact(z - sigma)
                 };
                 body + limit * normal_cdf_exact(-z)
             }
@@ -441,7 +468,7 @@ impl SeverityDistribution {
             }
             Self::Gamma { shape, scale } => {
                 let z = limit / scale;
-                shape * scale * gamma_p(shape + 1.0, z) + limit * (1.0 - gamma_p(*shape, z))
+                shape * scale * gamma_p(shape + 1.0, z) + limit * gamma_q(*shape, z)
             }
             Self::SplicedGammaPareto {
                 shape,
@@ -490,17 +517,7 @@ impl SeverityDistribution {
         limit: f64,
         base_limit: f64,
     ) -> Result<f64, PricingError> {
-        if !base_limit.is_finite() || !(base_limit > 0.0) {
-            return Err(PricingError::NonPositiveValue(
-                "base limit must be finite and positive",
-            ));
-        }
-        let lev_limit = self.limited_expected_value(limit)?;
-        let lev_base = self.limited_expected_value(base_limit)?;
-        if !(lev_base > 0.0) {
-            return Err(PricingError::SingularMatrix("base limit LEV is zero"));
-        }
-        Ok(lev_limit / lev_base)
+        ilf_from_lev(limit, base_limit, |x| self.limited_expected_value(x))
     }
 
     /// Calculate Loss Elimination Ratio (LER) for a deductible `d` relative to policy limit `L`:

@@ -5,7 +5,7 @@ use crate::error::PricingError;
 /// Compute the lower-triangular Cholesky factor `L` of symmetric positive-definite
 /// `dim × dim` matrix `a` in row-major layout (`A = L L^T`).
 pub fn cholesky_lower(a: &[f64], dim: usize) -> Result<Vec<f64>, PricingError> {
-    if dim == 0 || a.len() != dim * dim {
+    if dim == 0 || dim.checked_mul(dim) != Some(a.len()) {
         return Err(PricingError::DimensionMismatch(
             "matrix slice size does not match dim * dim",
         ));
@@ -53,7 +53,7 @@ pub fn solve_lower_into(
     b: &[f64],
     y: &mut [f64],
 ) -> Result<(), PricingError> {
-    if dim == 0 || l.len() != dim * dim || b.len() != dim || y.len() != dim {
+    if dim == 0 || dim.checked_mul(dim) != Some(l.len()) || b.len() != dim || y.len() != dim {
         return Err(PricingError::DimensionMismatch(
             "dimensions do not match dim for lower-triangular solve",
         ));
@@ -82,7 +82,7 @@ pub fn solve_upper_transpose_into(
     y: &[f64],
     x: &mut [f64],
 ) -> Result<(), PricingError> {
-    if dim == 0 || l.len() != dim * dim || y.len() != dim || x.len() != dim {
+    if dim == 0 || dim.checked_mul(dim) != Some(l.len()) || y.len() != dim || x.len() != dim {
         return Err(PricingError::DimensionMismatch(
             "dimensions do not match dim for upper-transpose solve",
         ));

@@ -414,3 +414,336 @@ pub fn elt_aggregate_distribution(
         tilt,
     )
 }
+
+// ===========================================================================
+// Catastrophe Year Loss Table (YLT) & Aggregate XL (AAD / AAL)
+// ===========================================================================
+
+/// Single simulated catastrophe event occurrence in a Year Loss Table (YLT).
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct YltEvent {
+    /// Zero-based simulation year index (`0..n_years`).
+    pub year: u32,
+    /// Catastrophe event identifier.
+    pub event_id: u64,
+    /// Simulated gross occurrence loss (`>= 0`).
+    pub loss: f64,
+}
+
+/// Validated Catastrophe Year Loss Table (YLT) supporting empirical OEP/AEP/PML,
+/// per-occurrence XL, and aggregate XL (Annual Aggregate Deductible / Annual
+/// Aggregate Limit) catastrophe treaty pricing.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct YearLossTable {
+    n_years: u32,
+    events: Vec<YltEvent>,
+}
+
+impl YearLossTable {
+    /// Construct and validate a [`YearLossTable`] spanning `n_years >= 1` simulation years.
+    pub fn try_new(n_years: u32, events: Vec<YltEvent>) -> Result<Self, PricingError> {
+        if n_years == 0 {
+            return Err(PricingError::InvalidParameter(
+                "YearLossTable requires n_years >= 1",
+            ));
+        }
+        for ev in &events {
+            if ev.year >= n_years {
+                return Err(PricingError::OutOfBounds(
+                    "YLT event year must be < n_years",
+                ));
+            }
+            if !ev.loss.is_finite() || !(ev.loss >= 0.0) {
+                return Err(PricingError::InvalidParameter(
+                    "YLT event loss must be finite and non-negative",
+                ));
+            }
+        }
+        Ok(Self { n_years, events })
+    }
+
+    /// Number of simulated years in the YLT.
+    #[inline]
+    pub const fn n_years(&self) -> u32 {
+        self.n_years
+    }
+
+    /// Underlying simulated event records.
+    #[inline]
+    pub fn events(&self) -> &[YltEvent] {
+        &self.events
+    }
+
+    /// Annual maximum (occurrence) loss vector of length `n_years` (`0.0` in event-free years).
+    pub fn annual_occurrence_losses(&self) -> Vec<f64> {
+        let mut maxes = vec![0.0_f64; self.n_years as usize];
+        for ev in &self.events {
+            let slot = &mut maxes[ev.year as usize];
+            if ev.loss > *slot {
+                *slot = ev.loss;
+            }
+        }
+        maxes
+    }
+
+    /// Annual aggregate (sum of events) loss vector of length `n_years` (`0.0` in event-free years).
+    pub fn annual_aggregate_losses(&self) -> Vec<f64> {
+        let mut sums = vec![0.0_f64; self.n_years as usize];
+        for ev in &self.events {
+            sums[ev.year as usize] += ev.loss;
+        }
+        sums
+    }
+
+    /// Empirical Average Annual Loss `AAL = (1 / n_years) * sum(loss)`.
+    pub fn aal(&self) -> f64 {
+        let total: f64 = self.events.iter().map(|e| e.loss).sum();
+        total / f64::from(self.n_years)
+    }
+
+    fn exceedance_prob(&self, annual_losses: &[f64], threshold: f64) -> Result<f64, PricingError> {
+        if !threshold.is_finite() || !(threshold >= 0.0) {
+            return Err(PricingError::InvalidParameter(
+                "threshold must be finite and non-negative",
+            ));
+        }
+        let exceed = annual_losses.iter().filter(|&&v| v > threshold).count();
+        Ok((exceed as f64) / f64::from(self.n_years))
+    }
+
+    /// Empirical Occurrence Exceedance Probability `OEP(x) = P(max_k X_k > x)`.
+    pub fn oep(&self, threshold: f64) -> Result<f64, PricingError> {
+        self.exceedance_prob(&self.annual_occurrence_losses(), threshold)
+    }
+
+    /// Empirical Aggregate Exceedance Probability `AEP(x) = P(sum_k X_k > x)`.
+    pub fn aep(&self, threshold: f64) -> Result<f64, PricingError> {
+        self.exceedance_prob(&self.annual_aggregate_losses(), threshold)
+    }
+
+    /// Empirical Occurrence PML at `return_period > 1.0` years (e.g., `100.0` for 1-in-100).
+    pub fn oep_pml(&self, return_period: f64) -> Result<f64, PricingError> {
+        empirical_pml(self.annual_occurrence_losses(), return_period)
+    }
+
+    /// Empirical Aggregate PML at `return_period > 1.0` years (e.g., `100.0` for 1-in-100).
+    pub fn aep_pml(&self, return_period: f64) -> Result<f64, PricingError> {
+        empirical_pml(self.annual_aggregate_losses(), return_period)
+    }
+
+    /// Expected annual ceded loss for a combined per-occurrence + aggregate excess-of-loss
+    /// catastrophe treaty (`per_occ_limit xs per_occ_attachment`, subject to Annual Aggregate
+    /// Deductible `aggregate_deductible` and Annual Aggregate Limit `aggregate_limit`).
+    ///
+    /// Pass `per_occ_attachment = 0.0`, `per_occ_limit = f64::INFINITY` for a pure annual
+    /// aggregate stop-loss treaty; pass `aggregate_deductible = 0.0`, `aggregate_limit = f64::INFINITY`
+    /// for a pure per-occurrence XL treaty.
+    pub fn aggregate_xl_expected_loss(
+        &self,
+        per_occ_attachment: f64,
+        per_occ_limit: f64,
+        aggregate_deductible: f64,
+        aggregate_limit: f64,
+    ) -> Result<f64, PricingError> {
+        if !per_occ_attachment.is_finite()
+            || !(per_occ_attachment >= 0.0)
+            || per_occ_limit.is_nan()
+            || !(per_occ_limit > 0.0)
+            || !aggregate_deductible.is_finite()
+            || !(aggregate_deductible >= 0.0)
+            || aggregate_limit.is_nan()
+            || !(aggregate_limit > 0.0)
+        {
+            return Err(PricingError::InvalidParameter(
+                "attachments/deductibles must be finite >= 0 and limits must be > 0",
+            ));
+        }
+
+        let mut annual_subject = vec![0.0_f64; self.n_years as usize];
+        for ev in &self.events {
+            if ev.loss > per_occ_attachment {
+                let occ_ceded = (ev.loss - per_occ_attachment).min(per_occ_limit);
+                annual_subject[ev.year as usize] += occ_ceded;
+            }
+        }
+
+        let total_ceded: f64 = annual_subject
+            .iter()
+            .map(|&s| (s - aggregate_deductible).max(0.0).min(aggregate_limit))
+            .sum();
+        Ok(total_ceded / f64::from(self.n_years))
+    }
+}
+
+fn empirical_pml(mut annual_losses: Vec<f64>, return_period: f64) -> Result<f64, PricingError> {
+    if !return_period.is_finite() || !(return_period > 1.0) {
+        return Err(PricingError::InvalidParameter(
+            "return_period must be finite and > 1.0",
+        ));
+    }
+    let n = annual_losses.len();
+    annual_losses.sort_by(f64::total_cmp);
+    let alpha = 1.0 - 1.0 / return_period;
+    let idx = ((alpha * (n as f64) - 1e-15).ceil() as usize)
+        .saturating_sub(1)
+        .min(n - 1);
+    Ok(annual_losses[idx])
+}
+
+/// Deterministic SplitMix64-seeded Xoshiro256** PRNG for reproducible YLT simulation.
+struct Xoshiro256StarStar {
+    s: [u64; 4],
+}
+
+impl Xoshiro256StarStar {
+    fn from_seed(mut seed: u64) -> Self {
+        let mut next_sm = || {
+            seed = seed.wrapping_add(0x9e37_79b9_7f4a_7c15);
+            let mut z = seed;
+            z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+            z ^ (z >> 31)
+        };
+        Self {
+            s: [next_sm(), next_sm(), next_sm(), next_sm()],
+        }
+    }
+
+    #[inline]
+    fn next_u64(&mut self) -> u64 {
+        let result = self.s[1].wrapping_mul(5).rotate_left(7).wrapping_mul(9);
+        let t = self.s[1] << 17;
+        self.s[2] ^= self.s[0];
+        self.s[3] ^= self.s[1];
+        self.s[1] ^= self.s[2];
+        self.s[0] ^= self.s[3];
+        self.s[2] ^= t;
+        self.s[3] = self.s[3].rotate_left(45);
+        result
+    }
+
+    #[inline]
+    fn next_f64(&mut self) -> f64 {
+        ((self.next_u64() >> 11) as f64) * (1.0 / ((1u64 << 53) as f64))
+    }
+
+    fn next_std_normal(&mut self) -> f64 {
+        let u1 = self.next_f64().max(1e-300);
+        let u2 = self.next_f64();
+        (-2.0 * u1.ln()).sqrt() * (std::f64::consts::TAU * u2).cos()
+    }
+
+    fn sample_gamma(&mut self, alpha: f64) -> f64 {
+        if alpha < 1.0 {
+            let u = self.next_f64().max(1e-300);
+            return self.sample_gamma(alpha + 1.0) * u.powf(1.0 / alpha);
+        }
+        let d = alpha - 1.0 / 3.0;
+        let c = 1.0 / (9.0 * d).sqrt();
+        loop {
+            let x = self.next_std_normal();
+            let v = 1.0 + c * x;
+            if v <= 0.0 {
+                continue;
+            }
+            let v3 = v * v * v;
+            let u = self.next_f64().max(1e-300);
+            if u < 1.0 - 0.0331 * x * x * x * x || u.ln() < 0.5 * x * x + d * (1.0 - v3 + v3.ln()) {
+                return d * v3;
+            }
+        }
+    }
+
+    fn sample_beta(&mut self, alpha: f64, beta: f64) -> f64 {
+        let x = self.sample_gamma(alpha);
+        let y = self.sample_gamma(beta);
+        if x + y > 0.0 { x / (x + y) } else { 0.5 }
+    }
+
+    fn sample_poisson(&mut self, lambda: f64) -> u32 {
+        if lambda <= 0.0 {
+            return 0;
+        }
+        if lambda < 30.0 {
+            let l = (-lambda).exp();
+            let mut k = 0u32;
+            let mut p = 1.0;
+            loop {
+                k += 1;
+                p *= self.next_f64().max(1e-300);
+                if p <= l {
+                    return k - 1;
+                }
+            }
+        }
+        // Normal approximation for high annual rate (> 30 events/yr).
+        let draw = (lambda + lambda.sqrt() * self.next_std_normal())
+            .round()
+            .max(0.0);
+        draw as u32
+    }
+}
+
+/// Deterministically simulate a [`YearLossTable`] of `n_years` simulation years from a
+/// catastrophe Event Loss Table using a seeded `Xoshiro256**` PRNG (recommended default
+/// seed: `42069`).
+///
+/// Each year draws a compound-Poisson event count (`Poisson(sum lambda_i)`), selects each
+/// event proportional to `lambda_i`, and draws its severity from `max_loss * Beta(alpha, beta)`
+/// (or point-mass `mean_loss` when `total_std_dev() == 0`).
+pub fn simulate_ylt_from_elt(
+    entries: &[EventLossEntry],
+    n_years: u32,
+    seed: u64,
+) -> Result<YearLossTable, PricingError> {
+    if n_years == 0 {
+        return Err(PricingError::InvalidParameter("n_years must be >= 1"));
+    }
+    let summary = elt_summary(entries)?;
+    if !(summary.total_annual_rate > 0.0) {
+        return Ok(YearLossTable {
+            n_years,
+            events: Vec::new(),
+        });
+    }
+
+    let mut prepared = Vec::with_capacity(entries.len());
+    let mut cum_rates = Vec::with_capacity(entries.len());
+    let mut running = 0.0;
+    for entry in entries {
+        if entry.annual_rate == 0.0 {
+            continue;
+        }
+        let params = entry.beta_params()?;
+        running += entry.annual_rate;
+        prepared.push((entry, params));
+        cum_rates.push(running / summary.total_annual_rate);
+    }
+    if let Some(last) = cum_rates.last_mut() {
+        *last = 1.0;
+    }
+
+    let mut rng = Xoshiro256StarStar::from_seed(seed);
+    let mut events = Vec::new();
+    for year in 0..n_years {
+        let count = rng.sample_poisson(summary.total_annual_rate);
+        for _ in 0..count {
+            let u = rng.next_f64();
+            let idx = cum_rates
+                .partition_point(|&c| c < u)
+                .min(prepared.len() - 1);
+            let (entry, params) = prepared[idx];
+            let loss = match params {
+                None => entry.mean_loss,
+                Some((a, b)) => entry.max_loss * rng.sample_beta(a, b),
+            };
+            events.push(YltEvent {
+                year,
+                event_id: entry.event_id,
+                loss,
+            });
+        }
+    }
+
+    Ok(YearLossTable { n_years, events })
+}

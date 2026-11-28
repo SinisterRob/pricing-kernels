@@ -12,13 +12,14 @@ pub(crate) fn normal_cdf_exact(z: f64) -> f64 {
 
 /// Log standard normal survival `ln Φ(-z)` without underflow for large `z > 0`.
 ///
-/// For `z > 5.0`, evaluates the asymptotic Mills-ratio expansion directly in
-/// log-space: `-z^2/2 - 0.5*ln(2π) - ln(z) + ln(1 - 1/z^2 + 3/z^4 - 15/z^6 + 105/z^8)`.
+/// For `z <= 25.0`, evaluates `ln(Φ(-z))` directly via Cody's `erfc` (`< 1e-15` accuracy,
+/// well above `f64::MIN_POSITIVE`). For `z > 25.0`, evaluates the asymptotic Mills-ratio
+/// expansion directly in log-space (`< 2e-13` relative error, avoiding underflow to `0.0`).
 pub(crate) fn log_normal_survival(z: f64) -> f64 {
     if z.is_nan() {
         return f64::NAN;
     }
-    if z > 5.0 {
+    if z > 25.0 {
         let inv_z2 = 1.0 / (z * z);
         let series = 1.0
             - inv_z2 * (1.0 - inv_z2 * (3.0 - inv_z2 * (15.0 - inv_z2 * (105.0 - 945.0 * inv_z2))));
@@ -37,9 +38,25 @@ pub(crate) fn gamma_q(a: f64, x: f64) -> f64 {
         return 1.0;
     }
     if x >= a + 1.0 {
-        gamma_q_cf(a, x)
+        gamma_q_cf_log(a, x).exp().clamp(0.0, 1.0)
     } else {
         (1.0 - gamma_p(a, x)).clamp(0.0, 1.0)
+    }
+}
+
+/// Log regularized upper incomplete gamma `ln Q(a, x)` for `a > 0, x >= 0`
+/// without right-tail underflow for large `x`.
+pub(crate) fn log_gamma_q(a: f64, x: f64) -> f64 {
+    if a.is_nan() || x.is_nan() || a <= 0.0 || x < 0.0 {
+        return f64::NAN;
+    }
+    if x == 0.0 {
+        return 0.0;
+    }
+    if x >= a + 1.0 {
+        gamma_q_cf_log(a, x).min(0.0)
+    } else {
+        (1.0 - gamma_p(a, x)).clamp(1e-300, 1.0).ln()
     }
 }
 
@@ -268,9 +285,9 @@ pub(crate) fn gamma_p(a: f64, x: f64) -> f64 {
     }
 }
 
-/// Regularized upper incomplete gamma `Q(a, x) = 1 - P(a, x)` via modified Lentz
-/// continued fraction for `x >= a + 1`.
-fn gamma_q_cf(a: f64, x: f64) -> f64 {
+/// Log of regularized upper incomplete gamma `ln Q(a, x)` via modified Lentz
+/// continued fraction for `x >= a + 1` (avoids underflow for large `x`).
+fn gamma_q_cf_log(a: f64, x: f64) -> f64 {
     const TINY: f64 = 1e-300;
     let max_iter = 2_000_usize
         .max((12.0 * a.sqrt()).ceil() as usize)
@@ -298,7 +315,13 @@ fn gamma_q_cf(a: f64, x: f64) -> f64 {
             break;
         }
     }
-    ((-x + a * x.ln() - ln_gamma(a)).exp() * h).clamp(0.0, 1.0)
+    (-x + a * x.ln() - ln_gamma(a)) + h.max(TINY).ln()
+}
+
+/// Regularized upper incomplete gamma `Q(a, x) = 1 - P(a, x)` via modified Lentz
+/// continued fraction for `x >= a + 1`.
+fn gamma_q_cf(a: f64, x: f64) -> f64 {
+    gamma_q_cf_log(a, x).exp().clamp(0.0, 1.0)
 }
 
 /// Regularized incomplete beta function `I_x(a, b)` via modified Lentz continued fraction.
@@ -386,6 +409,21 @@ mod tests {
         }
         assert!(normal_cdf_exact(f64::NAN).is_nan());
         assert!(normal_inv_cdf(f64::NAN).is_nan());
+    }
+
+    #[test]
+    fn log_normal_survival_continuous_and_accurate_across_crossover() {
+        // Verify continuity across the z = 25.0 Cody-erfc -> Mills-ratio crossover.
+        let left = log_normal_survival(25.0);
+        let right = log_normal_survival(25.000_001);
+        assert!((left - right).abs() < 1e-4, "left={left}, right={right}");
+        // At z = 10.0, Cody erfc gives exact ln Phi(-10) ≈ -53.222536619...
+        let z10 = log_normal_survival(10.0);
+        let exact_10 = normal_cdf_exact(-10.0).ln();
+        assert!((z10 - exact_10).abs() < 1e-14);
+        // Far tail z = 40.0 must remain finite without underflow.
+        let z40 = log_normal_survival(40.0);
+        assert!(z40.is_finite() && z40 < -800.0, "z40={z40}");
     }
 
     #[test]

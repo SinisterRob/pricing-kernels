@@ -126,7 +126,11 @@ fn validate_grid(
             "tolerance must be finite and positive",
         ));
     }
-    let total_cells = n_rows * n_cols;
+    let Some(total_cells) = n_rows.checked_mul(n_cols) else {
+        return Err(PricingError::DimensionMismatch(
+            "n_rows * n_cols overflowed usize",
+        ));
+    };
     if exposures.len() != total_cells || losses.len() != total_cells {
         return Err(PricingError::DimensionMismatch(
             "slice length does not match n_rows * n_cols",
@@ -174,6 +178,55 @@ fn compute_chi_squared(
     chi_sq
 }
 
+/// Normalize `(r, c)` against the first positive row/column, write normalized row
+/// relativities into `norm_r`, and return `(base_rate, max_diff)` vs previous iterate.
+fn normalize_and_diff(
+    r: &mut [f64],
+    c: &mut [f64],
+    norm_r: &mut [f64],
+    prev_r: &mut [f64],
+    prev_c: &mut [f64],
+    prev_base: &mut f64,
+) -> Result<(f64, f64), PricingError> {
+    let ref_c = c
+        .iter()
+        .copied()
+        .find(|&v| v > 0.0)
+        .ok_or(PricingError::SingularMatrix(
+            "all column relativities collapsed to zero",
+        ))?;
+    for val in c.iter_mut() {
+        *val /= ref_c;
+    }
+    for val in r.iter_mut() {
+        *val *= ref_c;
+    }
+
+    let base_rate = r
+        .iter()
+        .copied()
+        .find(|&v| v > 0.0)
+        .ok_or(PricingError::SingularMatrix(
+            "all row relativities collapsed to zero",
+        ))?;
+    for (dst, &src) in norm_r.iter_mut().zip(r.iter()) {
+        *dst = src / base_rate;
+    }
+
+    let mut max_diff = (base_rate - *prev_base).abs() / base_rate.max(1.0);
+    for (&nr, &pr) in norm_r.iter().zip(prev_r.iter()) {
+        max_diff = max_diff.max((nr - pr).abs());
+    }
+    for (&cv, &pc) in c.iter().zip(prev_c.iter()) {
+        max_diff = max_diff.max((cv - pc).abs());
+    }
+
+    *prev_base = base_rate;
+    prev_r.copy_from_slice(norm_r);
+    prev_c.copy_from_slice(c);
+    Ok((base_rate, max_diff))
+}
+
 /// Fit a two-dimensional multiplicative rating model using the **Bailey (1963)**
 /// balance-principle minimum bias procedure (mathematically equivalent to a
 /// Poisson log-link GLM; Brown 1988):
@@ -197,15 +250,12 @@ pub fn bailey_simon_multiplicative(
 
     let mut r = vec![1.0; n_rows];
     let mut c = vec![1.0; n_cols];
+    let mut norm_r = vec![1.0; n_rows];
     let mut prev_r = vec![1.0; n_rows];
     let mut prev_c = vec![1.0; n_cols];
     let mut prev_base = 0.0;
 
-    let mut iter = 0;
-
-    while iter < max_iter {
-        iter += 1;
-
+    for iter in 1..=max_iter {
         // 1. Update row factors: r_i = (sum_j P_ij * A_ij) / (sum_j P_ij * c_j)
         for i in 0..n_rows {
             let mut num = 0.0;
@@ -232,50 +282,14 @@ pub fn bailey_simon_multiplicative(
             c[j] = if den > 0.0 { num / den } else { 0.0 };
         }
 
-        // Normalize against first positive row and column so convergence is scale-invariant.
-        let ref_c = c
-            .iter()
-            .copied()
-            .find(|&v| v > 0.0)
-            .ok_or(PricingError::SingularMatrix(
-                "all column relativities collapsed to zero",
-            ))?;
-        for val in &mut c {
-            *val /= ref_c;
-        }
-        for val in &mut r {
-            *val *= ref_c;
-        }
-
-        let base_rate =
-            r.iter()
-                .copied()
-                .find(|&v| v > 0.0)
-                .ok_or(PricingError::SingularMatrix(
-                    "all row relativities collapsed to zero",
-                ))?;
-        let mut norm_r = r.clone();
-        for val in &mut norm_r {
-            *val /= base_rate;
-        }
-
-        let mut max_diff = (base_rate - prev_base).abs() / base_rate.max(1.0);
-        for i in 0..n_rows {
-            let d = (norm_r[i] - prev_r[i]).abs();
-            if d > max_diff {
-                max_diff = d;
-            }
-        }
-        for j in 0..n_cols {
-            let d = (c[j] - prev_c[j]).abs();
-            if d > max_diff {
-                max_diff = d;
-            }
-        }
-
-        prev_base = base_rate;
-        prev_r.copy_from_slice(&norm_r);
-        prev_c.copy_from_slice(&c);
+        let (base_rate, max_diff) = normalize_and_diff(
+            &mut r,
+            &mut c,
+            &mut norm_r,
+            &mut prev_r,
+            &mut prev_c,
+            &mut prev_base,
+        )?;
 
         if max_diff <= tol {
             let chi_squared =
@@ -315,15 +329,12 @@ pub fn bailey_simon_chi_squared(
 
     let mut r = vec![1.0; n_rows];
     let mut c = vec![1.0; n_cols];
+    let mut norm_r = vec![1.0; n_rows];
     let mut prev_r = vec![1.0; n_rows];
     let mut prev_c = vec![1.0; n_cols];
     let mut prev_base = 0.0;
 
-    let mut iter = 0;
-
-    while iter < max_iter {
-        iter += 1;
-
+    for iter in 1..=max_iter {
         for i in 0..n_rows {
             let mut num = 0.0;
             let mut den = 0.0;
@@ -354,49 +365,14 @@ pub fn bailey_simon_chi_squared(
             c[j] = if den > 0.0 { (num / den).sqrt() } else { 0.0 };
         }
 
-        let ref_c = c
-            .iter()
-            .copied()
-            .find(|&v| v > 0.0)
-            .ok_or(PricingError::SingularMatrix(
-                "all column relativities collapsed to zero",
-            ))?;
-        for val in &mut c {
-            *val /= ref_c;
-        }
-        for val in &mut r {
-            *val *= ref_c;
-        }
-
-        let base_rate =
-            r.iter()
-                .copied()
-                .find(|&v| v > 0.0)
-                .ok_or(PricingError::SingularMatrix(
-                    "all row relativities collapsed to zero",
-                ))?;
-        let mut norm_r = r.clone();
-        for val in &mut norm_r {
-            *val /= base_rate;
-        }
-
-        let mut max_diff = (base_rate - prev_base).abs() / base_rate.max(1.0);
-        for i in 0..n_rows {
-            let d = (norm_r[i] - prev_r[i]).abs();
-            if d > max_diff {
-                max_diff = d;
-            }
-        }
-        for j in 0..n_cols {
-            let d = (c[j] - prev_c[j]).abs();
-            if d > max_diff {
-                max_diff = d;
-            }
-        }
-
-        prev_base = base_rate;
-        prev_r.copy_from_slice(&norm_r);
-        prev_c.copy_from_slice(&c);
+        let (base_rate, max_diff) = normalize_and_diff(
+            &mut r,
+            &mut c,
+            &mut norm_r,
+            &mut prev_r,
+            &mut prev_c,
+            &mut prev_base,
+        )?;
 
         if max_diff <= tol {
             let chi_squared =
