@@ -210,9 +210,156 @@ fn hachemeister_collective_is_credibility_weighted() {
     let b1 = inv[2] * sum_zb[0] + inv[3] * sum_zb[1];
     assert!((res.collective_beta[0] - b0).abs() < 1e-9 * b0.abs().max(1.0));
     assert!((res.collective_beta[1] - b1).abs() < 1e-9 * b1.abs().max(1.0));
-    // VHM must be full rank here so the credibility-weighted branch (not GLS fallback) ran.
+    // VHM must be full rank here so the sum-Z form is defined and must equal the GLS form.
     let a = res.vhm_matrix;
     assert!(a[0] * a[3] - a[1] * a[2] > 0.0);
+}
+
+fn mat_vec2(m: [f64; 4], v: [f64; 2]) -> [f64; 2] {
+    [m[0] * v[0] + m[1] * v[1], m[2] * v[0] + m[3] * v[1]]
+}
+
+/// Hand GLS collective `b = (sum_i (A + s^2 V_i)^-1)^-1 sum_i (A + s^2 V_i)^-1 beta_i`,
+/// `V_i = (X_i^T W_i X_i)^-1`, evaluated independently in the caller's original coordinates.
+fn hand_gls_collective(
+    times: &[f64],
+    weights: &[&[f64]],
+    betas: &[[f64; 2]],
+    a: [f64; 4],
+    s2: f64,
+) -> [f64; 2] {
+    let mut sum_p = [0.0; 4];
+    let mut sum_pb = [0.0; 2];
+    for (w, beta) in weights.iter().zip(betas) {
+        let (mut s0, mut s1, mut s2t) = (0.0, 0.0, 0.0);
+        for (&t, &wj) in times.iter().zip(w.iter()) {
+            s0 += wj;
+            s1 += wj * t;
+            s2t += wj * t * t;
+        }
+        let v = inv2([s0, s1, s1, s2t]);
+        let omega = [
+            a[0] + s2 * v[0],
+            a[1] + s2 * v[1],
+            a[2] + s2 * v[2],
+            a[3] + s2 * v[3],
+        ];
+        let prec = inv2(omega);
+        let pb = mat_vec2(prec, *beta);
+        for k in 0..4 {
+            sum_p[k] += prec[k];
+        }
+        sum_pb[0] += pb[0];
+        sum_pb[1] += pb[1];
+    }
+    mat_vec2(inv2(sum_p), sum_pb)
+}
+
+/// Small panel with a common slope: K = 4, per-observation weights 50 / 5 / 200 / 1.
+/// `slope_spread` scales group-specific slope deviations (0 = common slope).
+fn common_slope_panel(slope_spread: f64) -> (Vec<f64>, Vec<Vec<f64>>, Vec<Vec<f64>>) {
+    let times: Vec<f64> = (1..=5).map(f64::from).collect();
+    let intercepts = [100.0, 130.0, 90.0, 150.0];
+    let slope_dev = [1.0, -1.5, -0.5, 2.0];
+    let noise = [0.8, -1.1, 0.3, 0.9, -0.6];
+    let group_w: [f64; 4] = [50.0, 5.0, 200.0, 1.0];
+    let ys = (0..4)
+        .map(|g| {
+            times
+                .iter()
+                .enumerate()
+                .map(|(j, &t)| {
+                    let n = noise[(j + 2 * g) % noise.len()] * (10.0 / group_w[g]).sqrt();
+                    intercepts[g] + (5.0 + slope_spread * slope_dev[g]) * t + n
+                })
+                .collect()
+        })
+        .collect();
+    let ws = group_w.iter().map(|&w| vec![w; times.len()]).collect();
+    (times, ys, ws)
+}
+
+fn fit_panel(
+    times: &[f64],
+    ys: &[Vec<f64>],
+    ws: &[Vec<f64>],
+) -> pricing_kernels::credibility::HachemeisterResult {
+    let t_sl: Vec<&[f64]> = ys.iter().map(|_| times).collect();
+    let y_sl: Vec<&[f64]> = ys.iter().map(Vec::as_slice).collect();
+    let w_sl: Vec<&[f64]> = ws.iter().map(Vec::as_slice).collect();
+    hachemeister_credibility(&t_sl, &y_sl, &w_sl).unwrap()
+}
+
+/// Rank-1 projected VHM (raw estimate indefinite): the collective must be the GLS estimator,
+/// not the `A = 0` pooled-GLS fallback.
+#[test]
+fn hachemeister_rank_one_vhm_collective_matches_gls_formula() {
+    let (times, ys, ws) = common_slope_panel(0.0);
+    let res = fit_panel(&times, &ys, &ws);
+    let raw = res.vhm_matrix_raw;
+    assert!(
+        raw[0] * raw[3] - raw[1] * raw[2] < 0.0,
+        "raw VHM must be indefinite"
+    );
+    let a = res.vhm_matrix;
+    let det = a[0] * a[3] - a[1] * a[2];
+    assert!(a[0] + a[3] > 0.0 && det.abs() <= 1e-9 * (a[0] * a[3]).abs().max(1.0));
+
+    let w_sl: Vec<&[f64]> = ws.iter().map(Vec::as_slice).collect();
+    let betas: Vec<[f64; 2]> = res.groups.iter().map(|g| g.wls_beta).collect();
+    let b = hand_gls_collective(&times, &w_sl, &betas, a, res.epv);
+    for k in 0..2 {
+        assert!(
+            (res.collective_beta[k] - b[k]).abs() <= 1e-9 * b[k].abs().max(1.0),
+            "collective[{k}] = {} vs hand GLS {}",
+            res.collective_beta[k],
+            b[k]
+        );
+    }
+    // The A = 0 pooled GLS estimate differs materially here (the pre-fix fallback).
+    let b0 = hand_gls_collective(&times, &w_sl, &betas, [0.0; 4], res.epv);
+    assert!((b0[0] - b[0]).abs() > 1.0, "{b0:?} vs {b:?}");
+    // Credibility estimates use the same collective: beta_i^c = b + Z_i (beta_i - b).
+    for g in &res.groups {
+        let d = [g.wls_beta[0] - b[0], g.wls_beta[1] - b[1]];
+        let adj = mat_vec2(g.credibility_matrix, d);
+        for k in 0..2 {
+            let want = b[k] + adj[k];
+            assert!((g.credibility_beta[k] - want).abs() <= 1e-8 * want.abs().max(1.0));
+        }
+    }
+}
+
+/// The collective prior is continuous across the PD -> rank-1 transition of the projected VHM.
+#[test]
+fn hachemeister_collective_continuous_across_vhm_rank_transition() {
+    const STEPS: u32 = 200;
+    const MAX_SPREAD: f64 = 2.0;
+    let mut saw_pd = false;
+    let mut saw_indefinite = false;
+    let mut prev: Option<[f64; 2]> = None;
+    let mut max_jump = 0.0_f64;
+    for k in 0..=STEPS {
+        let spread = MAX_SPREAD * f64::from(k) / f64::from(STEPS);
+        let (times, ys, ws) = common_slope_panel(spread);
+        let res = fit_panel(&times, &ys, &ws);
+        let raw = res.vhm_matrix_raw;
+        if raw[0] * raw[3] - raw[1] * raw[2] > 0.0 && raw[0] > 0.0 {
+            saw_pd = true;
+        } else {
+            saw_indefinite = true;
+        }
+        if let Some(p) = prev {
+            max_jump = max_jump.max((res.collective_beta[0] - p[0]).abs());
+        }
+        prev = Some(res.collective_beta);
+    }
+    assert!(
+        saw_pd && saw_indefinite,
+        "scan must cross the rank transition"
+    );
+    // Step 0.01 in slope spread moves the collective intercept smoothly (pre-fix: ~20 jump).
+    assert!(max_jump < 0.5, "max consecutive intercept jump {max_jump}");
 }
 
 /// Reviewer probe panel: K = 4 groups, 5 unit-weight years. Pre-fix, the PSD projection in

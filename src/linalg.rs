@@ -147,6 +147,8 @@ pub(crate) struct QrWorkspace {
     r_rm: Vec<f64>,
     /// Column-major `p × p` inverse `R^{-1}`.
     r_inv_cm: Vec<f64>,
+    /// Euclidean norms of the `p` columns of `a_cm` before factorization (rank test scale).
+    col_norm: Vec<f64>,
 }
 
 impl QrWorkspace {
@@ -158,11 +160,15 @@ impl QrWorkspace {
             v: vec![0.0; m],
             r_rm: vec![0.0; p * p],
             r_inv_cm: vec![0.0; p * p],
+            col_norm: vec![0.0; p],
         }
     }
 
     #[inline]
     fn ensure_dims(&mut self, m: usize, n: usize, p: usize) {
+        if self.col_norm.len() != p {
+            self.col_norm.resize(p, 0.0);
+        }
         if self.a_cm.len() != m * p {
             self.a_cm.resize(m * p, 0.0);
         }
@@ -178,12 +184,25 @@ impl QrWorkspace {
     }
 }
 
+/// Relative rank tolerance of the Householder QR: column `k` is declared linearly dependent on
+/// columns `0..k` when `|R_kk| <= QR_RANK_RTOL * ||a_k||_2` (the sine of the angle between
+/// `a_k` and the span of the preceding columns). Comparing each `R_kk` with its own original
+/// column norm (as LINPACK `dqrdc2` used by R `lm`/`glm` does) makes the test invariant to
+/// column scaling, so rescaling a covariate by `1e12` or `1e-13` cannot trigger a false
+/// [`PricingError::SingularMatrix`].
+const QR_RANK_RTOL: f64 = 1e-12;
+
 fn qr_factorize_a_cm_in_place(
     m: usize,
     p: usize,
     ws: &mut QrWorkspace,
     apply_rhs: bool,
 ) -> Result<(), PricingError> {
+    for k in 0..p {
+        let col = &ws.a_cm[k * m..(k + 1) * m];
+        let norm = col.iter().map(|v| v * v).sum::<f64>().sqrt();
+        ws.col_norm[k] = norm;
+    }
     for k in 0..p {
         let len = m - k;
         let col_k_start = k * m + k;
@@ -245,8 +264,6 @@ fn qr_factorize_a_cm_in_place(
         }
     }
 
-    let mut max_diag = 0.0_f64;
-    let mut min_diag = f64::INFINITY;
     for k in 0..p {
         let d = ws.a_cm[k * m + k].abs();
         if !d.is_finite() {
@@ -254,13 +271,12 @@ fn qr_factorize_a_cm_in_place(
                 "QR diagonal overflowed to non-finite",
             ));
         }
-        max_diag = max_diag.max(d);
-        min_diag = min_diag.min(d);
-    }
-    if max_diag <= 0.0 || min_diag <= 1e-12 * max_diag {
-        return Err(PricingError::SingularMatrix(
-            "design matrix is rank-deficient or collinear",
-        ));
+        let col_norm = ws.col_norm[k];
+        if !(col_norm > 0.0) || !(d > QR_RANK_RTOL * col_norm) {
+            return Err(PricingError::SingularMatrix(
+                "design matrix is rank-deficient or collinear",
+            ));
+        }
     }
 
     Ok(())

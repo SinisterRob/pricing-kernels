@@ -1398,6 +1398,21 @@ fn test_tweedie_negbin_binomial_invgauss_and_ridge_glm() {
     .unwrap();
     assert!(ig.coefficients[1] > 0.5);
     assert!(ig.deviance > 0.0);
+    // External anchor: the saturated one-way log-link MLE reproduces the group weighted means
+    // (score equations sum_i w_i (y_i - mu_k) / V(mu_k) * dmu/deta = 0 within each level);
+    // deviance = sum w (y - mu)^2 / (y mu^2), Pearson dispersion = sum w (y - mu)^2 / mu^3 / (n - p).
+    let m0 = (500.0 + 620.0 + 580.0) / 3.0;
+    let m1 = (1_400.0 + 1_650.0 + 1_550.0) / 3.0;
+    assert!(close_rel(ig.coefficients[0].exp(), m0, 1e-9));
+    assert!(close_rel(ig.coefficients[1].exp(), m1 / m0, 1e-9));
+    let (mut dev, mut chi2) = (0.0, 0.0);
+    for (i, &y) in y_ig.iter().enumerate() {
+        let mu = if i < 3 { m0 } else { m1 };
+        dev += (y - mu).powi(2) / (y * mu * mu);
+        chi2 += (y - mu).powi(2) / mu.powi(3);
+    }
+    assert!(close_rel(ig.deviance, dev, 1e-9));
+    assert!(close_rel(ig.dispersion, chi2 / 4.0, 1e-9));
 }
 
 #[test]
@@ -1492,6 +1507,88 @@ fn test_subannual_parallelogram_two_step_trend_and_hachemeister() {
     let cred_dist = (hach.groups[2].credibility_beta[1] - hach.collective_beta[1]).abs();
     assert!(cred_dist < raw_dist);
     assert!(hach.groups[0].predict(6.0) > hach.groups[0].predict(5.0));
+
+    // 5. Closed-form 2-group Hachemeister with identical designs (X_1 = X_2, W_1 = W_2):
+    // a_i = 1/2 gives A_raw = d d^T / 2 - s^2 V with d = beta_1 - beta_2, V = (X^T W X)^-1;
+    // s^2 = (SSE_1 + SSE_2) / (2 (n - 2)); equal Omega_i = A + s^2 V make the GLS collective the
+    // plain average of the WLS fits; and beta_i^c = b + Z (beta_i - b), Z = A (A + s^2 V)^-1.
+    let tt = [1.0, 2.0, 3.0, 4.0, 5.0];
+    let ww = [2.0, 1.0, 3.0, 1.0, 2.0];
+    let ya = [100.0, 104.0, 111.0, 113.0, 121.0];
+    let yb = [92.0, 99.0, 101.0, 108.0, 110.0];
+    let h2 = hachemeister_credibility(&[&tt, &tt], &[&ya, &yb], &[&ww, &ww]).unwrap();
+    let (s0, s1, s2t) = tt
+        .iter()
+        .zip(&ww)
+        .fold((0.0, 0.0, 0.0), |(a, b, c), (&t, &w)| {
+            (a + w, b + w * t, c + w * t * t)
+        });
+    let det = s0 * s2t - s1 * s1;
+    let v = [s2t / det, -s1 / det, -s1 / det, s0 / det];
+    let wls = |y: &[f64]| {
+        let (r0, r1) = tt
+            .iter()
+            .zip(&ww)
+            .zip(y)
+            .fold((0.0, 0.0), |(a, b), ((&t, &w), &yv)| {
+                (a + w * yv, b + w * t * yv)
+            });
+        [v[0] * r0 + v[1] * r1, v[2] * r0 + v[3] * r1]
+    };
+    let sse = |y: &[f64], beta: [f64; 2]| {
+        tt.iter()
+            .zip(&ww)
+            .zip(y)
+            .map(|((&t, &w), &yv)| w * (yv - beta[0] - beta[1] * t).powi(2))
+            .sum::<f64>()
+    };
+    let (ba, bb) = (wls(&ya), wls(&yb));
+    let s2 = (sse(&ya, ba) + sse(&yb, bb)) / 6.0;
+    assert!(close_rel(h2.epv, s2, 1e-10));
+    let d = [ba[0] - bb[0], ba[1] - bb[1]];
+    let a_raw = [
+        0.5 * d[0] * d[0] - s2 * v[0],
+        0.5 * d[0] * d[1] - s2 * v[1],
+        0.5 * d[1] * d[1] - s2 * v[3],
+    ];
+    let raw = h2.vhm_matrix_raw;
+    for (got, want) in [(raw[0], a_raw[0]), (raw[1], a_raw[1]), (raw[3], a_raw[2])] {
+        assert!(
+            (got - want).abs() <= 1e-9 * a_raw[0].abs().max(1.0),
+            "{got} vs {want}"
+        );
+    }
+    let b_hand = [f64::midpoint(ba[0], bb[0]), f64::midpoint(ba[1], bb[1])];
+    for k in 0..2 {
+        assert!(close_rel(h2.groups[0].wls_beta[k], ba[k], 1e-10));
+        assert!(close_rel(h2.groups[1].wls_beta[k], bb[k], 1e-10));
+        assert!(close_rel(h2.collective_beta[k], b_hand[k], 1e-10));
+    }
+    let a = h2.vhm_matrix;
+    let om = [
+        a[0] + s2 * v[0],
+        a[1] + s2 * v[1],
+        a[2] + s2 * v[2],
+        a[3] + s2 * v[3],
+    ];
+    let od = om[0] * om[3] - om[1] * om[2];
+    let om_inv = [om[3] / od, -om[1] / od, -om[2] / od, om[0] / od];
+    let z = [
+        a[0] * om_inv[0] + a[1] * om_inv[2],
+        a[0] * om_inv[1] + a[1] * om_inv[3],
+        a[2] * om_inv[0] + a[3] * om_inv[2],
+        a[2] * om_inv[1] + a[3] * om_inv[3],
+    ];
+    for (g, beta) in h2.groups.iter().zip([ba, bb]) {
+        let dd = [beta[0] - b_hand[0], beta[1] - b_hand[1]];
+        let want = [
+            b_hand[0] + z[0] * dd[0] + z[1] * dd[1],
+            b_hand[1] + z[2] * dd[0] + z[3] * dd[1],
+        ];
+        for k in 0..2 {
+            assert!(close_rel(g.credibility_beta[k], want[k], 1e-9));
+        }
+    }
 }
 
 #[test]

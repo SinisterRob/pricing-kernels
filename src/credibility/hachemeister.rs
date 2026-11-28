@@ -50,8 +50,11 @@ pub struct HachemeisterResult {
     /// Exposure-weighted collective time centre `t_bar = sum_ij w_ij t_ij / sum_ij w_ij`
     /// (original time units) at which the estimation and PSD projection are performed.
     pub time_centre: f64,
-    /// Collective prior regression vector `[intercept, slope]` (`b`), credibility-weighted
-    /// `b = (sum_i Z_i)^-1 sum_i Z_i beta_i` (GLS-weighted fallback when `sum_i Z_i` is singular).
+    /// Collective prior regression vector `[intercept, slope]` (`b`), the GLS estimator
+    /// `b = (sum_i (A + s^2 V_i)^-1)^-1 sum_i (A + s^2 V_i)^-1 beta_i` with
+    /// `V_i = (X_i^T W_i X_i)^-1`. It equals Hachemeister's credibility-weighted
+    /// `(sum_i Z_i)^-1 sum_i Z_i beta_i` whenever `A` is full rank, and stays well defined (and
+    /// continuous in `A`) when `A` is rank-deficient, including `A = 0` (plain pooled GLS).
     pub collective_beta: [f64; 2],
     /// Row-major `2x2` Variance of Hypothetical Means covariance matrix `A` (PSD-projected),
     /// estimated by the exposure-weighted multivariate Bühlmann-Straub moment estimator,
@@ -83,20 +86,6 @@ fn invert_2x2(m: [f64; 4]) -> Result<[f64; 4], PricingError> {
         -m[2] * inv_det,
         m[0] * inv_det,
     ])
-}
-
-/// Relative determinant threshold below which `sum_i Z_i` is treated as rank-deficient and the
-/// collective prior falls back to the GLS (`A -> 0`) limit.
-const SUM_Z_RANK_TOL: f64 = 1e-10;
-
-/// Invert a `2x2` matrix only when it is well conditioned relative to [`SUM_Z_RANK_TOL`].
-fn invert_well_conditioned_2x2(m: [f64; 4]) -> Option<[f64; 4]> {
-    let det = m[0] * m[3] - m[1] * m[2];
-    let scale = (m[0] * m[3]).abs().max((m[1] * m[2]).abs());
-    if !det.is_finite() || !(scale > 0.0) || det.abs() <= SUM_Z_RANK_TOL * scale {
-        return None;
-    }
-    invert_2x2(m).ok()
 }
 
 #[inline]
@@ -166,7 +155,14 @@ fn project_psd_2x2(a: f64, b: f64, d: f64) -> [f64; 4] {
 ///   / (w (1 - sum_i a_i^2))`, unbiased for any designs (multivariate analogue of the
 ///   Bühlmann-Straub VHM estimator; cf. Bühlmann & Gisler (2005) §8.4, Dannenburg, Kaas &
 ///   Goovaerts (1996)), then projected onto the PSD cone.
-/// - `b = (sum_i Z_i)^-1 sum_i Z_i beta_i` with `Z_i = A (A + s^2 V_i)^-1` (Hachemeister 1975).
+/// - `Z_i = A (A + s^2 V_i)^-1` (Hachemeister 1975) and the collective
+///   `b = (sum_i (A + s^2 V_i)^-1)^-1 sum_i (A + s^2 V_i)^-1 beta_i`, the GLS estimator of the
+///   common mean of `beta_i ~ (b, A + s^2 V_i)`. Since `Z_i = A (A + s^2 V_i)^-1`, this equals
+///   `(sum_i Z_i)^-1 sum_i Z_i beta_i` whenever `A` is invertible; unlike that form it remains
+///   defined for a rank-deficient (PSD-projected) `A`, which is common in small panels.
+///   Degenerate case `s^2 = 0` (all groups fit exactly): `Z_i = I` and `b` is the unweighted
+///   mean of the `beta_i` (the `sum_i Z_i` form with `Z_i = I`); it does not affect the
+///   credibility estimates, which then equal the standalone fits.
 ///
 /// All of the above is evaluated in centred time coordinates `t - t_bar` (exposure-weighted
 /// collective barycentre, Bühlmann & Gisler (2005) §8.4) so that the PSD projection — and hence
@@ -341,35 +337,39 @@ pub fn hachemeister_credibility(
         z_mats.push(z_mat);
     }
 
-    // Hachemeister (1975) collective prior is credibility-weighted:
-    // b = (sum_i Z_i)^-1 sum_i Z_i beta_i (cf. Bühlmann-Straub mu = sum Z_i X_i / sum Z_i).
-    // When sum_i Z_i is (numerically) singular (A = 0 or rank-deficient A), fall back to the
-    // GLS limit b = (sum_i X_i^T W_i X_i)^-1 sum_i X_i^T W_i X_i beta_i, which is the A -> 0 limit
-    // of the credibility-weighted estimator.
-    let mut sum_z = [0.0; 4];
-    let mut sum_zb = [0.0; 2];
-    for i in 0..k {
-        for idx in 0..4 {
-            sum_z[idx] += z_mats[i][idx];
+    // Collective prior: GLS estimator of the common mean of beta_i ~ (b, A + s^2 V_i),
+    //   b = (sum_i Omega_i^-1)^-1 sum_i Omega_i^-1 beta_i,   Omega_i = A + s^2 V_i.
+    // Because Z_i = A Omega_i^-1, this coincides with Hachemeister's (sum Z_i)^-1 sum Z_i beta_i
+    // when A is invertible, and it is the continuous extension to rank-deficient A (A = 0 gives
+    // the pooled GLS estimate). For s^2 > 0 each Omega_i is positive definite (V_i is).
+    let collective_beta = if epv == 0.0 {
+        // Z_i = I for every group: (sum Z_i)^-1 sum Z_i beta_i is the unweighted mean.
+        let inv_k = 1.0 / (k as f64);
+        let mut mean = [0.0; 2];
+        for beta in &wls_betas {
+            mean[0] += inv_k * beta[0];
+            mean[1] += inv_k * beta[1];
         }
-        let zb = mat_vec_2x2(z_mats[i], wls_betas[i]);
-        sum_zb[0] += zb[0];
-        sum_zb[1] += zb[1];
-    }
-    let collective_beta = if let Some(sum_z_inv) = invert_well_conditioned_2x2(sum_z) {
-        mat_vec_2x2(sum_z_inv, sum_zb)
+        mean
     } else {
-        let mut sum_m = [0.0; 4];
-        let mut sum_mb = [0.0; 2];
+        let mut sum_prec = [0.0; 4];
+        let mut sum_prec_b = [0.0; 2];
         for i in 0..k {
+            let omega = [
+                vhm[0] + epv * xtwx_inv_list[i][0],
+                vhm[1] + epv * xtwx_inv_list[i][1],
+                vhm[2] + epv * xtwx_inv_list[i][2],
+                vhm[3] + epv * xtwx_inv_list[i][3],
+            ];
+            let prec = invert_2x2(omega)?;
             for idx in 0..4 {
-                sum_m[idx] += xtwx_list[i][idx];
+                sum_prec[idx] += prec[idx];
             }
-            let mb = mat_vec_2x2(xtwx_list[i], wls_betas[i]);
-            sum_mb[0] += mb[0];
-            sum_mb[1] += mb[1];
+            let pb = mat_vec_2x2(prec, wls_betas[i]);
+            sum_prec_b[0] += pb[0];
+            sum_prec_b[1] += pb[1];
         }
-        mat_vec_2x2(invert_2x2(sum_m)?, sum_mb)
+        mat_vec_2x2(invert_2x2(sum_prec)?, sum_prec_b)
     };
 
     // Map centred-coordinate results back to the user's original time coordinates.

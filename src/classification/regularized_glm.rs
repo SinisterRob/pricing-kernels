@@ -462,23 +462,10 @@ pub fn fit_regularized_glm(
     require_positive(total_w, "sum of weights must be > 0")?;
 
     // Weighted column standardization (dropping zero-variance columns cleanly).
-    let mut col_means = vec![0.0; p];
-    let mut col_sds = vec![0.0; p];
+    let (col_means, col_sds) = weighted_column_moments(x, n, p, &w_vec, total_w);
     let mut x_std = vec![0.0; n * p]; // column-major: col j at j*n..(j+1)*n
     for j in 0..p {
-        let mut m = 0.0;
-        for i in 0..n {
-            m += w_vec[i] * x[i * p + j];
-        }
-        m /= total_w;
-        col_means[j] = m;
-        let mut var = 0.0;
-        for i in 0..n {
-            let d = x[i * p + j] - m;
-            var += w_vec[i] * d * d;
-        }
-        let sd = (var / total_w).sqrt();
-        col_sds[j] = sd;
+        let (m, sd) = (col_means[j], col_sds[j]);
         if sd >= ZERO_SD_TOL {
             for i in 0..n {
                 x_std[j * n + i] = (x[i * p + j] - m) / sd;
@@ -1142,7 +1129,8 @@ pub fn natural_cubic_spline_basis(
 pub struct RandomInterceptGlmmResult {
     /// Fixed-effect intercept `β_0` (unpenalized; estimated jointly with the random intercepts).
     pub intercept: f64,
-    /// Fixed-effect slopes `β_1..β_p`.
+    /// Fixed-effect slopes `β_1..β_p` (one per input column; `0.0` for a dropped constant
+    /// column).
     pub fixed_effects: Vec<f64>,
     /// Fitted random-effect variance `τ^2 ∈ [1e-8, 1e4]`.
     pub tau_squared: f64,
@@ -1366,6 +1354,36 @@ impl GlmmData<'_> {
     }
 }
 
+/// Weighted column means and (population) standard deviations of row-major `n × p` `x`.
+/// Columns with `sd < ZERO_SD_TOL` are constant (e.g. an explicit intercept column) and are
+/// dropped by [`fit_regularized_glm`] and [`fit_random_intercept_glmm`], which already carry
+/// their own unpenalized intercept.
+fn weighted_column_moments(
+    x: &[f64],
+    n: usize,
+    p: usize,
+    w: &[f64],
+    total_w: f64,
+) -> (Vec<f64>, Vec<f64>) {
+    let mut means = vec![0.0; p];
+    let mut sds = vec![0.0; p];
+    for j in 0..p {
+        let mut m = 0.0;
+        for i in 0..n {
+            m += w[i] * x[i * p + j];
+        }
+        m /= total_w;
+        let mut var = 0.0;
+        for i in 0..n {
+            let d = x[i * p + j] - m;
+            var += w[i] * d * d;
+        }
+        means[j] = m;
+        sds[j] = (var / total_w).sqrt();
+    }
+    (means, sds)
+}
+
 /// Fit a Laplace-approximated Poisson random-intercept GLMM
 /// `η_{ij} = β_0 + x_{ij}^T β + o_{ij} + u_j`, `u_j ~ N(0, τ^2)`
 /// for high-cardinality territories or class codes (`group_ids[i] ∈ 0..n_groups`).
@@ -1390,7 +1408,11 @@ impl GlmmData<'_> {
 /// * `options.tol` — relative parameter-step tolerance of each joint-mode solve (`> 0`);
 ///   the solve also requires the Newton decrement to fall below `1e-10`.
 ///
-/// The columns of `x` together with the intercept must have full column rank
+/// Constant columns of `x` (weighted standard deviation `< 1e-12`, e.g. an explicit
+/// intercept column as carried by [`crate::classification::DesignMatrix`]) are dropped
+/// exactly as in [`fit_regularized_glm`]: they are absorbed by the model intercept and their
+/// entry in `fixed_effects` is reported as `0.0` (so `fixed_effects.len() == p` always).
+/// The remaining columns together with the intercept must have full column rank
 /// (otherwise [`PricingError::SingularMatrix`]).
 #[allow(clippy::too_many_arguments)]
 pub fn fit_random_intercept_glmm(
@@ -1451,10 +1473,29 @@ pub fn fit_random_intercept_glmm(
         ..RegularizedGlmOptions::default()
     };
     let glm = fit_regularized_glm(x, n, p, y, Some(&w_vec), Some(&o_vec), fixed_opts)?;
+
+    // Drop constant columns (same rule as `fit_regularized_glm`); `kept[j]` = column retained.
+    let total_w: f64 = w_vec.iter().sum();
+    let (_, col_sds) = weighted_column_moments(x, n, p, &w_vec, total_w);
+    let kept: Vec<bool> = col_sds.iter().map(|&sd| sd >= ZERO_SD_TOL).collect();
+    let p_kept = kept.iter().filter(|&&k| k).count();
+    let x_kept: Vec<f64> = if p_kept == p {
+        x.to_vec()
+    } else {
+        (0..n)
+            .flat_map(|i| {
+                let row = &x[i * p..(i + 1) * p];
+                row.iter()
+                    .zip(&kept)
+                    .filter_map(|(&v, &k)| k.then_some(v))
+                    .collect::<Vec<f64>>()
+            })
+            .collect()
+    };
     let data = GlmmData {
-        x,
+        x: &x_kept,
         n,
-        p,
+        p: p_kept,
         y,
         w: w_vec,
         o: o_vec,
@@ -1462,9 +1503,14 @@ pub fn fit_random_intercept_glmm(
         n_groups,
         log_factorial_sum,
     };
-    let mut beta_start = Vec::with_capacity(p + 1);
+    let mut beta_start = Vec::with_capacity(p_kept + 1);
     beta_start.push(glm.intercept);
-    beta_start.extend_from_slice(&glm.coefficients);
+    beta_start.extend(
+        glm.coefficients
+            .iter()
+            .zip(&kept)
+            .filter_map(|(&b, &k)| k.then_some(b)),
+    );
     let start = JointMode {
         beta: beta_start,
         u: vec![0.0; n_groups],
@@ -1565,10 +1611,21 @@ pub fn fit_random_intercept_glmm(
     }
     let group_credibilities: Vec<f64> = sum_mu.iter().map(|s| s / (s + inv_t2)).collect();
     let converged = all_converged && search_converged && !at_upper;
+    let mut kept_effects = best.beta[1..].iter();
+    let fixed_effects: Vec<f64> = kept
+        .iter()
+        .map(|&k| {
+            if k {
+                kept_effects.next().copied().unwrap_or(0.0)
+            } else {
+                0.0
+            }
+        })
+        .collect();
 
     Ok(RandomInterceptGlmmResult {
         intercept: best.beta[0],
-        fixed_effects: best.beta[1..].to_vec(),
+        fixed_effects,
         tau_squared: tau_sq,
         random_intercepts: best.u,
         group_credibilities,
