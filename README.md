@@ -130,7 +130,7 @@ fn main() -> Result<(), PricingError> {
     ];
 
     let erp = calculate_ncci_experience_mod(&spec, &claims)?;
-    println!("Experience Modification Factor: {:.3}", erp.mod_factor);
+    println!("Experience Modification Factor: {:.2} (unrounded {:.4})", erp.mod_factor, erp.mod_factor_unrounded);
     Ok(())
 }
 ```
