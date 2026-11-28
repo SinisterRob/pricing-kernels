@@ -51,6 +51,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `NcciErpResult.mod_factor` is 2-decimal (e.g. 0.858 → 0.86); `datasets::ncci_erp_worksheet().expected_mod_rounded` = 0.86. New pub const `NCCI_MOD_DECIMALS`.
 - `myers_cohn_profit_load` fair premium / `pv_underwriting_profit_tax` change whenever `loss_discount_rate ≠ risk_free_rate`.
 - `ClassicalCredibility::credibility` and `blend` return `Result<f64, PricingError>` (FFI `pk_classical_credibility` still returns NaN on error).
+- `AggregateLossDistribution` fields are private; use `step()`, `pmf()`, `mean()`, `variance()`, `std_dev()`. Deserialization re-validates via `from_pmf` and recomputes moments.
 - New fields: `TweediePowerSelection.best_dispersion`, `InformationCriteria.{log_likelihood, ml_dispersion}`, `converged` on `ZeroModifiedPoissonResult` and `RandomInterceptGlmmResult`; new variant `RegularizedGlmFamily::ZeroTruncatedPoisson`.
 - `glm_information_criteria` rejects `QuasiPoisson` (no likelihood); AIC/BIC values change.
 - New fields `GlmResult.separation_suspected`, `TweediePowerSelection.failed_powers`, `RandomInterceptGlmmResult.{tau_squared_at_lower_bound, tau_squared_at_upper_bound}`; new variant `RegularizedGlmFamily::BinomialCloglog`. `ZeroModifiedPoissonResult.zero_part` from `fit_hurdle_poisson` is a cloglog fit (predict with `BinomialCloglog` and `ln E` offsets); Hurdle fitted values change whenever offsets are supplied.

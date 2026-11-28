@@ -11,7 +11,7 @@
 //!     100.0,
 //!     64,
 //! )?;
-//! assert!((agg.mean - 300.0).abs() < 1e-6);
+//! assert!((agg.mean() - 300.0).abs() < 1e-6);
 //! # Ok::<(), pricing_kernels::error::PricingError>(())
 //! ```
 
