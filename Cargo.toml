@@ -13,6 +13,7 @@ readme = "README.md"
 exclude = [
     "assets/",
     "scripts/",
+    ".claude/",
     ".github/",
     ".githooks/",
     ".gitignore",

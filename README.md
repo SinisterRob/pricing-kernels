@@ -193,6 +193,10 @@ cargo test --doc --all-features
 cargo build --release --target wasm32-unknown-unknown --features wasm
 ```
 
+## Actuarial Standards & Disclaimer
+
+`pricing-kernels` is a general-purpose open-source numerical library provided **"as-is"** under the MIT or Apache-2.0 license. It does **not** constitute an actuarial opinion, rate filing, pricing certification, or regulatory advice. Under **ASOP 56 (Modeling)**, **ASOP 23 (Data Quality)**, **ASOP 25 (Credibility Procedures)**, and **ASOP 53 (Estimating Future Costs for Prospective Property/Casualty Risk Transfer and Risk Retention)**, the actuary or practitioner using this software remains solely responsible for data validation, model and assumption selection, bureau/jurisdictional compliance, and independent verification of all outputs for their specific portfolio and intended purpose.
+
 ## License
 
 Licensed under either of [MIT](https://github.com/SinisterRob/pricing-kernels/blob/main/LICENSE-MIT) or [Apache-2.0](https://github.com/SinisterRob/pricing-kernels/blob/main/LICENSE-APACHE) at your option.
