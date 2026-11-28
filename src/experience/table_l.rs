@@ -208,7 +208,7 @@ impl TableLEngine {
     /// Build Skurnick (1974) Table L directly from a per-occurrence-limited
     /// [`AggregateLossDistribution`] and the corresponding `unlimited_expected_loss > 0`.
     ///
-    /// Normalizes each grid point `x*_k = k * limited_agg.step` into limited entry ratio
+    /// Normalizes each grid point `x*_k = k * limited_agg.step()` into limited entry ratio
     /// `y*_k = x*_k / unlimited_expected_loss`, automatically inferring the per-occurrence
     /// Loss Elimination Ratio `k = 1 - E[Y*]`.
     pub fn from_limited_aggregate(
@@ -220,17 +220,17 @@ impl TableLEngine {
                 "unlimited_expected_loss must be finite and positive",
             ));
         }
-        let mut ratios = Vec::with_capacity(limited_agg.pmf.len());
-        let mut probs = Vec::with_capacity(limited_agg.pmf.len());
+        let mut ratios = Vec::with_capacity(limited_agg.pmf().len());
+        let mut probs = Vec::with_capacity(limited_agg.pmf().len());
         let mut total_p = 0.0;
-        for (k, &p) in limited_agg.pmf.iter().enumerate() {
+        for (k, &p) in limited_agg.pmf().iter().enumerate() {
             if !p.is_finite() || p < 0.0 {
                 return Err(PricingError::InvalidParameter(
                     "aggregate pmf probabilities must be finite and non-negative",
                 ));
             }
             if p > 0.0 {
-                ratios.push((k as f64) * limited_agg.step / unlimited_expected_loss);
+                ratios.push((k as f64) * limited_agg.step() / unlimited_expected_loss);
                 probs.push(p);
                 total_p += p;
             }

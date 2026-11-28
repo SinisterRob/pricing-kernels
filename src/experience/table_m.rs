@@ -226,27 +226,27 @@ impl TableMEngine {
     /// Panjer recursion, FFT convolution, or Cat ELT aggregation.
     ///
     /// Retains strictly positive probability masses, renormalizes them to sum to `1` (tail
-    /// truncation up to `1e-3` is tolerated), and normalizes each grid point `x_k = k * agg.step`
+    /// truncation up to `1e-3` is tolerated), and normalizes each grid point `x_k = k * agg.step()`
     /// into entry ratio `r_k = x_k / m`, where `m = sum_k x_k p_k / sum_k p_k` is the mean of the
-    /// **renormalized retained pmf** (not `agg.mean`, which is only checked to be finite and
+    /// **renormalized retained pmf** (not `agg.mean()`, which is only checked to be finite and
     /// positive), so that `E[r] = 1` and `phi(0) = 1` hold exactly.
     pub fn from_aggregate(agg: &AggregateLossDistribution) -> Result<Self, PricingError> {
-        if !agg.mean.is_finite() || !(agg.mean > 0.0) {
+        if !agg.mean().is_finite() || !(agg.mean() > 0.0) {
             return Err(PricingError::NonPositiveValue(
                 "aggregate distribution mean must be finite and positive to normalize entry ratios",
             ));
         }
-        let mut xs = Vec::with_capacity(agg.pmf.len());
-        let mut probs = Vec::with_capacity(agg.pmf.len());
+        let mut xs = Vec::with_capacity(agg.pmf().len());
+        let mut probs = Vec::with_capacity(agg.pmf().len());
         let mut total_p = 0.0;
-        for (k, &p) in agg.pmf.iter().enumerate() {
+        for (k, &p) in agg.pmf().iter().enumerate() {
             if !p.is_finite() || p < 0.0 {
                 return Err(PricingError::InvalidParameter(
                     "aggregate pmf probabilities must be finite and non-negative",
                 ));
             }
             if p > 0.0 {
-                xs.push((k as f64) * agg.step);
+                xs.push((k as f64) * agg.step());
                 probs.push(p);
                 total_p += p;
             }

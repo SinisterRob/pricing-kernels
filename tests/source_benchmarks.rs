@@ -971,10 +971,10 @@ fn test_panjer_vs_tilted_fft_and_compound_moments() {
         let exact_mean = en * ex;
         let exact_var = en * var_x + var_n * ex * ex;
 
-        assert!(close_rel(panjer.mean, exact_mean, 1e-8));
-        assert!(close_rel(panjer.variance, exact_var, 1e-7));
-        assert!(close_rel(fft.mean, panjer.mean, 1e-8));
-        assert!(close_rel(fft.variance, panjer.variance, 1e-7));
+        assert!(close_rel(panjer.mean(), exact_mean, 1e-8));
+        assert!(close_rel(panjer.variance(), exact_var, 1e-7));
+        assert!(close_rel(fft.mean(), panjer.mean(), 1e-8));
+        assert!(close_rel(fft.variance(), panjer.variance(), 1e-7));
         assert!(close_rel(
             fft.tvar(0.95).unwrap(),
             panjer.tvar(0.95).unwrap(),
@@ -998,10 +998,14 @@ fn test_panjer_vs_tilted_fft_and_compound_moments() {
     )
     .unwrap();
     let combined = convolve_independent_aggregates(&[&comp1, &comp2], 256).unwrap();
-    assert!(close_rel(combined.mean, comp1.mean + comp2.mean, 1e-8));
     assert!(close_rel(
-        combined.variance,
-        comp1.variance + comp2.variance,
+        combined.mean(),
+        comp1.mean() + comp2.mean(),
+        1e-8
+    ));
+    assert!(close_rel(
+        combined.variance(),
+        comp1.variance() + comp2.variance(),
         1e-7
     ));
 
@@ -1067,7 +1071,7 @@ fn test_catastrophe_elt_oep_aep_pml_and_layer_pricing() {
 
     // Compound-Poisson AEP via FFT: mean matches AAL and AEP(x) >= OEP(x)
     let aep = elt_aggregate_distribution(&entries, 250_000.0, 256, Some(0.01)).unwrap();
-    assert!(close_rel(aep.mean, summary.average_annual_loss, 1e-2));
+    assert!(close_rel(aep.mean(), summary.average_annual_loss, 1e-2));
     let oep_3m = elt_oep(&entries, 3_000_000.0).unwrap();
     let aep_3m = aep.exceedance_probability(3_000_000.0).unwrap();
     assert!(aep_3m >= oep_3m - 1e-3);
@@ -1824,7 +1828,7 @@ fn test_phase2_ergonomics_containers_and_bridges() {
     .unwrap();
     let tm = TableMEngine::from_aggregate(&agg).unwrap();
     assert!(close_rel(tm.charge_at(0.0), 1.0, 1e-3));
-    let tl = TableLEngine::from_limited_aggregate(&agg, agg.mean * 1.15).unwrap();
+    let tl = TableLEngine::from_limited_aggregate(&agg, agg.mean() * 1.15).unwrap();
     assert!(tl.loss_elimination_ratio > 0.10 && tl.loss_elimination_ratio < 0.20);
 
     // 4. GlmResult::relativities and to_rater

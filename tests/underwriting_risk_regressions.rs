@@ -92,11 +92,11 @@ fn panjer_poisson_hand_values() {
     )
     .expect("panjer");
     let e2 = (-2.0_f64).exp();
-    assert!((agg.pmf[0] - e2).abs() < 1e-15);
-    assert!((agg.pmf[1] - e2).abs() < 1e-15);
-    assert!((agg.pmf[2] - 1.1 * e2).abs() < 1e-15);
-    assert!((agg.pmf[3] - 7.0 / 6.0 * e2).abs() < 1e-15);
-    assert!(close_rel(agg.mean, 2.0 * 1.7, 1e-12));
+    assert!((agg.pmf()[0] - e2).abs() < 1e-15);
+    assert!((agg.pmf()[1] - e2).abs() < 1e-15);
+    assert!((agg.pmf()[2] - 1.1 * e2).abs() < 1e-15);
+    assert!((agg.pmf()[3] - 7.0 / 6.0 * e2).abs() < 1e-15);
+    assert!(close_rel(agg.mean(), 2.0 * 1.7, 1e-12));
 }
 
 #[test]
@@ -113,22 +113,22 @@ fn panjer_and_fft_match_brute_force_convolution_for_ab0_class() {
         let fft = fft_aggregate_loss(freq, &sev, 1.0, grid, Some(0.05)).expect("fft");
         for k in 0..grid {
             assert!(
-                (panjer.pmf[k] - reference[k]).abs() < 1e-14,
+                (panjer.pmf()[k] - reference[k]).abs() < 1e-14,
                 "{freq:?} panjer k={k}: {} vs {}",
-                panjer.pmf[k],
+                panjer.pmf()[k],
                 reference[k]
             );
             assert!(
-                (fft.pmf[k] - reference[k]).abs() < 1e-12,
+                (fft.pmf()[k] - reference[k]).abs() < 1e-12,
                 "{freq:?} fft k={k}: {} vs {}",
-                fft.pmf[k],
+                fft.pmf()[k],
                 reference[k]
             );
         }
         let ex: f64 = sev.iter().enumerate().map(|(k, &p)| k as f64 * p).sum();
         let exact_mean = freq.mean().expect("mean") * ex;
-        assert!(close_rel(panjer.mean, exact_mean, 1e-12));
-        assert!(close_rel(fft.mean, exact_mean, 1e-10));
+        assert!(close_rel(panjer.mean(), exact_mean, 1e-12));
+        assert!(close_rel(fft.mean(), exact_mean, 1e-10));
     }
 }
 
@@ -152,7 +152,7 @@ fn panjer_rejects_truncated_grid() {
 
     let ok = panjer_recursion(freq, &sev, 1.0, 512).expect("adequate grid");
     assert!((1.0 - ok.total_mass()).abs() < 1e-12);
-    assert!(close_rel(ok.mean, 100.0, 1e-10));
+    assert!(close_rel(ok.mean(), 100.0, 1e-10));
     let var = ok.var(0.99).expect("var");
     let tvar = ok.tvar(0.99).expect("tvar");
     assert!(tvar >= var, "tvar={tvar} < var={var}");
@@ -173,7 +173,7 @@ fn fft_rejects_aliasing_with_and_without_tilt() {
         "{tilted:?}"
     );
     let ok = fft_aggregate_loss(freq, &sev, 1.0, 512, Some(0.01)).expect("adequate fft grid");
-    assert!(close_rel(ok.mean, 100.0, 1e-9));
+    assert!(close_rel(ok.mean(), 100.0, 1e-9));
 }
 
 #[test]
@@ -219,8 +219,8 @@ fn convolution_rejects_wraparound_and_trims_trailing_zeros() {
         "{err:?}"
     );
     let ok = convolve_independent_aggregates(&[&mass_at_100, &mass_at_100], 256).expect("conv");
-    assert!(close_rel(ok.mean, 200.0, 1e-12));
-    assert!((ok.pmf[200] - 1.0).abs() < 1e-12);
+    assert!(close_rel(ok.mean(), 200.0, 1e-12));
+    assert!((ok.pmf()[200] - 1.0).abs() < 1e-12);
 
     // Trailing zeros do not count toward the required support.
     let mut padded = vec![0.0; 300];
@@ -228,8 +228,8 @@ fn convolution_rejects_wraparound_and_trims_trailing_zeros() {
     padded[3] = 0.5;
     let padded = AggregateLossDistribution::from_pmf(1.0, padded).expect("pmf");
     let small = convolve_independent_aggregates(&[&padded, &padded], 8).expect("conv");
-    assert!(close_rel(small.mean, 3.0, 1e-12));
-    assert!((small.pmf[6] - 0.25).abs() < 1e-14);
+    assert!(close_rel(small.mean(), 3.0, 1e-12));
+    assert!((small.pmf()[6] - 0.25).abs() < 1e-14);
 }
 
 // ---------------------------------------------------------------------------
@@ -289,9 +289,9 @@ fn elt_aggregate_mean_matches_aal_exactly() {
     let aal = elt_summary(&entries).expect("summary").average_annual_loss;
     let aep = elt_aggregate_distribution(&entries, 250_000.0, 256, Some(0.01)).expect("aep");
     assert!(
-        close_rel(aep.mean, aal, 1e-9),
+        close_rel(aep.mean(), aal, 1e-9),
         "aep mean={}, aal={aal}",
-        aep.mean
+        aep.mean()
     );
     assert!((1.0 - aep.total_mass()).abs() < 1e-9);
 }
@@ -479,16 +479,16 @@ fn tilted_fft_matches_panjer_across_standard_tilts() {
                 let fft = fft_aggregate_loss(freq, sev, 1.0, n, Some(theta))
                     .unwrap_or_else(|e| panic!("{freq:?} theta*N={theta_n}: {e}"));
                 let max_err = panjer
-                    .pmf
+                    .pmf()
                     .iter()
-                    .zip(&fft.pmf)
+                    .zip(fft.pmf())
                     .map(|(a, b)| (a - b).abs())
                     .fold(0.0_f64, f64::max);
                 assert!(
                     max_err <= 1e-10,
                     "{freq:?} theta*N={theta_n}: max |fft - panjer| = {max_err:e}"
                 );
-                assert!(fft.pmf.iter().all(|&p| p >= 0.0));
+                assert!(fft.pmf().iter().all(|&p| p >= 0.0));
             }
         }
     }
@@ -535,7 +535,7 @@ fn severity_input_mass_deficit_is_rejected_as_input_error() {
     let total = 1.0 - 1e-9;
     let ex = (0.5 - 1e-9 + 0.6 + 0.6) / total;
     assert!((agg.total_mass() - 1.0).abs() < 1e-13);
-    assert!(close_rel(agg.mean, 2.0 * ex, 1e-12));
+    assert!(close_rel(agg.mean(), 2.0 * ex, 1e-12));
 }
 
 #[test]

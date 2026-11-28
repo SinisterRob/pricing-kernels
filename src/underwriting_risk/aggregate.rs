@@ -179,21 +179,62 @@ impl FrequencyDistribution {
 }
 
 /// Discretized prospective aggregate underwriting loss distribution on `0, step, 2*step, ...`.
+///
+/// Fields are private so the derived moments can never go stale relative to the PMF;
+/// construct with [`AggregateLossDistribution::from_pmf`] (deserialization re-validates
+/// through the same constructor and recomputes the moments).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(try_from = "AggregateLossDistributionRepr")]
 pub struct AggregateLossDistribution {
-    /// Monetary grid spacing `h > 0`.
-    pub step: f64,
-    /// Discrete probability mass function `g_k = P(S = k * step)`.
-    pub pmf: Vec<f64>,
-    /// Mean `E[S]` computed from the discrete PMF.
-    pub mean: f64,
-    /// Variance `Var(S)` computed from the discrete PMF.
-    pub variance: f64,
-    /// Standard deviation `sqrt(Var(S))`.
-    pub std_dev: f64,
+    step: f64,
+    pmf: Vec<f64>,
+    mean: f64,
+    variance: f64,
+    std_dev: f64,
+}
+
+/// Serialized form of [`AggregateLossDistribution`]; derived moments, if present, are
+/// ignored and recomputed from `pmf`.
+#[derive(Deserialize)]
+struct AggregateLossDistributionRepr {
+    step: f64,
+    pmf: Vec<f64>,
+}
+
+impl TryFrom<AggregateLossDistributionRepr> for AggregateLossDistribution {
+    type Error = PricingError;
+
+    fn try_from(repr: AggregateLossDistributionRepr) -> Result<Self, Self::Error> {
+        Self::from_pmf(repr.step, repr.pmf)
+    }
 }
 
 impl AggregateLossDistribution {
+    /// Monetary grid spacing `h > 0`.
+    pub const fn step(&self) -> f64 {
+        self.step
+    }
+
+    /// Discrete probability mass function `g_k = P(S = k * step)`.
+    pub fn pmf(&self) -> &[f64] {
+        &self.pmf
+    }
+
+    /// Mean `E[S]` computed from the discrete PMF.
+    pub const fn mean(&self) -> f64 {
+        self.mean
+    }
+
+    /// Variance `Var(S)` computed from the discrete PMF.
+    pub const fn variance(&self) -> f64 {
+        self.variance
+    }
+
+    /// Standard deviation `sqrt(Var(S))`.
+    pub const fn std_dev(&self) -> f64 {
+        self.std_dev
+    }
+
     /// Construct from a validated grid spacing `step > 0` and probability mass vector.
     pub fn from_pmf(step: f64, pmf: Vec<f64>) -> Result<Self, PricingError> {
         if !step.is_finite() || !(step > 0.0) {

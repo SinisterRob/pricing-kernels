@@ -185,10 +185,10 @@ pub fn distortion_price_aggregate(
     dist: &AggregateLossDistribution,
     distortion: DistortionOperator,
 ) -> Result<DistortionPricingResult, PricingError> {
-    let losses: Vec<f64> = (0..dist.pmf.len())
-        .map(|k| (k as f64) * dist.step)
+    let losses: Vec<f64> = (0..dist.pmf().len())
+        .map(|k| (k as f64) * dist.step())
         .collect();
-    distortion_price_discrete(&losses, &dist.pmf, distortion)
+    distortion_price_discrete(&losses, dist.pmf(), distortion)
 }
 
 /// Result of Kreps (1990) marginal surplus risk load calculation.
