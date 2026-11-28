@@ -10,15 +10,17 @@
 //!
 //! Uses exact closed-form formulas for proportional ALAE (`A = k X`), adaptive
 //! 15-point Gauss–Kronrod quadrature (`G7-K15`) for general conditional ALAE
-//! expectations `m(x) = E[A | X = x]`, and deterministic 32-point 2D
-//! Gauss–Legendre quadrature for bivariate Lognormal ALAE-included severity.
+//! expectations `m(x) = E[A | X = x]`, and — for ALAE-included limits with a
+//! random conditional ALAE (`PowerLawLognormal`, `BivariateLognormal`) — the
+//! exact 1-D reduction
+//! `E[(X + A) ∧ L] = E[X ∧ L] + ∫_0^L E[A ∧ (L - x) | X = x] f_X(x) dx`
+//! with the inner conditional lognormal limited expected value in closed form.
 
 use crate::error::PricingError;
 use crate::layers::SeverityDistribution;
 use crate::special::normal_cdf_exact;
 use crate::validate::{require_finite, require_non_negative, require_positive};
 use serde::{Deserialize, Serialize};
-use std::f64::consts::SQRT_2;
 
 // ===========================================================================
 // Public Types
@@ -43,14 +45,35 @@ pub enum AlaeDependenceModel {
         /// Constant ALAE-to-loss ratio `k >= 0`.
         k: f64,
     },
-    /// Power-law conditional expectation: `E[A | X = x] = c * x^gamma` (`c >= 0, gamma ∈ (0, 1]`).
+    /// Deterministic power-law ALAE: `A = c * X^gamma` exactly (`c >= 0, gamma ∈ (0, 1]`).
+    ///
+    /// `ProRata` and `InAddition` are linear in `A`, so their results hold for *any*
+    /// conditional ALAE distribution with mean `E[A | X = x] = c x^gamma`. `Included`
+    /// (`E[(X + A) ∧ L]`) is concave in `A`; treating `A` as deterministic overstates it
+    /// by Jensen's inequality when `A | X` is dispersed — use
+    /// [`AlaeDependenceModel::PowerLawLognormal`] in that case.
     PowerLaw {
         /// Scale coefficient `c >= 0`.
         c: f64,
         /// Power exponent `gamma ∈ (0, 1]`.
         gamma: f64,
     },
+    /// Power-law conditional mean with Lognormal conditional dispersion:
+    /// `A | X = x ~ Lognormal` with `E[A | X = x] = c * x^gamma` and coefficient of
+    /// variation `cv >= 0` (`cv = 0` is [`AlaeDependenceModel::PowerLaw`]).
+    PowerLawLognormal {
+        /// Scale coefficient `c >= 0`.
+        c: f64,
+        /// Power exponent `gamma ∈ (0, 1]`.
+        gamma: f64,
+        /// Conditional coefficient of variation `CV[A | X = x] >= 0`.
+        cv: f64,
+    },
     /// Joint bivariate Lognormal `(ln X, ln A) ~ N((mu_x, mu_a), Σ)` with correlation `rho ∈ (-1, 1)`.
+    ///
+    /// The model owns the indemnity marginal: the `severity` argument of the ALAE kernels
+    /// must be `SeverityDistribution::Lognormal { mu: mu_x, sigma: sigma_x }`
+    /// (see [`AlaeDependenceModel::indemnity_marginal`]); anything else is rejected.
     BivariateLognormal {
         /// Log-indemnity mean `mu_x`.
         mu_x: f64,
@@ -169,43 +192,41 @@ pub fn gauss_kronrod_integrate_semi_infinite<F: Fn(f64) -> f64>(f: F, lower: f64
 }
 
 // ===========================================================================
-// 32-Point Gauss–Legendre Nodes/Weights on [-1, 1] for 2D Bivariate Integration
+// Conditional Lognormal Limited Expected Value & 1-D ALAE-Included Reduction
 // ===========================================================================
 
-fn gauss_legendre_32() -> &'static ([f64; 32], [f64; 32]) {
-    static GL32: std::sync::OnceLock<([f64; 32], [f64; 32])> = std::sync::OnceLock::new();
-    GL32.get_or_init(|| {
-        const N: usize = 32;
-        let mut nodes = [0.0; N];
-        let mut weights = [0.0; N];
-        let m = N / 2;
-        for i in 0..m {
-            let mut z = (std::f64::consts::PI * (i as f64 + 0.75) / (N as f64 + 0.5)).cos();
-            let mut dp = 0.0;
-            for _ in 0..50 {
-                let mut p0 = 1.0;
-                let mut p1 = z;
-                for k in 2..=N {
-                    let kf = k as f64;
-                    let pk = ((2.0 * kf - 1.0) * z * p1 - (kf - 1.0) * p0) / kf;
-                    p0 = p1;
-                    p1 = pk;
-                }
-                dp = (N as f64) * (z * p1 - p0) / (z * z - 1.0);
-                let dz = p1 / dp;
-                z -= dz;
-                if dz.abs() < 1e-15 {
-                    break;
-                }
-            }
-            nodes[i] = -z;
-            nodes[N - 1 - i] = z;
-            let w = 2.0 / ((1.0 - z * z) * dp * dp);
-            weights[i] = w;
-            weights[N - 1 - i] = w;
-        }
-        (nodes, weights)
-    })
+/// Relative tolerance target of the 1-D ALAE-included quadratures.
+const INCLUDED_QUAD_REL_TOL: f64 = 1e-12;
+/// Maximum bisection depth of the adaptive ALAE-included quadratures.
+const INCLUDED_QUAD_MAX_DEPTH: usize = 30;
+/// Standard-normal half-width beyond which the integrand mass is below `1e-31`.
+const STD_NORMAL_TAIL_Z: f64 = 12.0;
+/// Relative tolerance for matching `severity` to the bivariate-Lognormal marginal.
+const MARGINAL_MATCH_TOL: f64 = 1e-12;
+
+/// Lognormal limited expected value `E[A ∧ m]` for `ln A ~ N(mu, sigma^2)`.
+fn lognormal_lev(m: f64, mu: f64, sigma: f64) -> f64 {
+    if !(m > 0.0) {
+        return 0.0;
+    }
+    let z = (m.ln() - mu) / sigma;
+    let mean = (mu + 0.5 * sigma * sigma).exp();
+    mean * normal_cdf_exact(z - sigma) + m * normal_cdf_exact(-z)
+}
+
+/// Lognormal `(mu, sigma)` with mean `mean > 0` and coefficient of variation `cv > 0`.
+fn lognormal_from_mean_cv(mean: f64, cv: f64) -> (f64, f64) {
+    let s2 = (cv * cv).ln_1p();
+    (mean.ln() - 0.5 * s2, s2.sqrt())
+}
+
+/// Adaptive Gauss–Kronrod with an absolute tolerance `tol_abs` (relative to the caller's
+/// magnitude scale) and an explicit depth cap.
+fn integrate_to_tol<F: Fn(f64) -> f64>(f: F, a: f64, b: f64, tol_abs: f64) -> f64 {
+    if !(b > a) {
+        return 0.0;
+    }
+    gk15_adaptive(&f, a, b, tol_abs, INCLUDED_QUAD_MAX_DEPTH)
 }
 
 // ===========================================================================
@@ -217,14 +238,10 @@ fn validate_dependence(dep: AlaeDependenceModel) -> Result<(), PricingError> {
         AlaeDependenceModel::Proportional { k } => {
             require_non_negative(k, "proportional ALAE ratio k must be >= 0")
         }
-        AlaeDependenceModel::PowerLaw { c, gamma } => {
-            require_non_negative(c, "power-law scale c must be >= 0")?;
-            if !(gamma.is_finite() && gamma > 0.0 && gamma <= 1.0) {
-                return Err(PricingError::InvalidParameter(
-                    "power-law exponent gamma must lie in (0, 1]",
-                ));
-            }
-            Ok(())
+        AlaeDependenceModel::PowerLaw { c, gamma } => validate_power_law(c, gamma),
+        AlaeDependenceModel::PowerLawLognormal { c, gamma, cv } => {
+            validate_power_law(c, gamma)?;
+            require_non_negative(cv, "power-law conditional CV must be >= 0")
         }
         AlaeDependenceModel::BivariateLognormal {
             mu_x,
@@ -244,6 +261,53 @@ fn validate_dependence(dep: AlaeDependenceModel) -> Result<(), PricingError> {
             }
             Ok(())
         }
+    }
+}
+
+fn validate_power_law(c: f64, gamma: f64) -> Result<(), PricingError> {
+    require_non_negative(c, "power-law scale c must be >= 0")?;
+    if !(gamma.is_finite() && gamma > 0.0 && gamma <= 1.0) {
+        return Err(PricingError::InvalidParameter(
+            "power-law exponent gamma must lie in (0, 1]",
+        ));
+    }
+    Ok(())
+}
+
+impl AlaeDependenceModel {
+    /// Indemnity marginal owned by the dependence model, if any
+    /// (`Some(Lognormal { mu_x, sigma_x })` for `BivariateLognormal`, else `None`).
+    pub const fn indemnity_marginal(&self) -> Option<SeverityDistribution> {
+        match *self {
+            Self::BivariateLognormal { mu_x, sigma_x, .. } => {
+                Some(SeverityDistribution::Lognormal {
+                    mu: mu_x,
+                    sigma: sigma_x,
+                })
+            }
+            _ => None,
+        }
+    }
+}
+
+fn require_matching_marginal(
+    severity: &SeverityDistribution,
+    mu_x: f64,
+    sigma_x: f64,
+) -> Result<(), PricingError> {
+    let matches = match *severity {
+        SeverityDistribution::Lognormal { mu, sigma } => {
+            (mu - mu_x).abs() <= MARGINAL_MATCH_TOL * mu_x.abs().max(1.0)
+                && (sigma - sigma_x).abs() <= MARGINAL_MATCH_TOL * sigma_x
+        }
+        _ => false,
+    };
+    if matches {
+        Ok(())
+    } else {
+        Err(PricingError::InvalidParameter(
+            "BivariateLognormal owns the indemnity marginal: severity must equal Lognormal { mu: mu_x, sigma: sigma_x }",
+        ))
     }
 }
 
@@ -274,8 +338,9 @@ fn severity_pdf(severity: &SeverityDistribution, x: f64) -> f64 {
 /// ground-up indemnity distribution `severity`, ALAE dependence model `dependence`,
 /// and policy treatment `treatment`.
 ///
-/// For `AlaeDependenceModel::BivariateLognormal`, the indemnity marginal is
-/// `Lognormal(mu_x, sigma_x)` directly (ignoring `severity`).
+/// For `AlaeDependenceModel::BivariateLognormal`, `severity` must equal the model's
+/// marginal `Lognormal(mu_x, sigma_x)` ([`AlaeDependenceModel::indemnity_marginal`]);
+/// a conflicting severity returns [`PricingError::InvalidParameter`].
 pub fn alae_loss_severity(
     severity: &SeverityDistribution,
     limit: f64,
@@ -304,7 +369,12 @@ pub fn alae_loss_severity(
                 }
             }
         }
-        AlaeDependenceModel::PowerLaw { c, gamma } => {
+        AlaeDependenceModel::PowerLaw { c, gamma }
+        | AlaeDependenceModel::PowerLawLognormal { c, gamma, .. } => {
+            let cv = match dependence {
+                AlaeDependenceModel::PowerLawLognormal { cv, .. } => cv,
+                _ => 0.0,
+            };
             let lev_l = severity.limited_expected_value(limit)?;
             let m_fn = |x: f64| c * x.powf(gamma);
             match treatment {
@@ -347,6 +417,24 @@ pub fn alae_loss_severity(
                         0.0,
                     );
                     Ok(lev_l + e_a)
+                }
+                AlaePolicyTreatment::Included if cv > 0.0 && c > 0.0 => {
+                    // E[(X + A) ∧ L] = E[X ∧ L] + ∫_0^L E[A ∧ (L - x) | x] f(x) dx with
+                    // A | x Lognormal(mean c x^gamma, CV cv) in closed form.
+                    let alae_part = gauss_kronrod_integrate(
+                        |x| {
+                            let pdf = severity_pdf(severity, x);
+                            let mean_a = m_fn(x);
+                            if !(x > 0.0) || !pdf.is_finite() || !(mean_a > 0.0) {
+                                return 0.0;
+                            }
+                            let (mu_c, sigma_c) = lognormal_from_mean_cv(mean_a, cv);
+                            lognormal_lev(limit - x, mu_c, sigma_c) * pdf
+                        },
+                        0.0,
+                        limit,
+                    );
+                    Ok(lev_l + alae_part)
                 }
                 AlaePolicyTreatment::Included => {
                     // Analytic kink-split: solve x* + c * (x*)^gamma = limit (monotone
@@ -394,11 +482,8 @@ pub fn alae_loss_severity(
             sigma_a,
             rho,
         } => {
-            let ln_x = SeverityDistribution::Lognormal {
-                mu: mu_x,
-                sigma: sigma_x,
-            };
-            let lev_l = ln_x.limited_expected_value(limit)?;
+            require_matching_marginal(severity, mu_x, sigma_x)?;
+            let lev_l = severity.limited_expected_value(limit)?;
             let e_a = (mu_a + 0.5 * sigma_a * sigma_a).exp();
 
             match treatment {
@@ -421,28 +506,25 @@ pub fn alae_loss_severity(
                     Ok(lev_l + below + above)
                 }
                 AlaePolicyTreatment::Included => {
-                    // Exact 2D 32-point Gauss–Legendre quadrature over standard normal
-                    // (z1, z2) ∈ [-7.5, 7.5]^2 for E[(exp(mu_x + sigma_x z1) + exp(mu_a + sigma_a (rho z1 + sqrt(1-rho^2) z2))) ∧ L].
-                    let (nodes, weights) = gauss_legendre_32();
-                    let bound = 7.5_f64;
-                    let cond_sd = (1.0 - rho * rho).sqrt();
-                    let inv_sqrt_2pi = 1.0 / (SQRT_2 * std::f64::consts::PI.sqrt());
-
-                    let mut total = 0.0;
-                    for i in 0..32 {
-                        let z1 = bound * nodes[i];
-                        let w1 = bound * weights[i] * inv_sqrt_2pi * (-0.5 * z1 * z1).exp();
-                        let x = (mu_x + sigma_x * z1).exp();
-                        let mut inner = 0.0;
-                        for j in 0..32 {
-                            let z2 = bound * nodes[j];
-                            let w2 = bound * weights[j] * inv_sqrt_2pi * (-0.5 * z2 * z2).exp();
-                            let a = (mu_a + sigma_a * (rho * z1 + cond_sd * z2)).exp();
-                            inner += w2 * (x + a).min(limit);
-                        }
-                        total += w1 * inner;
-                    }
-                    Ok(total)
+                    // Exact 1-D reduction in z = (ln x - mu_x) / sigma_x:
+                    // E[(X + A) ∧ L] = E[X ∧ L] + ∫_{-∞}^{z_L} E[A ∧ (L - x(z)) | z] φ(z) dz,
+                    // ln A | z ~ N(mu_a + rho sigma_a z, sigma_a^2 (1 - rho^2)).
+                    // The integrand is smooth on (-∞, z_L) (the kink x = L is the endpoint).
+                    let cond_sd = sigma_a * (1.0 - rho * rho).sqrt();
+                    let z_l = (limit.ln() - mu_x) / sigma_x;
+                    // E[A | z] φ(z) = E[A] φ(z - rho sigma_a): truncate below that centre.
+                    let z_lo = z_l.min(rho * sigma_a) - STD_NORMAL_TAIL_Z;
+                    let inv_sqrt_tau = 1.0 / std::f64::consts::TAU.sqrt();
+                    let integrand = |z: f64| -> f64 {
+                        let x = sigma_x.mul_add(z, mu_x).exp();
+                        let mu_c = rho.mul_add(sigma_a * z, mu_a);
+                        let phi = inv_sqrt_tau * (-0.5 * z * z).exp();
+                        lognormal_lev(limit - x, mu_c, cond_sd) * phi
+                    };
+                    let scale = e_a.min(limit);
+                    let alae_part =
+                        integrate_to_tol(integrand, z_lo, z_l, INCLUDED_QUAD_REL_TOL * scale);
+                    Ok(lev_l + alae_part)
                 }
             }
         }
@@ -557,6 +639,11 @@ mod tests {
             sigma_a: 0.8,
             rho: 0.65,
         };
+        let sev_biv = dep_biv.indemnity_marginal().expect("bivariate marginal");
+        assert!(
+            alae_loss_severity(&sev, 100_000.0, dep_biv, AlaePolicyTreatment::Included).is_err(),
+            "conflicting severity must be rejected"
+        );
         let l1 = 100_000.0;
         let l2 = 200_000.0;
         let l3 = 300_000.0;
@@ -565,9 +652,9 @@ mod tests {
             AlaePolicyTreatment::ProRata,
             AlaePolicyTreatment::InAddition,
         ] {
-            let s1 = alae_loss_severity(&sev, l1, dep_biv, tr).expect("s1");
-            let s2 = alae_loss_severity(&sev, l2, dep_biv, tr).expect("s2");
-            let s3 = alae_loss_severity(&sev, l3, dep_biv, tr).expect("s3");
+            let s1 = alae_loss_severity(&sev_biv, l1, dep_biv, tr).expect("s1");
+            let s2 = alae_loss_severity(&sev_biv, l2, dep_biv, tr).expect("s2");
+            let s3 = alae_loss_severity(&sev_biv, l3, dep_biv, tr).expect("s3");
             assert!(s1 < s2 && s2 < s3);
             // Concavity: diminishing marginal cost.
             assert!((s3 - s2) <= (s2 - s1) + 1e-6);

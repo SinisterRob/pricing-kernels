@@ -47,7 +47,9 @@ pub use mbbefd::{MbbefdCurve, SwissReCurve};
 pub use reinsurance::{
     BlendCredibilityRule, BurningCostResult, BurningCostYearResult, ExposureExperienceBlendResult,
     HistoricalTreatyClaim, HistoricalTreatyYear, ProportionalTreatyResult, QuotaShareSpec,
-    ReinstatementBasis, ReinstatementPricingResult, SlidingScaleSpec, SurplusShareSpec,
-    TreatyExperience, blend_exposure_and_experience, burning_cost_xl,
-    expected_loss_corridor_retention, expected_profit_commission, price_reinstatements,
+    ReinstatementBasis, ReinstatementPricingResult, ReinstatementSliceExpectations,
+    SlidingScaleSpec, SurplusShareSpec, TreatyExperience, blend_exposure_and_experience,
+    burning_cost_xl, compound_poisson_reinstatement_slices, expected_loss_corridor_retention,
+    expected_profit_commission, price_reinstatements, price_reinstatements_compound_poisson,
+    price_reinstatements_time_weighted,
 };
