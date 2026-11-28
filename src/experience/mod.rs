@@ -33,9 +33,8 @@ pub use iso_erp::{
 };
 pub use ncci_erp::{
     ERA_MEDICAL_ONLY_RATABLE_FACTOR, ExperienceClaim, NCCI_MULTIPLE_CLAIM_LIMIT_MULTIPLIER,
-    NcciAccidentLimitation, NcciErpResult, NcciErpSpec, NcciErpSpecification,
-    calculate_ncci_experience_mod, calculate_ncci_experience_mod_by_accident,
-    calculate_off_balance,
+    NcciAccidentLimitation, NcciErpResult, NcciErpSpec, calculate_ncci_experience_mod,
+    calculate_ncci_experience_mod_by_accident, calculate_off_balance,
 };
 pub use retrospective::{RetroPlanResult, RetroPlanSpec, solve_balanced_retro_plan};
 pub use table_l::{TableLEngine, TableLRow, solve_balanced_retro_plan_table_l};

@@ -313,15 +313,14 @@ impl TableLEngine {
 pub fn solve_balanced_retro_plan_table_l(
     spec: &RetroPlanSpec,
     table_l: &TableLEngine,
-    max_iter: usize,
-    tol: f64,
+    options: &SolverOptions,
 ) -> Result<RetroPlanResult, PricingError> {
     solve_balanced_retro_plan_with(
         spec,
         table_l.loss_elimination_ratio,
         |r| table_l.charge_at(r),
         |r| table_l.savings_at(r),
-        SolverOptions { max_iter, tol },
+        *options,
         "Table L retro plan basic premium solver failed to converge",
         "infeasible Table L retro plan: max_retro_ratio / tax_multiplier is below balanced basic premium",
     )

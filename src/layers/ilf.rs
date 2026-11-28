@@ -564,7 +564,7 @@ impl SeverityDistribution {
     /// Expected loss cost in a 100%-participation excess layer `limit xs attachment`:
     /// `E[X ∧ (attachment + limit)] - E[X ∧ attachment]`.
     pub fn layer_expected_loss(&self, attachment: f64, limit: f64) -> Result<f64, PricingError> {
-        CommercialLayer::new(attachment, limit, 1.0)?.layer_expected_loss(self)
+        CommercialLayer::try_new(attachment, limit, 1.0)?.layer_expected_loss(self)
     }
 }
 
@@ -581,7 +581,7 @@ pub struct CommercialLayer {
 
 impl CommercialLayer {
     /// Construct a commercial excess layer with given attachment, limit, and participation share.
-    pub fn new(attachment: f64, limit: f64, participation: f64) -> Result<Self, PricingError> {
+    pub fn try_new(attachment: f64, limit: f64, participation: f64) -> Result<Self, PricingError> {
         if !attachment.is_finite()
             || !limit.is_finite()
             || !participation.is_finite()
@@ -606,7 +606,7 @@ impl CommercialLayer {
 
     /// Validate layer parameters (`attachment >= 0`, `limit > 0`, `participation in (0, 1]`).
     pub fn validate(&self) -> Result<(), PricingError> {
-        Self::new(self.attachment, self.limit, self.participation).map(|_| ())
+        Self::try_new(self.attachment, self.limit, self.participation).map(|_| ())
     }
 
     /// Evaluates expected loss cost in this specific layer:

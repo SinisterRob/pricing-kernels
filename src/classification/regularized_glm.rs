@@ -36,8 +36,6 @@ const ZIP_PROB_EPS: f64 = 1e-9;
 const ZIP_EM_TOL: f64 = 1e-6;
 /// GLMM joint-mode Newton stop: Newton decrement `½ Δθᵀ∇h` (nats).
 const GLMM_NEWTON_DECREMENT_TOL: f64 = 1e-10;
-/// GLMM joint-mode Newton stop: `max_k |Δθ_k| / (1 + |θ_k|)`.
-const GLMM_PARAM_RTOL: f64 = 1e-8;
 /// Maximum step-halvings per GLMM joint-mode Newton iteration.
 const GLMM_MAX_STEP_HALVINGS: usize = 30;
 /// Relative round-off slack accepted when testing ascent of the GLMM penalized log-likelihood.
@@ -1226,6 +1224,7 @@ impl GlmmData<'_> {
         tau2: f64,
         start: &JointMode,
         max_iter: usize,
+        param_rtol: f64,
     ) -> Result<JointMode, PricingError> {
         let q = self.p + 1;
         let g_n = self.n_groups;
@@ -1339,7 +1338,7 @@ impl GlmmData<'_> {
             }
             beta.copy_from_slice(&trial_beta);
             u.copy_from_slice(&trial_u);
-            if 0.5 * decrement <= GLMM_NEWTON_DECREMENT_TOL && max_rel_step <= GLMM_PARAM_RTOL {
+            if 0.5 * decrement <= GLMM_NEWTON_DECREMENT_TOL && max_rel_step <= param_rtol {
                 converged = true;
                 break;
             }
@@ -1387,7 +1386,9 @@ impl GlmmData<'_> {
 /// An optimum at the upper bound sets `tau_squared_at_upper_bound` and `converged = false`
 /// instead of being silently clamped.
 ///
-/// * `max_iter` — maximum penalized-Newton iterations per joint-mode solve (`>= 1`).
+/// * `options.max_iter` — maximum penalized-Newton iterations per joint-mode solve (`>= 1`).
+/// * `options.tol` — relative parameter-step tolerance of each joint-mode solve (`> 0`);
+///   the solve also requires the Newton decrement to fall below `1e-10`.
 ///
 /// The columns of `x` together with the intercept must have full column rank
 /// (otherwise [`PricingError::SingularMatrix`]).
@@ -1401,15 +1402,20 @@ pub fn fit_random_intercept_glmm(
     n_groups: usize,
     weights: Option<&[f64]>,
     offsets: Option<&[f64]>,
-    max_iter: usize,
+    options: &crate::error::SolverOptions,
 ) -> Result<RandomInterceptGlmmResult, PricingError> {
     if n == 0 || p == 0 || n_groups == 0 {
         return Err(PricingError::EmptyInput(
             "n, p, and n_groups must all be >= 1",
         ));
     }
-    if max_iter == 0 {
+    if options.max_iter == 0 {
         return Err(PricingError::InvalidParameter("max_iter must be >= 1"));
+    }
+    if !options.tol.is_finite() || !(options.tol > 0.0) {
+        return Err(PricingError::InvalidParameter(
+            "tolerance must be finite and positive",
+        ));
     }
     if n.checked_mul(p) != Some(x.len()) || y.len() != n || group_ids.len() != n {
         return Err(PricingError::DimensionMismatch(
@@ -1470,7 +1476,7 @@ pub fn fit_random_intercept_glmm(
     let mut all_converged = true;
     let mut eval = |s: f64, from: &JointMode| -> Result<JointMode, PricingError> {
         evaluations += 1;
-        let m = data.joint_mode(s.exp(), from, max_iter)?;
+        let m = data.joint_mode(s.exp(), from, options.max_iter, options.tol)?;
         all_converged &= m.converged;
         Ok(m)
     };
@@ -1718,8 +1724,18 @@ mod tests {
         assert!(zip.fitted_means.iter().all(|v| v.is_finite() && *v > 0.0));
 
         let groups = [0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2];
-        let glmm =
-            fit_random_intercept_glmm(&x, 12, 1, &y, &groups, 3, None, None, 15).expect("glmm");
+        let glmm = fit_random_intercept_glmm(
+            &x,
+            12,
+            1,
+            &y,
+            &groups,
+            3,
+            None,
+            None,
+            &crate::error::SolverOptions::default().with_max_iter(15),
+        )
+        .expect("glmm");
         assert!(glmm.tau_squared >= 1e-8);
         assert!(
             glmm.group_credibilities

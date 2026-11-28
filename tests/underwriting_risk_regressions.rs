@@ -580,11 +580,11 @@ fn cat_layer_expected_loss_uses_exact_beta_lev() {
     };
     // 10M xs 0 covers the full support: E[X ^ M] - E[X ^ 0] = E[X] exactly.
     let full =
-        pricing_kernels::layers::CommercialLayer::new(0.0, 10_000_000.0, 1.0).expect("layer");
+        pricing_kernels::layers::CommercialLayer::try_new(0.0, 10_000_000.0, 1.0).expect("layer");
     let el = elt_occurrence_layer_expected_loss(&[entry], &full).expect("el");
     assert!((el - 5_030_000.0).abs() <= 1e-9 * 5_030_000.0, "el={el}");
     // 2M xs 4M: E[X ^ 6M] - E[X ^ 4M] = 1.03M up to Gaussian tails beyond ~1000 SD (< 1e-300).
-    let mid = pricing_kernels::layers::CommercialLayer::new(4_000_000.0, 2_000_000.0, 1.0)
+    let mid = pricing_kernels::layers::CommercialLayer::try_new(4_000_000.0, 2_000_000.0, 1.0)
         .expect("layer");
     let el = elt_occurrence_layer_expected_loss(&[entry], &mid).expect("el");
     assert!((el - 1_030_000.0).abs() <= 1e-9 * 1_030_000.0, "el={el}");

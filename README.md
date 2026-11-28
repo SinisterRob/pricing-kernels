@@ -22,12 +22,14 @@
   <a href="#quick-start">Quick Start</a> &nbsp;·&nbsp;
   <a href="#building-and-testing">Build &amp; Test</a> &nbsp;·&nbsp;
   <a href="https://github.com/SinisterRob/pricing-kernels/blob/main/docs/SOURCES.md">Literature</a> &nbsp;·&nbsp;
-  <a href="https://github.com/SinisterRob/reserving-kernels">reserving-kernels</a>
+  <a href="https://github.com/SinisterRob/reserving-kernels">reserving-kernels</a> &nbsp;·&nbsp;
+  <a href="https://github.com/SinisterRob/reinsurance-kernels">reinsurance-kernels</a> &nbsp;·&nbsp;
+  <a href="https://github.com/SinisterRob/esg-kernels">esg-kernels</a>
 </p>
 
 ---
 
-`pricing-kernels` covers prospective commercial-lines ratemaking (classification, credibility, experience rating, ILFs, retrospective plans, large deductibles), treaty reinsurance pricing (MBBEFD exposure curves, burning cost, reinstatements, sliding-scale & profit commissions), and the **underwriting risk** module of capital modeling. Every method is implemented from peer-reviewed actuarial literature ([`docs/SOURCES.md`](https://github.com/SinisterRob/pricing-kernels/blob/main/docs/SOURCES.md)) and verified against published benchmark problems ([`tests/source_benchmarks.rs`](https://github.com/SinisterRob/pricing-kernels/blob/main/tests/source_benchmarks.rs)). Standalone sister crate to [`reserving-kernels`](https://github.com/SinisterRob/reserving-kernels) (retrospective loss development and reserve risk).
+`pricing-kernels` covers prospective commercial-lines ratemaking (classification, credibility, experience rating, ILFs, retrospective plans, large deductibles), treaty reinsurance pricing (MBBEFD exposure curves, burning cost, reinstatements, sliding-scale & profit commissions), and the **underwriting risk** module of capital modeling. Every method is implemented from peer-reviewed actuarial literature ([`docs/SOURCES.md`](https://github.com/SinisterRob/pricing-kernels/blob/main/docs/SOURCES.md)) and verified against published benchmark problems ([`tests/source_benchmarks.rs`](https://github.com/SinisterRob/pricing-kernels/blob/main/tests/source_benchmarks.rs)). Part of the standalone actuarial kernel family alongside [`reserving-kernels`](https://github.com/SinisterRob/reserving-kernels) (loss development and reserve risk), [`reinsurance-kernels`](https://github.com/SinisterRob/reinsurance-kernels) (treaty structuring and ceded risk), and [`esg-kernels`](https://github.com/SinisterRob/esg-kernels) (economic scenario generation).
 
 ## Implemented Modules
 
@@ -100,7 +102,7 @@ fn main() -> Result<(), PricingError> {
     let exposures = vec![1000.0, 800.0, 500.0, 400.0];
     let losses = vec![100.0, 120.0, 150.0, 180.0];
 
-    let result = bailey_simon_multiplicative(2, 2, &exposures, &losses, 100, 1e-6)?;
+    let result = bailey_simon_multiplicative(2, 2, &exposures, &losses, &SolverOptions::default())?;
     println!("Base Rate: {:.2}", result.base_rate);
     println!("Row Relativities: {:?}", result.relativities_dim1);
     println!("Column Relativities: {:?}", result.relativities_dim2);
@@ -114,7 +116,7 @@ fn main() -> Result<(), PricingError> {
 use pricing_kernels::prelude::*;
 
 fn main() -> Result<(), PricingError> {
-    let spec = NcciErpSpecification {
+    let spec = NcciErpSpec {
         split_point: 18_500.0,
         expected_losses: 120_000.0,
         d_ratio: 0.38,
@@ -148,7 +150,7 @@ fn main() -> Result<(), PricingError> {
     println!("$1M ILF: {:.4}", ilf_1m);
 
     // Price a commercial excess layer: $4M excess of $1M
-    let layer = CommercialLayer::new(1_000_000.0, 4_000_000.0, 1.0)?;
+    let layer = CommercialLayer::try_new(1_000_000.0, 4_000_000.0, 1.0)?;
     let layer_cost = layer.layer_expected_loss(&lomax)?;
     println!("Layer Expected Loss: ${:.2}", layer_cost);
     Ok(())
@@ -175,7 +177,7 @@ fn main() -> Result<(), PricingError> {
         expense_ratio: 0.18,
     };
 
-    let plan = solve_balanced_retro_plan(&spec, &table_m, 100, 1e-5)?;
+    let plan = solve_balanced_retro_plan(&spec, &table_m, &SolverOptions::default())?;
     println!("Basic Premium Factor: {:.4}", plan.basic_premium_factor);
     println!("Basic Premium Dollars: ${:.2}", plan.basic_premium_dollars);
     Ok(())

@@ -29,7 +29,7 @@ pub use diagnostics::{
 };
 pub use irls_glm::{
     DesignMatrix, GlmFamily, GlmFit, GlmOptions, GlmResult, RelativityRow, TweediePowerSelection,
-    fit_glm_irls, fit_glm_irls_with_options, predict_glm, select_tweedie_power,
+    fit_glm_irls, predict_glm, select_tweedie_power,
 };
 pub use minimum_bias::{
     MinimumBiasResult, RatingTable, bailey_simon_chi_squared, bailey_simon_multiplicative,

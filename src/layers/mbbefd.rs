@@ -86,7 +86,7 @@ impl MbbefdCurve {
     /// Construct an MBBEFD exposure curve directly from `(b, g)` parameters.
     ///
     /// Requires finite `b >= 0.0` and `g >= 1.0`.
-    pub fn new(b: f64, g: f64) -> Result<Self, PricingError> {
+    pub fn try_new(b: f64, g: f64) -> Result<Self, PricingError> {
         if !b.is_finite() || !g.is_finite() {
             return Err(PricingError::InvalidParameter(
                 "MBBEFD parameters b and g must be finite",
@@ -123,7 +123,7 @@ impl MbbefdCurve {
             ));
         }
         let (b, g) = Self::swiss_re_bg(c);
-        Self::new(b, g)
+        Self::try_new(b, g)
     }
 
     /// Construct one of the canonical Swiss Re preset curves (`Y1`–`Y4`, `Lloyds`).
@@ -151,7 +151,7 @@ impl MbbefdCurve {
 
     /// Validate curve parameters.
     pub fn validate(&self) -> Result<(), PricingError> {
-        Self::new(self.b, self.g).map(|_| ())
+        Self::try_new(self.b, self.g).map(|_| ())
     }
 
     /// Evaluate the exposure curve `G(d) = E[min(X, d)] / E[X]` for normalized

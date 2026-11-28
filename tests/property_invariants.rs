@@ -398,19 +398,34 @@ fn design_matrix_regularized_glm_ergonomics_and_adversarial_guards() {
             &[],
             &[],
             &[],
-            10,
-            1e-6
+            &GlmOptions::default().with_max_iter(10).with_tol(1e-6),
         )
         .is_err()
     );
-    assert!(bailey_simon_multiplicative(usize::MAX, 2, &[], &[], 10, 1e-6).is_err());
+    assert!(
+        bailey_simon_multiplicative(
+            usize::MAX,
+            2,
+            &[],
+            &[],
+            &SolverOptions::default().with_max_iter(10).with_tol(1e-6),
+        )
+        .is_err()
+    );
     // 2. Non-finite quadrature bounds must return an error immediately (no deep recursion).
     assert!(gauss_kronrod_integrate(|x| x, f64::NAN, 1.0).is_err());
     assert!(gauss_kronrod_integrate_semi_infinite(|x| x, f64::INFINITY, 1.0).is_err());
     // 3. GLMM max_iter == 0 rejected.
     assert!(
-        dm.fit_random_intercept_glmm(&y, &[0, 0, 1, 1, 2, 2], 3, None, None, 0)
-            .is_err()
+        dm.fit_random_intercept_glmm(
+            &y,
+            &[0, 0, 1, 1, 2, 2],
+            3,
+            None,
+            None,
+            &SolverOptions::default().with_max_iter(0),
+        )
+        .is_err()
     );
     // 4. Empty goodness_of_fit returns finite/NaN cleanly without panicking.
     let gof = goodness_of_fit(

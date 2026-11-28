@@ -9,11 +9,11 @@
 
 use pricing_kernels::classification::{
     GlmFamily, GlmOptions, MultiplicativeRater, RegularizedGlmFamily, RegularizedGlmOptions,
-    bspline_basis, double_lift_chart, fit_glm_irls_with_options, fit_hurdle_poisson,
-    fit_random_intercept_glmm, fit_regularized_glm, fit_zero_inflated_poisson,
-    glm_information_criteria, predict_glm, select_tweedie_power, tweedie_log_density,
+    bspline_basis, double_lift_chart, fit_glm_irls, fit_hurdle_poisson, fit_random_intercept_glmm,
+    fit_regularized_glm, fit_zero_inflated_poisson, glm_information_criteria, predict_glm,
+    select_tweedie_power, tweedie_log_density,
 };
-use pricing_kernels::error::PricingError;
+use pricing_kernels::error::{PricingError, SolverOptions};
 
 const SEED: u64 = 42069;
 
@@ -179,7 +179,17 @@ fn zero_modified_models_reject_bad_lengths_without_panicking() {
     ));
     let groups: Vec<usize> = (0..20).map(|i| i % 4).collect();
     assert!(matches!(
-        fit_random_intercept_glmm(&x, 20, 1, &y, &groups, 4, Some(&short), None, 5),
+        fit_random_intercept_glmm(
+            &x,
+            20,
+            1,
+            &y,
+            &groups,
+            4,
+            Some(&short),
+            None,
+            &SolverOptions::default().with_max_iter(5)
+        ),
         Err(PricingError::DimensionMismatch(_))
     ));
 }
@@ -212,7 +222,18 @@ fn zip_and_glmm_report_convergence() {
     let zip_one = fit_zero_inflated_poisson(&x, n, 1, &y, None, None, 0.0, 0.0, 1).unwrap();
     assert!(!zip_one.converged);
 
-    let glmm = fit_random_intercept_glmm(&x, n, 1, &y, &groups, 8, None, None, 50).unwrap();
+    let glmm = fit_random_intercept_glmm(
+        &x,
+        n,
+        1,
+        &y,
+        &groups,
+        8,
+        None,
+        None,
+        &SolverOptions::default().with_max_iter(50),
+    )
+    .unwrap();
     assert!(glmm.converged, "GLMM iterations={}", glmm.iterations);
 }
 
@@ -440,10 +461,8 @@ fn aic_prefers_true_gamma_model_over_intercept_only() {
     let w = vec![1.0; n];
     let off = vec![0.0; n];
     let opts = GlmOptions::default();
-    let fit_full =
-        fit_glm_irls_with_options(GlmFamily::Gamma, &x_full, n, 2, &y, &w, &off, &opts).unwrap();
-    let fit_null =
-        fit_glm_irls_with_options(GlmFamily::Gamma, &x_null, n, 1, &y, &w, &off, &opts).unwrap();
+    let fit_full = fit_glm_irls(GlmFamily::Gamma, &x_full, n, 2, &y, &w, &off, &opts).unwrap();
+    let fit_null = fit_glm_irls(GlmFamily::Gamma, &x_null, n, 1, &y, &w, &off, &opts).unwrap();
     let mu_full = predict_glm(
         GlmFamily::Gamma,
         &x_full,
@@ -674,8 +693,18 @@ fn glmm_joint_mode_recovers_variance_and_intercept() {
             groups.push(g);
             y.push(rng.poisson((b0 + b1 * xi + u[g]).exp()) as f64);
         }
-        let f =
-            fit_random_intercept_glmm(&x, n, 1, &y, &groups, n_groups, None, None, 100).unwrap();
+        let f = fit_random_intercept_glmm(
+            &x,
+            n,
+            1,
+            &y,
+            &groups,
+            n_groups,
+            None,
+            None,
+            &SolverOptions::default().with_max_iter(100),
+        )
+        .unwrap();
         assert!(f.converged, "tau2={tau2}: {f:?}");
         assert!(!f.tau_squared_at_upper_bound && !f.tau_squared_at_lower_bound);
         // BLUP constraint at the joint mode (intercept score equation).
@@ -737,7 +766,7 @@ fn irls_zero_claim_level_converges_with_separation_flag() {
     let (x, y) = zero_claim_design();
     let w = vec![1.0; 30];
     let off = vec![0.0; 30];
-    let fit = fit_glm_irls_with_options(
+    let fit = fit_glm_irls(
         GlmFamily::Poisson,
         &x,
         30,
@@ -760,7 +789,7 @@ fn irls_zero_claim_level_converges_with_separation_flag() {
 
     // Separated Binomial (level 2 all zeros) likewise returns Ok with the flag.
     let yb: Vec<f64> = y.iter().map(|&v| f64::from(u8::from(v > 2.0))).collect();
-    let fb = fit_glm_irls_with_options(
+    let fb = fit_glm_irls(
         GlmFamily::Binomial,
         &x,
         30,
@@ -777,7 +806,7 @@ fn irls_zero_claim_level_converges_with_separation_flag() {
     // Complete separation on a continuous covariate.
     let xs: Vec<f64> = (0..20).flat_map(|i| [1.0, f64::from(i) / 19.0]).collect();
     let ys: Vec<f64> = (0..20).map(|i| f64::from(u8::from(i >= 10))).collect();
-    let fs = fit_glm_irls_with_options(
+    let fs = fit_glm_irls(
         GlmFamily::Binomial,
         &xs,
         20,
@@ -810,7 +839,7 @@ fn saturated_one_way_poisson_and_gamma_match_closed_form_mle() {
     }
     let off: Vec<f64> = exposure.iter().map(|e: &f64| e.ln()).collect();
     let w = [1.0; 6];
-    let fit = fit_glm_irls_with_options(
+    let fit = fit_glm_irls(
         GlmFamily::Poisson,
         &x,
         6,
@@ -837,7 +866,7 @@ fn saturated_one_way_poisson_and_gamma_match_closed_form_mle() {
     // Gamma (log link) with claim-count weights: fitted level mean = weighted mean severity.
     let sev = [1200.0, 900.0, 3000.0, 1500.0, 1100.0, 2600.0];
     let cnt = [3.0, 5.0, 2.0, 4.0, 1.0, 6.0];
-    let g = fit_glm_irls_with_options(
+    let g = fit_glm_irls(
         GlmFamily::Gamma,
         &x,
         6,

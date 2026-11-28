@@ -17,8 +17,8 @@ fn main() -> Result<(), PricingError> {
     let olf_2024 = parallelogram_on_level_factor(2024.0, &changes)?;
 
     // 2. Two-step exponential loss trend (historical +4.0%, prospective +5.5%).
-    let loss_trend = TwoStepTrendModel::new(0.04, 0.055)?;
-    let prem_trend = TrendModel::new(0.02)?;
+    let loss_trend = TwoStepTrendModel::try_new(0.04, 0.055)?;
+    let prem_trend = TrendModel::try_new(0.02)?;
 
     let spec = RateIndicationSpec {
         periods: vec![

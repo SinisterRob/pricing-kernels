@@ -10,7 +10,7 @@ use pricing_kernels::credibility::{
 };
 use pricing_kernels::error::{PricingError, SolverOptions};
 use pricing_kernels::experience::{
-    ExperienceClaim, NcciAccidentLimitation, NcciErpSpecification, RetroPlanSpec, TableLEngine,
+    ExperienceClaim, NcciAccidentLimitation, NcciErpSpec, RetroPlanSpec, TableLEngine,
     TableMEngine, TableMRow, calculate_ncci_experience_mod,
     calculate_ncci_experience_mod_by_accident,
 };
@@ -653,8 +653,8 @@ fn table_rows_are_validated() {
 // NCCI accident limitations (finding 5)
 // ---------------------------------------------------------------------------
 
-fn ncci_spec() -> NcciErpSpecification {
-    NcciErpSpecification {
+fn ncci_spec() -> NcciErpSpec {
+    NcciErpSpec {
         split_point: 20_000.0,
         expected_losses: 125_000.0,
         d_ratio: 0.30,
@@ -733,11 +733,11 @@ fn ncci_multiple_claim_accident_limitation() {
 
 #[test]
 fn trend_model_rate_validated() {
-    assert!(TrendModel::new(0.05).is_ok());
-    assert!(TrendModel::new(-0.5).is_ok());
+    assert!(TrendModel::try_new(0.05).is_ok());
+    assert!(TrendModel::try_new(-0.5).is_ok());
     for bad in [-1.0, -1.5, f64::NAN, f64::INFINITY] {
         assert!(matches!(
-            TrendModel::new(bad),
+            TrendModel::try_new(bad),
             Err(PricingError::InvalidParameter(_))
         ));
     }
@@ -842,7 +842,7 @@ fn classical_credibility_infinite_volume_is_full_and_invalid_is_err() {
 fn ncci_mod_rounds_half_up_to_two_decimals() {
     // E = 100,000, D = 0.5, W = 0, B = 0 -> Mod = (A_p + 50,000) / 100,000; A_p = 35,500
     // gives 0.855 -> 0.86 (half-up, not banker's rounding or truncation).
-    let spec = NcciErpSpecification {
+    let spec = NcciErpSpec {
         split_point: 1_000_000.0,
         expected_losses: 100_000.0,
         d_ratio: 0.5,

@@ -39,13 +39,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`double_lift_chart`**: never drops empty buckets silently; each bucket receives ≥ 1 observation.
 
 ### Changed (breaking)
+- **API consolidation**: fallible constructors are named `try_new` (`CommercialLayer`, `MbbefdCurve`, `TrendModel`, `TwoStepTrendModel`); `NcciErpSpecification` is renamed `NcciErpSpec` (alias removed); `fit_glm_irls_with_options` is folded into `fit_glm_irls(.., &GlmOptions)`; `bailey_simon_*`, `solve_balanced_retro_plan(_table_l)` and `fit_random_intercept_glmm` take `&SolverOptions` instead of positional `max_iter`/`tol` (GLMM: `max_iter` caps Newton iterations per joint-mode solve, `tol` is its relative parameter-step tolerance). Crate-level `pricing_kernels::Result<T>` alias; library code denies `unwrap`/`expect`.
 - YLT `oep_pml`/`aep_pml` default to the rank convention $T = N/r$ and error when $T > N$; `EmpiricalPmlConvention::LowerQuantile` restores the old behaviour.
 - `var`/`tvar`, Panjer, FFT, convolution and ELT-AEP return errors where they previously returned silently biased values.
 - Panjer/FFT reject severity PMFs with |Σf − 1| > 1e-6 (`InvalidParameter`; previously 1e-4) and renormalize accepted ones; `tvar` errors on under-represented tails; convolution rejects non-unit-mass components; FFT out-of-bounds messages changed (tilt advice corrected). YLT Beta draws change at the ulp level for all shapes (log-space sampler) and materially for shapes < 1e-3; cat XL Beta layer losses change (exact LEV).
 - `price_reinstatements` rejects `ReinstatementBasis::ProRataAmountAndTime`; use `price_reinstatements_compound_poisson` (exact) or `price_reinstatements_time_weighted` (explicit time factor). The 0.4.0 note "pro-rata by amount and by time" referred to the flat-0.5 approximation.
 - `AlaeDependenceModel::BivariateLognormal` rejects a severity that differs from its owned marginal (`indemnity_marginal()`).
 - Spliced EVT SE vectors have length 5 (body_weight included); new field `EvtFitResult.iterations`.
-- `TrendModel::new` and `ClassicalCredibility::from_confidence_and_tolerance` return `Result`; `TableMEngine.rows` / `TableLEngine.rows` are private (`rows()`, validated `from_rows`, validated serde).
+- `TrendModel::try_new` (was `new`) and `ClassicalCredibility::from_confidence_and_tolerance` return `Result`; `TableMEngine.rows` / `TableLEngine.rows` are private (`rows()`, validated `from_rows`, validated serde).
 - `HachemeisterResult` adds `vhm_matrix_raw`; Hachemeister numbers change.
 - `HachemeisterResult` adds `time_centre`; results change whenever the raw-origin PSD projection was active (coefficients/matrices still reported in the caller's time coordinates).
 - `NcciErpResult.mod_factor` is 2-decimal (e.g. 0.858 → 0.86); `datasets::ncci_erp_worksheet().expected_mod_rounded` = 0.86. New pub const `NCCI_MOD_DECIMALS`.

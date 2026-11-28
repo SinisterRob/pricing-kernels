@@ -84,7 +84,7 @@ pub struct ExperienceClaim {
 
 /// NCCI Experience Rating Plan calculation inputs and parameters.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
-pub struct NcciErpSpecification {
+pub struct NcciErpSpec {
     /// State split point between primary and excess loss (e.g. $18,500).
     pub split_point: f64,
     /// Total expected losses (`E = sum_class Payroll * Expected Loss Rate`).
@@ -99,10 +99,7 @@ pub struct NcciErpSpecification {
     pub apply_era: bool,
 }
 
-/// Concise alias for [`NcciErpSpecification`] matching [`super::IsoErpSpec`] and [`super::RetroPlanSpec`].
-pub type NcciErpSpec = NcciErpSpecification;
-
-impl NcciErpSpecification {
+impl NcciErpSpec {
     /// Compute the NCCI Experience Modification Factor for the given experience-period claims.
     pub fn calculate(&self, claims: &[ExperienceClaim]) -> Result<NcciErpResult, PricingError> {
         calculate_ncci_experience_mod(self, claims)
@@ -142,7 +139,7 @@ pub struct NcciErpResult {
     pub ratable_excess_expected: f64,
 }
 
-fn validate_spec(spec: &NcciErpSpecification) -> Result<(), PricingError> {
+fn validate_spec(spec: &NcciErpSpec) -> Result<(), PricingError> {
     if !spec.expected_losses.is_finite() || !(spec.expected_losses > 0.0) {
         return Err(PricingError::NonPositiveValue(
             "expected losses must be finite and positive",
@@ -173,7 +170,7 @@ fn validate_spec(spec: &NcciErpSpecification) -> Result<(), PricingError> {
 
 /// Ratable loss of one claim after ERA and the per claim accident limitation.
 fn ratable_claim_loss(
-    spec: &NcciErpSpecification,
+    spec: &NcciErpSpec,
     claim: &ExperienceClaim,
     limitation: Option<&NcciAccidentLimitation>,
 ) -> Result<f64, PricingError> {
@@ -192,11 +189,7 @@ fn ratable_claim_loss(
     Ok(loss)
 }
 
-fn finalize_mod(
-    spec: &NcciErpSpecification,
-    actual_primary: f64,
-    actual_excess: f64,
-) -> NcciErpResult {
+fn finalize_mod(spec: &NcciErpSpec, actual_primary: f64, actual_excess: f64) -> NcciErpResult {
     let expected_primary = spec.expected_losses * spec.d_ratio;
     let expected_excess = spec.expected_losses * (1.0 - spec.d_ratio);
 
@@ -231,7 +224,7 @@ fn finalize_mod(
 /// accident and **no accident limitation is applied**: pass already-limited ratable losses, or
 /// use [`calculate_ncci_experience_mod_by_accident`] with an [`NcciAccidentLimitation`].
 pub fn calculate_ncci_experience_mod(
-    spec: &NcciErpSpecification,
+    spec: &NcciErpSpec,
     claims: &[ExperienceClaim],
 ) -> Result<NcciErpResult, PricingError> {
     validate_spec(spec)?;
@@ -256,7 +249,7 @@ pub fn calculate_ncci_experience_mod(
 /// from excess loss first (accident primary = `min(sum primary, accident limited total)`).
 /// With `limitation = None` this equals [`calculate_ncci_experience_mod`] on the flattened claims.
 pub fn calculate_ncci_experience_mod_by_accident(
-    spec: &NcciErpSpecification,
+    spec: &NcciErpSpec,
     accidents: &[&[ExperienceClaim]],
     limitation: Option<&NcciAccidentLimitation>,
 ) -> Result<NcciErpResult, PricingError> {

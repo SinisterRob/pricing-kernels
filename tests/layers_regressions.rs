@@ -438,7 +438,7 @@ fn solver_tolerance_changes_iterations_and_results() {
 #[test]
 fn mbbefd_is_continuous_across_b_equals_one_and_bg_equals_one() {
     let g = 10.0;
-    let at = |b: f64, g: f64| MbbefdCurve::new(b, g).expect("curve");
+    let at = |b: f64, g: f64| MbbefdCurve::try_new(b, g).expect("curve");
     for &delta in &[2e-12, -2e-12, 1e-10, -1e-10, 1e-8, -1e-8] {
         // b -> 1 limit.
         let c0 = at(1.0, g);

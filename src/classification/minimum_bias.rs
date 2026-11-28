@@ -65,8 +65,7 @@ impl RatingTable {
             self.n_cols,
             &self.exposures,
             &self.losses,
-            options.max_iter,
-            options.tol,
+            options,
         )
     }
 
@@ -80,8 +79,7 @@ impl RatingTable {
             self.n_cols,
             &self.exposures,
             &self.losses,
-            options.max_iter,
-            options.tol,
+            options,
         )
     }
 }
@@ -236,16 +234,15 @@ fn normalize_and_diff(
 ///
 /// - `exposures`: Row-major slice of size `n_rows * n_cols` (`P_ij`).
 /// - `losses`: Row-major slice of average loss costs / claim frequencies (`A_ij`).
-/// - `max_iter`: Maximum iteration cycles.
-/// - `tol`: Absolute convergence threshold on normalized relativities and base rate.
+/// - `options`: Convergence controls (`max_iter`, `tol`).
 pub fn bailey_simon_multiplicative(
     n_rows: usize,
     n_cols: usize,
     exposures: &[f64],
     losses: &[f64],
-    max_iter: usize,
-    tol: f64,
+    options: &SolverOptions,
 ) -> Result<MinimumBiasResult, PricingError> {
+    let SolverOptions { max_iter, tol } = *options;
     validate_grid(n_rows, n_cols, exposures, losses, max_iter, tol)?;
 
     let mut r = vec![1.0; n_rows];
@@ -322,9 +319,9 @@ pub fn bailey_simon_chi_squared(
     n_cols: usize,
     exposures: &[f64],
     losses: &[f64],
-    max_iter: usize,
-    tol: f64,
+    options: &SolverOptions,
 ) -> Result<MinimumBiasResult, PricingError> {
+    let SolverOptions { max_iter, tol } = *options;
     validate_grid(n_rows, n_cols, exposures, losses, max_iter, tol)?;
 
     let mut r = vec![1.0; n_rows];

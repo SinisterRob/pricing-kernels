@@ -40,7 +40,7 @@ impl RetroPlanSpec {
         table_m: &TableMEngine,
         options: &SolverOptions,
     ) -> Result<RetroPlanResult, PricingError> {
-        solve_balanced_retro_plan(self, table_m, options.max_iter, options.tol)
+        solve_balanced_retro_plan(self, table_m, options)
     }
 
     /// Solve for the balanced retrospective plan with per-occurrence loss limit using a
@@ -50,7 +50,7 @@ impl RetroPlanSpec {
         table_l: &TableLEngine,
         options: &SolverOptions,
     ) -> Result<RetroPlanResult, PricingError> {
-        solve_balanced_retro_plan_table_l(self, table_l, options.max_iter, options.tol)
+        solve_balanced_retro_plan_table_l(self, table_l, options)
     }
 }
 
@@ -184,15 +184,14 @@ where
 pub fn solve_balanced_retro_plan(
     spec: &RetroPlanSpec,
     table_m: &TableMEngine,
-    max_iter: usize,
-    tol: f64,
+    options: &SolverOptions,
 ) -> Result<RetroPlanResult, PricingError> {
     solve_balanced_retro_plan_with(
         spec,
         0.0,
         |r| table_m.charge_at(r),
         |r| table_m.savings_at(r),
-        SolverOptions { max_iter, tol },
+        *options,
         "retro plan basic premium solver failed to converge",
         "infeasible retro plan: max_retro_ratio / tax_multiplier is below balanced basic premium",
     )
