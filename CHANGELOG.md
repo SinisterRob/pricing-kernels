@@ -16,6 +16,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **ALAE ILFs**: ALAE-Included under bivariate Lognormal uses an exact 1-D conditional-LEV reduction with adaptive Gauss–Kronrod (fixed 32×32 Gauss–Legendre had errors up to 3.8%). Power-Law documented as deterministic ALAE.
 - **Reinsurance**: pro-rata-as-to-amount-and-time reinstatements are exact under compound Poisson with uniform arrivals (Sundt 1991; Mata 2000); the flat 0.5 time factor (first reinstatement −16% at λ=1) is removed.
 - **MBBEFD**: continuous across b=1 and bg=1 via `expm1`/`ln_1p` (removed 1e-12 tolerance branches with 5e-5 cancellation error).
+- **Quadrature (`layers`)**: Gauss–Kronrod is globally adaptive with scale-aware initial subdivision (geometric grading to both endpoints and around natural scale points); a first panel with both rules ≈ 0 is no longer accepted. **Breaking:** `gauss_kronrod_integrate*` return `Result` (no silent NaN/0) and `gauss_kronrod_integrate_semi_infinite` takes a `scale` argument.
+- **EVT LEVs**: `FittedEvtDistribution::limited_expected_value` uses closed forms for Weibull (incomplete gamma), Burr XII with αγ > 1 (incomplete beta), Inverse Gaussian (normal CDF), shifted GPD and spliced body + GPD (integrating only to the support end u + β/|ξ| when ξ < 0). Previously Weibull/Burr/IG LEV(1e7–1e9) returned ≈ 0 and GPD ξ < 0 was 25% low.
+- **Power-law ALAE**: Pro-Rata, In-Addition and Included (cv = 0) use closed-form truncated power moments per family (was a unit-scale semi-infinite map: In-Addition −20.8% at Lognormal(15, 1), E[A] = 0 for SPP(1.5, 1e5)); In-Addition errors when E[X^γ] is infinite (Lomax/SPP γ ≥ α, GPD ξγ ≥ 1); exact densities replace finite differences in the fallback quadrature.
 
 ### Changed (breaking)
 - YLT `oep_pml`/`aep_pml` default to the rank convention $T = N/r$ and error when $T > N$; `EmpiricalPmlConvention::LowerQuantile` restores the old behaviour.

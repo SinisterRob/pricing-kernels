@@ -17,7 +17,12 @@ fn gamma_pdf_raw(shape: f64, scale: f64, x: f64) -> f64 {
 
 /// Continuity-enforced body weight `w = P(X <= splice)` for `SplicedGammaPareto`.
 #[inline]
-fn spliced_body_weight(shape: f64, scale: f64, splice: f64, tail_alpha: f64) -> (f64, f64) {
+pub(crate) fn spliced_body_weight(
+    shape: f64,
+    scale: f64,
+    splice: f64,
+    tail_alpha: f64,
+) -> (f64, f64) {
     let f_u = gamma_p(shape, splice / scale);
     let pdf_u = gamma_pdf_raw(shape, scale, splice);
     let denom = tail_alpha * f_u + splice * pdf_u;

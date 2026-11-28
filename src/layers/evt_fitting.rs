@@ -27,9 +27,10 @@
 //!   `converged = false`.
 
 use crate::error::{PricingError, SolverOptions};
-use crate::layers::alae_ilf::gauss_kronrod_integrate;
 use crate::layers::fitting::SeverityObservation;
 use crate::layers::ilf::{SeverityDistribution, ilf_from_lev};
+use crate::layers::moments::lomax_unit_part;
+use crate::layers::quadrature::integrate_finite;
 use crate::linalg::cholesky_invert;
 use crate::special::{gamma_p, ln_gamma, log_gamma_q, log_normal_survival, normal_cdf_exact};
 use serde::{Deserialize, Serialize};
@@ -242,6 +243,93 @@ fn gpd_log_one_plus_xi_t_over_xi(xi: f64, t: f64) -> f64 {
     }
 }
 
+/// Minimum body mass `F1(u)` used by the spliced evaluators.
+const SPLICE_MIN_BODY_MASS: f64 = 1e-300;
+/// GPD shapes with `|xi|` at or below this are treated as exponential.
+const GPD_EXPONENTIAL_XI_TOL: f64 = 1e-10;
+/// Largest incomplete-gamma shape `1 + 1/k` for which the Weibull closed form is used
+/// (`Γ(a)` overflows beyond `a ≈ 171`).
+const WEIBULL_MAX_GAMMA_SHAPE: f64 = 170.0;
+
+fn body_distribution(body: SpliceBodyFamily, p1: f64, p2: f64) -> FittedEvtDistribution {
+    match body {
+        SpliceBodyFamily::Lognormal => FittedEvtDistribution::Lognormal { mu: p1, sigma: p2 },
+        SpliceBodyFamily::Weibull => FittedEvtDistribution::Weibull { k: p1, lambda: p2 },
+    }
+}
+
+/// Lognormal partial mean `E[X; X <= y] = e^(mu + sigma^2/2) Φ((ln y - mu - sigma^2) / sigma)`.
+fn lognormal_lower_mean(mu: f64, sigma: f64, y: f64) -> f64 {
+    if !(y > 0.0) {
+        return 0.0;
+    }
+    let z = (y.ln() - mu - sigma * sigma) / sigma;
+    (mu + 0.5 * sigma * sigma + log_normal_survival(-z)).exp()
+}
+
+/// Weibull partial mean `E[X; X <= y] = λ Γ(1 + 1/k) P(1 + 1/k, (y/λ)^k)`.
+fn weibull_lower_mean(k: f64, lambda: f64, y: f64) -> Option<f64> {
+    let a = 1.0 + 1.0 / k;
+    if !(a.is_finite() && a <= WEIBULL_MAX_GAMMA_SHAPE) {
+        return None;
+    }
+    if !(y > 0.0) {
+        return Some(0.0);
+    }
+    let z = (k * (y / lambda).ln()).exp();
+    let m = lambda * ln_gamma(a).exp() * gamma_p(a, z);
+    m.is_finite().then_some(m)
+}
+
+/// Burr XII partial mean: `Y = X^gamma ~ Lomax(alpha, lambda)`, so
+/// `E[X; X <= y] = lambda^(1/gamma) alpha B(1 + 1/gamma, alpha - 1/gamma) I_u(…)`
+/// with `u = y^gamma / (lambda + y^gamma)`; requires `alpha gamma > 1`.
+fn burr_lower_mean(alpha: f64, gamma: f64, lambda: f64, y: f64) -> Option<f64> {
+    if !(alpha * gamma > 1.0) {
+        return None;
+    }
+    if !(y > 0.0) {
+        return Some(0.0);
+    }
+    let ln_r = gamma.mul_add(y.ln(), -lambda.ln());
+    let unit = lomax_unit_part(alpha, 1.0 / gamma, ln_r, false)?;
+    let m = (lambda.ln() / gamma).exp() * unit;
+    m.is_finite().then_some(m)
+}
+
+/// Inverse Gaussian partial mean (Klugman, Panjer & Willmot App. A):
+/// `E[X; X <= y] = mu [Φ(z1) - e^(2 lambda / mu) Φ(-z2)]`,
+/// `z1 = sqrt(lambda / y) (y / mu - 1)`, `z2 = sqrt(lambda / y) (y / mu + 1)`.
+fn inverse_gaussian_lower_mean(mu: f64, lambda: f64, y: f64) -> f64 {
+    if !(y > 0.0) {
+        return 0.0;
+    }
+    let sq = (lambda / y).sqrt();
+    let z1 = sq * (y / mu - 1.0);
+    let z2 = sq * (y / mu + 1.0);
+    let second = (2.0 * lambda / mu + log_normal_survival(z2)).exp();
+    (mu * (normal_cdf_exact(z1) - second)).max(0.0)
+}
+
+/// GPD excess LEV `∫_0^y (1 + xi t / beta)^(-1/xi) dt`, truncated at the finite upper
+/// support end `beta / |xi|` when `xi < 0`.
+fn gpd_excess_lev(xi: f64, beta: f64, y: f64) -> f64 {
+    if !(y > 0.0) {
+        return 0.0;
+    }
+    if xi.abs() <= GPD_EXPONENTIAL_XI_TOL {
+        return beta * -((-y / beta).exp_m1());
+    }
+    let y = if xi < 0.0 { y.min(beta / -xi) } else { y };
+    let ln_u = (xi * y / beta).max(-1.0).ln_1p();
+    if (xi - 1.0).abs() <= GPD_EXPONENTIAL_XI_TOL {
+        beta * ln_u
+    } else {
+        let omx = 1.0 - xi;
+        beta * -(((-omx / xi) * ln_u).exp_m1()) / omx
+    }
+}
+
 impl FittedEvtDistribution {
     /// Evaluate `ln f(x)` for `x > 0` (returns `-inf` outside support).
     pub fn log_pdf(&self, x: f64) -> f64 {
@@ -428,11 +516,13 @@ impl FittedEvtDistribution {
 
     /// Evaluate Limited Expected Value `E[X ∧ L] = ∫_0^L S(x) dx` for `L >= 0`.
     ///
-    /// Uses exact closed-form formulas via [`SeverityDistribution`] when available
-    /// (`Lognormal`, `ParetoII`, `Gamma`, `Gpd` with `threshold == 0, xi >= 0`) and
-    /// adaptive 15-point Gauss–Kronrod quadrature (split cleanly at the splice/threshold
-    /// point to avoid kinks) for `BurrXii`, `Weibull`, `InverseGaussian`, general `Gpd`,
-    /// and `SplicedBodyGpd`.
+    /// Closed forms throughout: via [`SeverityDistribution`] for `Lognormal`, `ParetoII`,
+    /// `Gamma`; `E[X; X <= L] + L S(L)` with incomplete gamma (`Weibull`), incomplete beta
+    /// (`BurrXii` with `alpha gamma > 1`) and normal-CDF (`InverseGaussian`) partial means;
+    /// exact shifted-GPD and spliced body + GPD formulas, integrating only up to the finite
+    /// upper support end `u + beta / |xi|` when `xi < 0`. Scale-aware adaptive Gauss–Kronrod
+    /// quadrature of `S(x)` is used only where no closed form applies (`BurrXii` with
+    /// `alpha gamma <= 1`, Weibull shape `k < 1 / 169`).
     pub fn limited_expected_value(&self, limit: f64) -> Result<f64, PricingError> {
         if !limit.is_finite() || !(limit >= 0.0) {
             return Err(PricingError::InvalidParameter(
@@ -442,28 +532,98 @@ impl FittedEvtDistribution {
         if limit == 0.0 {
             return Ok(0.0);
         }
-        if let Ok(sev) = SeverityDistribution::try_from(*self) {
-            return sev.limited_expected_value(limit);
+        match SeverityDistribution::try_from(*self) {
+            Ok(sev) => return sev.limited_expected_value(limit),
+            Err(e)
+                if matches!(
+                    self,
+                    Self::Lognormal { .. } | Self::ParetoII { .. } | Self::Gamma { .. }
+                ) =>
+            {
+                return Err(e);
+            }
+            Err(_) => {}
         }
+        let surv_l = self.log_survival(limit).exp();
+        let lev = match *self {
+            Self::Weibull { k, lambda } => match weibull_lower_mean(k, lambda, limit) {
+                Some(m) => m + limit * surv_l,
+                None => self.lev_by_quadrature(0.0, limit, &[lambda])?,
+            },
+            Self::BurrXii {
+                alpha,
+                gamma,
+                lambda,
+            } => {
+                if let Some(m) = burr_lower_mean(alpha, gamma, lambda, limit) {
+                    m + limit * surv_l
+                } else {
+                    let scale = (lambda.ln() / gamma).exp();
+                    let median = (lambda * (2f64.powf(1.0 / alpha) - 1.0)).powf(1.0 / gamma);
+                    self.lev_by_quadrature(0.0, limit, &[scale, median])?
+                }
+            }
+            Self::InverseGaussian { mu, lambda } => {
+                inverse_gaussian_lower_mean(mu, lambda, limit) + limit * surv_l
+            }
+            Self::Gpd {
+                threshold,
+                xi,
+                beta,
+            } => limit.min(threshold) + gpd_excess_lev(xi, beta, limit - threshold),
+            Self::SplicedBodyGpd {
+                body,
+                threshold,
+                body_param1,
+                body_param2,
+                body_weight,
+                xi,
+                beta,
+                ..
+            } => {
+                let body_dist = body_distribution(body, body_param1, body_param2);
+                let f1_u = body_dist.cdf(threshold).max(SPLICE_MIN_BODY_MASS);
+                let y = limit.min(threshold);
+                // ∫_0^y [1 - w F1(x) / F1(u)] dx = y - (w / F1(u)) (y F1(y) - E1[X; X <= y]).
+                let lower_mean = match body {
+                    SpliceBodyFamily::Lognormal => {
+                        Some(lognormal_lower_mean(body_param1, body_param2, y))
+                    }
+                    SpliceBodyFamily::Weibull => weibull_lower_mean(body_param1, body_param2, y),
+                };
+                let body_part = match lower_mean {
+                    Some(m) => {
+                        let below = (y * body_dist.cdf(y) - m).max(0.0);
+                        y - (body_weight / f1_u) * below
+                    }
+                    None => self.lev_by_quadrature(0.0, y, &[body_param2, threshold])?,
+                };
+                let tail_part = if limit > threshold {
+                    (1.0 - body_weight) * gpd_excess_lev(xi, beta, limit - threshold)
+                } else {
+                    0.0
+                };
+                body_part + tail_part
+            }
+            Self::Lognormal { .. } | Self::ParetoII { .. } | Self::Gamma { .. } => {
+                self.lev_by_quadrature(0.0, limit, &[])?
+            }
+        };
+        if !lev.is_finite() {
+            return Err(PricingError::OutOfBounds(
+                "limited expected value is not finite",
+            ));
+        }
+        Ok(lev.clamp(0.0, limit))
+    }
+
+    /// Fallback `∫_a^b S(x) dx` by scale-aware adaptive Gauss–Kronrod quadrature.
+    fn lev_by_quadrature(&self, a: f64, b: f64, anchors: &[f64]) -> Result<f64, PricingError> {
         let surv = |x: f64| -> f64 {
             let ls = self.log_survival(x);
             if ls.is_finite() { ls.exp() } else { 0.0 }
         };
-        let lev = match *self {
-            Self::Gpd { threshold, .. } | Self::SplicedBodyGpd { threshold, .. }
-                if limit > threshold && threshold > 0.0 =>
-            {
-                let part1 = if matches!(*self, Self::Gpd { .. }) {
-                    threshold
-                } else {
-                    gauss_kronrod_integrate(surv, 0.0, threshold)
-                };
-                part1 + gauss_kronrod_integrate(surv, threshold, limit)
-            }
-            Self::Gpd { threshold, .. } if limit <= threshold => limit,
-            _ => gauss_kronrod_integrate(surv, 0.0, limit),
-        };
-        Ok(lev.clamp(0.0, limit))
+        integrate_finite(surv, a, b, anchors, 0.0)
     }
 
     /// Pure-loss Increased Limits Factor `ILF(L; B) = E[X ∧ L] / E[X ∧ B]`.
@@ -1652,32 +1812,138 @@ mod tests {
         assert!(((l1 + d) - l2).abs() < 1e-4, "l1+d={} l2={l2}", l1 + d);
     }
 
+    /// SplitMix64 (Steele, Lea & Flood 2014) seeded test generator.
+    struct SplitMix64(u64);
+
+    impl SplitMix64 {
+        fn uniform(&mut self) -> f64 {
+            self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = self.0;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            z ^= z >> 31;
+            ((z >> 11) as f64 + 0.5) / (1u64 << 53) as f64
+        }
+
+        fn normal(&mut self) -> f64 {
+            crate::special::normal_inv_cdf(self.uniform())
+        }
+    }
+
+    const TEST_SEED: u64 = 42069;
+    const RECOVERY_N: usize = 2_000;
+    /// Recovered parameters must lie within this many delta-method standard errors.
+    const RECOVERY_SE_MULT: f64 = 4.0;
+
+    fn assert_recovers(fam: EvtFamily, xs: &[f64], truth: &[f64]) {
+        let obs: Vec<SeverityObservation> =
+            xs.iter().map(|&x| SeverityObservation::exact(x)).collect();
+        let res = fit_evt_mle(fam, &obs).expect("evt family fit");
+        assert!(res.converged, "{fam:?} did not converge");
+        assert!(res.log_likelihood.is_finite());
+        assert!(res.diagnostics.ks_statistic >= 0.0 && res.diagnostics.ks_statistic <= 1.0);
+        let est = res.distribution.estimated_values();
+        let names = res.distribution.parameter_names();
+        for (i, &t) in truth.iter().enumerate() {
+            let se = res.standard_errors[i];
+            assert!(se.is_finite() && se > 0.0, "{fam:?} {}: se={se}", names[i]);
+            assert!(
+                (est[i] - t).abs() <= RECOVERY_SE_MULT * se,
+                "{fam:?} {}: est {} truth {t} se {se}",
+                names[i],
+                est[i]
+            );
+        }
+    }
+
     #[test]
-    fn gpd_burr_gamma_ig_and_spliced_fit_cleanly_with_mean_excess() {
+    fn gpd_burr_gamma_ig_and_spliced_recover_seeded_parameters_with_mean_excess() {
+        let mut rng = SplitMix64(TEST_SEED);
+        let n = RECOVERY_N;
+
+        // GPD(xi = 0.3, beta = 500) excesses over u = 200.
+        let (u, xi, beta) = (200.0, 0.3, 500.0);
+        let gpd: Vec<f64> = (0..n)
+            .map(|_| u + beta / xi * (rng.uniform().powf(-xi) - 1.0))
+            .collect();
+        assert_recovers(EvtFamily::Gpd { threshold: u }, &gpd, &[xi, beta]);
+
+        // Burr XII(alpha = 2, gamma = 1.5, theta = 1000), lambda = theta^gamma.
+        let (a, g, th): (f64, f64, f64) = (2.0, 1.5, 1000.0);
+        let burr: Vec<f64> = (0..n)
+            .map(|_| th * (rng.uniform().powf(-1.0 / a) - 1.0).powf(1.0 / g))
+            .collect();
+        assert_recovers(EvtFamily::BurrXii, &burr, &[a, g, th.powf(g)]);
+
+        // Gamma(shape 3, rate 0.002) as a sum of three exponentials.
+        let rate = 0.002;
+        let gam: Vec<f64> = (0..n)
+            .map(|_| (0..3).map(|_| -rng.uniform().ln() / rate).sum())
+            .collect();
+        assert_recovers(EvtFamily::Gamma, &gam, &[3.0, rate]);
+
+        // Inverse Gaussian(mu = 1000, lambda = 2000), Michael–Schucany–Haas (1976).
+        let (mu, lam) = (1000.0, 2000.0);
+        let ig: Vec<f64> = (0..n)
+            .map(|_| {
+                let nu = rng.normal();
+                let y = nu * nu;
+                let x = mu + mu * mu * y / (2.0 * lam)
+                    - mu / (2.0 * lam) * (4.0 * mu * lam * y + mu * mu * y * y).sqrt();
+                if rng.uniform() <= mu / (mu + x) {
+                    x
+                } else {
+                    mu * mu / x
+                }
+            })
+            .collect();
+        assert_recovers(EvtFamily::InverseGaussian, &ig, &[mu, lam]);
+
+        // C0 spliced Lognormal(6, 1) body on (0, 1000] + GPD(0.3, 600) tail; the body
+        // weight is implied by density continuity w = F1(u) / (F1(u) + beta f1(u)).
+        let (b_mu, b_sigma, su, t_xi, t_beta) = (6.0, 1.0, 1000.0, 0.3, 600.0);
+        let body = FittedEvtDistribution::Lognormal {
+            mu: b_mu,
+            sigma: b_sigma,
+        };
+        let f1_u = body.cdf(su);
+        let w = f1_u / (f1_u + t_beta * body.log_pdf(su).exp());
+        let spliced: Vec<f64> = (0..n)
+            .map(|_| {
+                if rng.uniform() < w {
+                    let z = crate::special::normal_inv_cdf(rng.uniform() * f1_u);
+                    b_sigma.mul_add(z, b_mu).exp()
+                } else {
+                    su + t_beta / t_xi * (rng.uniform().powf(-t_xi) - 1.0)
+                }
+            })
+            .collect();
+        assert_recovers(
+            EvtFamily::SplicedBodyGpd {
+                body: SpliceBodyFamily::Lognormal,
+                threshold: su,
+                continuity: SpliceContinuity::C0Continuous,
+            },
+            &spliced,
+            &[b_mu, b_sigma, w, t_xi, t_beta],
+        );
+
+        // C1 spliced fit on KPW Data Set B stays well-defined.
         let obs: Vec<SeverityObservation> = KPW_DATA_B
             .iter()
             .map(|&x| SeverityObservation::exact(x))
             .collect();
-        for fam in [
-            EvtFamily::Gpd { threshold: 200.0 },
-            EvtFamily::BurrXii,
-            EvtFamily::Gamma,
-            EvtFamily::InverseGaussian,
-            EvtFamily::SplicedBodyGpd {
-                body: SpliceBodyFamily::Lognormal,
-                threshold: 1000.0,
-                continuity: SpliceContinuity::C0Continuous,
-            },
+        let res = fit_evt_mle(
             EvtFamily::SplicedBodyGpd {
                 body: SpliceBodyFamily::Lognormal,
                 threshold: 1000.0,
                 continuity: SpliceContinuity::C1Differentiable,
             },
-        ] {
-            let res = fit_evt_mle(fam, &obs).expect("evt family fit");
-            assert!(res.log_likelihood.is_finite());
-            assert!(res.diagnostics.ks_statistic >= 0.0 && res.diagnostics.ks_statistic <= 1.0);
-        }
+            &obs,
+        )
+        .expect("C1 spliced fit");
+        assert!(res.log_likelihood.is_finite());
+        assert!(res.diagnostics.ks_statistic >= 0.0 && res.diagnostics.ks_statistic <= 1.0);
 
         let me1 = empirical_mean_excess(&KPW_DATA_B, 200.0).expect("me 200");
         let me2 = empirical_mean_excess(&KPW_DATA_B, 800.0).expect("me 800");
