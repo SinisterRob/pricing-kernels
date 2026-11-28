@@ -3,6 +3,63 @@
 use crate::error::PricingError;
 use serde::{Deserialize, Serialize};
 
+/// Fraction of a medical-only claim's incurred loss that remains ratable under the NCCI
+/// Experience Rating Adjustment (ERA): a 70% reduction leaves `0.30`.
+pub const ERA_MEDICAL_ONLY_RATABLE_FACTOR: f64 = 0.30;
+
+/// NCCI Experience Rating Plan Manual Rule 2-B: the multiple claim accident limitation equals
+/// this multiple of the state per claim accident limitation.
+pub const NCCI_MULTIPLE_CLAIM_LIMIT_MULTIPLIER: f64 = 2.0;
+
+/// Decimal places used when rounding the published experience modification.
+const MOD_ROUNDING_SCALE: f64 = 1000.0;
+
+/// NCCI Experience Rating Plan Manual Rule 2-B accident limitations (state "per claim" and
+/// "multiple claim" accident limitations, published per state in the ERM state values).
+///
+/// Applied per accident **before** the primary/excess split: each claim's ratable loss (after
+/// ERA) is capped at `per_claim_limit`, then the sum over all claims of one accident is capped at
+/// `multiple_claim_limit`. Disease limitations are not modeled.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct NcciAccidentLimitation {
+    /// State per claim accident limitation (ratable loss cap per claim).
+    pub per_claim_limit: f64,
+    /// Multiple claim accident limitation (ratable loss cap per accident).
+    pub multiple_claim_limit: f64,
+}
+
+impl NcciAccidentLimitation {
+    /// Per claim limitation with the NCCI default multiple claim limitation
+    /// `NCCI_MULTIPLE_CLAIM_LIMIT_MULTIPLIER * per_claim_limit`.
+    pub fn new(per_claim_limit: f64) -> Result<Self, PricingError> {
+        Self::with_multiple_claim_limit(
+            per_claim_limit,
+            NCCI_MULTIPLE_CLAIM_LIMIT_MULTIPLIER * per_claim_limit,
+        )
+    }
+
+    /// Explicit per claim and multiple claim limitations (`0 < per_claim <= multiple_claim`).
+    pub fn with_multiple_claim_limit(
+        per_claim_limit: f64,
+        multiple_claim_limit: f64,
+    ) -> Result<Self, PricingError> {
+        if !per_claim_limit.is_finite() || !(per_claim_limit > 0.0) {
+            return Err(PricingError::NonPositiveValue(
+                "per claim accident limitation must be finite and positive",
+            ));
+        }
+        if !multiple_claim_limit.is_finite() || !(multiple_claim_limit >= per_claim_limit) {
+            return Err(PricingError::InvalidParameter(
+                "multiple claim accident limitation must be finite and >= per claim limitation",
+            ));
+        }
+        Ok(Self {
+            per_claim_limit,
+            multiple_claim_limit,
+        })
+    }
+}
+
 /// Individual claim record in the experience period.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct ExperienceClaim {
@@ -37,6 +94,16 @@ impl NcciErpSpecification {
     pub fn calculate(&self, claims: &[ExperienceClaim]) -> Result<NcciErpResult, PricingError> {
         calculate_ncci_experience_mod(self, claims)
     }
+
+    /// Compute the Experience Modification from claims grouped by accident with optional
+    /// Rule 2-B accident limitations (see [`calculate_ncci_experience_mod_by_accident`]).
+    pub fn calculate_by_accident(
+        &self,
+        accidents: &[&[ExperienceClaim]],
+        limitation: Option<&NcciAccidentLimitation>,
+    ) -> Result<NcciErpResult, PricingError> {
+        calculate_ncci_experience_mod_by_accident(self, accidents, limitation)
+    }
 }
 
 /// Detailed result of NCCI Experience Modification calculation.
@@ -60,16 +127,7 @@ pub struct NcciErpResult {
     pub ratable_excess_expected: f64,
 }
 
-/// Compute Workers' Compensation Experience Modification according to the NCCI formula:
-///
-/// `Mod = (A_p + W * A_e + (1 - W) * E_e + B) / (E + B)`
-///
-/// where each claim's loss is split at `split_point` (after 70% ERA reduction for
-/// medical-only claims when `apply_era` is `true`).
-pub fn calculate_ncci_experience_mod(
-    spec: &NcciErpSpecification,
-    claims: &[ExperienceClaim],
-) -> Result<NcciErpResult, PricingError> {
+fn validate_spec(spec: &NcciErpSpecification) -> Result<(), PricingError> {
     if !spec.expected_losses.is_finite() || !(spec.expected_losses > 0.0) {
         return Err(PricingError::NonPositiveValue(
             "expected losses must be finite and positive",
@@ -95,26 +153,35 @@ pub fn calculate_ncci_experience_mod(
             "ballast_b must be finite and non-negative",
         ));
     }
+    Ok(())
+}
 
-    let mut actual_primary = 0.0;
-    let mut actual_excess = 0.0;
-
-    for claim in claims {
-        let mut loss = claim.incurred;
-        if !loss.is_finite() || !(loss >= 0.0) {
-            return Err(PricingError::InvalidParameter(
-                "claim incurred must be finite and non-negative",
-            ));
-        }
-        if spec.apply_era && claim.is_medical_only {
-            loss *= 0.30; // 70% reduction under ERA
-        }
-        let primary = loss.min(spec.split_point);
-        let excess = (loss - spec.split_point).max(0.0);
-        actual_primary += primary;
-        actual_excess += excess;
+/// Ratable loss of one claim after ERA and the per claim accident limitation.
+fn ratable_claim_loss(
+    spec: &NcciErpSpecification,
+    claim: &ExperienceClaim,
+    limitation: Option<&NcciAccidentLimitation>,
+) -> Result<f64, PricingError> {
+    let mut loss = claim.incurred;
+    if !loss.is_finite() || !(loss >= 0.0) {
+        return Err(PricingError::InvalidParameter(
+            "claim incurred must be finite and non-negative",
+        ));
     }
+    if spec.apply_era && claim.is_medical_only {
+        loss *= ERA_MEDICAL_ONLY_RATABLE_FACTOR;
+    }
+    if let Some(lim) = limitation {
+        loss = loss.min(lim.per_claim_limit);
+    }
+    Ok(loss)
+}
 
+fn finalize_mod(
+    spec: &NcciErpSpecification,
+    actual_primary: f64,
+    actual_excess: f64,
+) -> NcciErpResult {
     let expected_primary = spec.expected_losses * spec.d_ratio;
     let expected_excess = spec.expected_losses * (1.0 - spec.d_ratio);
 
@@ -126,9 +193,9 @@ pub fn calculate_ncci_experience_mod(
     let denominator = spec.expected_losses + spec.ballast_b;
 
     let mod_factor_unrounded = numerator / denominator;
-    let mod_factor = (mod_factor_unrounded * 1000.0).round() / 1000.0;
+    let mod_factor = (mod_factor_unrounded * MOD_ROUNDING_SCALE).round() / MOD_ROUNDING_SCALE;
 
-    Ok(NcciErpResult {
+    NcciErpResult {
         mod_factor,
         mod_factor_unrounded,
         actual_primary,
@@ -137,7 +204,75 @@ pub fn calculate_ncci_experience_mod(
         expected_excess,
         ratable_excess_actual,
         ratable_excess_expected,
-    })
+    }
+}
+
+/// Compute Workers' Compensation Experience Modification according to the NCCI formula:
+///
+/// `Mod = (A_p + W * A_e + (1 - W) * E_e + B) / (E + B)`
+///
+/// where each claim's loss is split at `split_point` (after 70% ERA reduction for
+/// medical-only claims when `apply_era` is `true`). Each claim is treated as a separate
+/// accident and **no accident limitation is applied**: pass already-limited ratable losses, or
+/// use [`calculate_ncci_experience_mod_by_accident`] with an [`NcciAccidentLimitation`].
+pub fn calculate_ncci_experience_mod(
+    spec: &NcciErpSpecification,
+    claims: &[ExperienceClaim],
+) -> Result<NcciErpResult, PricingError> {
+    validate_spec(spec)?;
+
+    let mut actual_primary = 0.0;
+    let mut actual_excess = 0.0;
+    for claim in claims {
+        let loss = ratable_claim_loss(spec, claim, None)?;
+        actual_primary += loss.min(spec.split_point);
+        actual_excess += (loss - spec.split_point).max(0.0);
+    }
+
+    Ok(finalize_mod(spec, actual_primary, actual_excess))
+}
+
+/// NCCI Experience Modification from claims grouped by accident (`accidents[a]` = all claims
+/// arising from accident `a`), with optional ERM Rule 2-B accident limitations.
+///
+/// Per claim: ratable loss = incurred (x `ERA_MEDICAL_ONLY_RATABLE_FACTOR` for medical-only
+/// claims under ERA), capped at `per_claim_limit`; primary = `min(ratable, split_point)`.
+/// Per accident: total ratable loss is capped at `multiple_claim_limit`; the reduction is taken
+/// from excess loss first (accident primary = `min(sum primary, accident limited total)`).
+/// With `limitation = None` this equals [`calculate_ncci_experience_mod`] on the flattened claims.
+pub fn calculate_ncci_experience_mod_by_accident(
+    spec: &NcciErpSpecification,
+    accidents: &[&[ExperienceClaim]],
+    limitation: Option<&NcciAccidentLimitation>,
+) -> Result<NcciErpResult, PricingError> {
+    validate_spec(spec)?;
+    if let Some(lim) = limitation {
+        // Re-validate in case the struct was built literally.
+        NcciAccidentLimitation::with_multiple_claim_limit(
+            lim.per_claim_limit,
+            lim.multiple_claim_limit,
+        )?;
+    }
+
+    let mut actual_primary = 0.0;
+    let mut actual_excess = 0.0;
+    for claims in accidents {
+        let mut acc_primary = 0.0;
+        let mut acc_total = 0.0;
+        for claim in *claims {
+            let loss = ratable_claim_loss(spec, claim, limitation)?;
+            acc_primary += loss.min(spec.split_point);
+            acc_total += loss;
+        }
+        if let Some(lim) = limitation {
+            acc_total = acc_total.min(lim.multiple_claim_limit);
+        }
+        let acc_primary = acc_primary.min(acc_total);
+        actual_primary += acc_primary;
+        actual_excess += (acc_total - acc_primary).max(0.0);
+    }
+
+    Ok(finalize_mod(spec, actual_primary, actual_excess))
 }
 
 /// Compute statewide or line-wide experience rating off-balance factor:
