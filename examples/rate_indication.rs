@@ -18,7 +18,7 @@ fn main() -> Result<(), PricingError> {
 
     // 2. Two-step exponential loss trend (historical +4.0%, prospective +5.5%).
     let loss_trend = TwoStepTrendModel::new(0.04, 0.055)?;
-    let prem_trend = TrendModel::new(0.02);
+    let prem_trend = TrendModel::new(0.02)?;
 
     let spec = RateIndicationSpec {
         periods: vec![

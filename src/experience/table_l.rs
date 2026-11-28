@@ -5,6 +5,9 @@
 //! Rating"*, *Proceedings of the Casualty Actuarial Society (PCAS)*, Vol. LXI, pp. 1–28.
 
 use super::retrospective::{RetroPlanResult, RetroPlanSpec, solve_balanced_retro_plan_with};
+use super::table_m::{
+    PROBABILITY_SUM_TOL, TABLE_IDENTITY_TOL, excess_and_shortfall, sort_and_merge,
+};
 use crate::error::{PricingError, SolverOptions};
 use crate::underwriting_risk::AggregateLossDistribution;
 use serde::{Deserialize, Serialize};
@@ -29,15 +32,97 @@ pub struct TableLRow {
 /// `E[Y*] = 1 - k`. Table L satisfies the exact Skurnick balance identity:
 /// `phi*(r) - psi*(r) = 1 - r` for all `r >= 0`, with `phi*(0) = 1` and `lim_{r -> inf} phi*(r) = k`.
 /// When `k = 0`, Table L reduces identically to Table M.
+///
+/// `rows` is private so the sorted, non-empty grid invariant required by the binary-search
+/// evaluator cannot be broken; use [`TableLEngine::rows`]. Deserialization is validated through
+/// [`TableLEngine::from_rows`].
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(try_from = "TableLEngineRaw")]
 pub struct TableLEngine {
     /// Per-occurrence Loss Elimination Ratio `k = 1 - E[Y*] in [0, 1)`.
     pub loss_elimination_ratio: f64,
     /// Sorted grid of Table L rows.
-    pub rows: Vec<TableLRow>,
+    rows: Vec<TableLRow>,
+}
+
+#[derive(Deserialize)]
+struct TableLEngineRaw {
+    loss_elimination_ratio: f64,
+    rows: Vec<TableLRow>,
+}
+
+impl TryFrom<TableLEngineRaw> for TableLEngine {
+    type Error = PricingError;
+    fn try_from(raw: TableLEngineRaw) -> Result<Self, Self::Error> {
+        Self::from_rows(raw.loss_elimination_ratio, raw.rows)
+    }
 }
 
 impl TableLEngine {
+    /// Sorted (strictly increasing entry ratio), non-empty grid of Table L rows.
+    #[inline]
+    pub fn rows(&self) -> &[TableLRow] {
+        &self.rows
+    }
+
+    /// Build Table L from pre-computed rows and LER `k in [0, 1)`, validating a non-empty,
+    /// finite, strictly increasing grid with non-increasing charges and the Skurnick identities
+    /// `phi*(0) = 1`, `phi*(r) = E[(Y* - r)+] + k`, `psi*(r) = phi*(r) + r - 1` within
+    /// [`TABLE_IDENTITY_TOL`].
+    pub fn from_rows(
+        loss_elimination_ratio: f64,
+        rows: Vec<TableLRow>,
+    ) -> Result<Self, PricingError> {
+        let k = loss_elimination_ratio;
+        if !k.is_finite() || !(k >= 0.0) || !(k < 1.0) {
+            return Err(PricingError::InvalidParameter(
+                "Table L loss elimination ratio must be finite and in [0, 1)",
+            ));
+        }
+        let Some(first) = rows.first() else {
+            return Err(PricingError::EmptyInput("Table L rows must be non-empty"));
+        };
+        if (first.charge + first.entry_ratio - 1.0).abs() > TABLE_IDENTITY_TOL {
+            return Err(PricingError::InvalidParameter(
+                "Table L rows violate phi*(0) = 1",
+            ));
+        }
+        let mut prev: Option<&TableLRow> = None;
+        for row in &rows {
+            if !row.entry_ratio.is_finite()
+                || !row.charge.is_finite()
+                || !row.aggregate_excess_charge.is_finite()
+                || !row.savings.is_finite()
+                || !(row.entry_ratio >= 0.0)
+                || !(row.aggregate_excess_charge >= 0.0)
+                || !(row.savings >= 0.0)
+            {
+                return Err(PricingError::InvalidParameter(
+                    "Table L rows must be finite and non-negative",
+                ));
+            }
+            if (row.charge - (row.aggregate_excess_charge + k)).abs() > TABLE_IDENTITY_TOL
+                || (row.savings - (row.charge + row.entry_ratio - 1.0)).abs() > TABLE_IDENTITY_TOL
+            {
+                return Err(PricingError::InvalidParameter(
+                    "Table L rows violate phi* = excess + k or psi* = phi* + r - 1",
+                ));
+            }
+            if let Some(p) = prev
+                && (!(row.entry_ratio > p.entry_ratio) || row.charge > p.charge)
+            {
+                return Err(PricingError::InvalidParameter(
+                    "Table L rows must be strictly increasing in entry ratio with non-increasing charge",
+                ));
+            }
+            prev = Some(row);
+        }
+        Ok(Self {
+            loss_elimination_ratio: k,
+            rows,
+        })
+    }
+
     /// Build Table L from a discrete probability distribution of **limited** aggregate
     /// entry ratios `(y*_i, p_i)` normalized by **unlimited** expected loss.
     ///
@@ -73,60 +158,39 @@ impl TableLEngine {
             pairs.push((y, p));
         }
 
-        if !sum_p.is_finite() || (sum_p - 1.0).abs() > 1e-4 {
+        if !sum_p.is_finite() || (sum_p - 1.0).abs() > PROBABILITY_SUM_TOL {
             return Err(PricingError::InvalidParameter(
                 "probabilities must sum to 1.0",
             ));
         }
-        if !mean_y_star.is_finite() || !(mean_y_star > 0.0) || mean_y_star > 1.0 + 1e-4 {
+        // Renormalize so that sum p = 1 exactly; otherwise phi*(0) = E[Y*] + k != 1.
+        let mean_y_star = mean_y_star / sum_p;
+        if !mean_y_star.is_finite()
+            || !(mean_y_star > 0.0)
+            || mean_y_star > 1.0 + PROBABILITY_SUM_TOL
+        {
             return Err(PricingError::InvalidParameter(
                 "mean limited entry ratio E[Y*] must lie in (0, 1]",
             ));
         }
+        for pair in &mut pairs {
+            pair.1 /= sum_p;
+        }
 
         let k = (1.0 - mean_y_star).max(0.0);
 
-        pairs.sort_by(|a, b| a.0.total_cmp(&b.0));
-        let mut merged: Vec<(f64, f64)> = Vec::with_capacity(pairs.len());
-        for (y, p) in pairs {
-            if let Some(last) = merged.last_mut()
-                && (last.0 - y).abs() <= 1e-15
-            {
-                last.1 += p;
-                continue;
-            }
-            merged.push((y, p));
-        }
-
-        // O(N) cancellation-free right-to-left recurrence for E[max(0, Y* - r_i)].
-        let n = merged.len();
-        let mut rows = vec![
-            TableLRow {
-                entry_ratio: 0.0,
-                charge: 0.0,
-                aggregate_excess_charge: 0.0,
-                savings: 0.0,
-            };
-            n
-        ];
-        let mut agg_excess = 0.0;
-        let mut tail_prob = 0.0;
-        for i in (0..n).rev() {
-            let (r, _) = merged[i];
-            if i + 1 < n {
-                let (next_r, next_p) = merged[i + 1];
-                tail_prob += next_p;
-                agg_excess += tail_prob * (next_r - r);
-            }
-            let charge = agg_excess + k;
-            let savings = (charge + r - 1.0).max(0.0);
-            rows[i] = TableLRow {
+        let merged = sort_and_merge(pairs);
+        // E[(Y* - r)+] and E[(r - Y*)+] via cancellation-free recurrences; psi* = E[(r - Y*)+].
+        let rows: Vec<TableLRow> = merged
+            .iter()
+            .zip(excess_and_shortfall(&merged))
+            .map(|(&(r, _), (agg_excess, savings))| TableLRow {
                 entry_ratio: r,
-                charge,
+                charge: agg_excess + k,
                 aggregate_excess_charge: agg_excess,
                 savings,
-            };
-        }
+            })
+            .collect();
 
         Ok(Self {
             loss_elimination_ratio: k,

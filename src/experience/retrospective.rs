@@ -20,7 +20,16 @@ pub struct RetroPlanSpec {
     pub max_retro_ratio: f64,
     /// Minimum Retrospective Premium Ratio (`H = MinPremium / StandardPremium`).
     pub min_retro_ratio: f64,
-    /// Expense loading ratio (excluding taxes and ULAE).
+    /// Total expense ratio `e` (to standard premium) **excluding premium taxes but including
+    /// the loss adjustment expense provided by the LCF** (Fisher, *Pricing Retrospective*;
+    /// NCCI Retrospective Rating Plan Manual convention): acquisition, general/admin and
+    /// profit loadings **plus** the LAE `(LCF - 1) * ELR` that the loss conversion factor
+    /// collects on losses.
+    ///
+    /// The balanced basic `BPF = e - (LCF - 1) * ELR + LCF * ELR * I` removes that LAE from
+    /// the basic premium because it is collected through `LCF * Losses`; under this definition
+    /// the plan balances to `E[RetroPremium] = (e + ELR) * TM * StandardPremium`. Passing an `e`
+    /// that excludes LAE understates expected retro premium by `(LCF - 1) * ELR * TM * P`.
     pub expense_ratio: f64,
 }
 
@@ -164,7 +173,9 @@ where
 
 /// Solves for the balanced Basic Premium Factor (`BPF`) of an incurred retrospective plan:
 ///
-/// Under actuarial balance (expected retro premium == standard expected cost):
+/// Under actuarial balance (expected retro premium == standard expected cost
+/// `(e + ELR) * TM * P`, with `e` = [`RetroPlanSpec::expense_ratio`] including LCF-provided LAE
+/// and excluding taxes):
 /// `BPF = ExpenseRatio - (LCF - 1.0) * ELR + [ phi(r_G) - psi(r_H) ] * LCF * ELR`
 ///
 /// where entry ratios `r_G` and `r_H` depend on `BPF`:

@@ -1,6 +1,36 @@
 //! Classical (limited-fluctuation) credibility standards (Longley-Cook 1962 / CAS Exam 5).
 
+use crate::error::PricingError;
 use serde::{Deserialize, Serialize};
+
+fn validate_z_and_tolerance(z_score: f64, tolerance: f64) -> Result<f64, PricingError> {
+    if !z_score.is_finite() || !(z_score > 0.0) {
+        return Err(PricingError::InvalidParameter(
+            "z_score must be finite and strictly positive",
+        ));
+    }
+    if !tolerance.is_finite() || !(tolerance > 0.0) {
+        return Err(PricingError::InvalidParameter(
+            "tolerance must be finite and strictly positive",
+        ));
+    }
+    let n0 = (z_score / tolerance).powi(2);
+    if !n0.is_finite() {
+        return Err(PricingError::OutOfBounds(
+            "full credibility standard overflowed floating-point range",
+        ));
+    }
+    Ok(n0)
+}
+
+fn validate_cv(cv_severity: f64) -> Result<f64, PricingError> {
+    if !cv_severity.is_finite() || !(cv_severity >= 0.0) {
+        return Err(PricingError::InvalidParameter(
+            "severity coefficient of variation must be finite and non-negative",
+        ));
+    }
+    Ok(cv_severity)
+}
 
 /// Classical / Limited Fluctuation Credibility standard (CAS Exam 5 / Longley-Cook).
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
@@ -11,13 +41,54 @@ pub struct ClassicalCredibility {
 }
 
 impl ClassicalCredibility {
-    /// Create standard given confidence level `z_score` and tolerance `p`:
-    /// `N_full = (z_score / tolerance)^2`.
-    pub fn from_confidence_and_tolerance(z_score: f64, tolerance: f64) -> Self {
-        let n_full = (z_score / tolerance).powi(2);
-        Self {
-            full_credibility_standard: n_full,
+    /// Claim-count (frequency) standard for Poisson frequency given two-sided normal quantile
+    /// `z_score` (e.g. `1.645` for `p = 90%`) and tolerance `k` (e.g. `0.05`):
+    /// `n_0 = (z_score / tolerance)^2` claims.
+    ///
+    /// Returns [`PricingError::InvalidParameter`] unless `z_score > 0` and `tolerance > 0`
+    /// (a zero tolerance would otherwise give an infinite standard and `NaN` credibility).
+    pub fn from_confidence_and_tolerance(
+        z_score: f64,
+        tolerance: f64,
+    ) -> Result<Self, PricingError> {
+        Ok(Self {
+            full_credibility_standard: validate_z_and_tolerance(z_score, tolerance)?,
+        })
+    }
+
+    /// Pure-premium (aggregate loss) standard in **expected claims** under Poisson frequency
+    /// (Werner & Modlin *Basic Ratemaking*, Ch. 12; Mahler & Dean (2001)):
+    /// `n_PP = n_0 * (1 + CV_S^2)`, where `CV_S` is the severity coefficient of variation.
+    pub fn pure_premium_standard(
+        z_score: f64,
+        tolerance: f64,
+        cv_severity: f64,
+    ) -> Result<Self, PricingError> {
+        let n0 = validate_z_and_tolerance(z_score, tolerance)?;
+        let cv = validate_cv(cv_severity)?;
+        Ok(Self {
+            full_credibility_standard: n0 * (1.0 + cv * cv),
+        })
+    }
+
+    /// Severity standard in **claims** (Mahler & Dean (2001)): `n_S = n_0 * CV_S^2`.
+    ///
+    /// Returns [`PricingError::InvalidParameter`] when `CV_S = 0` (degenerate standard).
+    pub fn severity_standard(
+        z_score: f64,
+        tolerance: f64,
+        cv_severity: f64,
+    ) -> Result<Self, PricingError> {
+        let n0 = validate_z_and_tolerance(z_score, tolerance)?;
+        let cv = validate_cv(cv_severity)?;
+        if !(cv > 0.0) {
+            return Err(PricingError::InvalidParameter(
+                "severity standard requires a strictly positive severity CV",
+            ));
         }
+        Ok(Self {
+            full_credibility_standard: n0 * cv * cv,
+        })
     }
 
     /// Default 1,082.41 claim standard (90% probability within +/- 5% error under Poisson).

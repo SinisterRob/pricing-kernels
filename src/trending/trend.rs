@@ -12,9 +12,18 @@ pub struct TrendModel {
 }
 
 impl TrendModel {
-    /// Construct a trend model with specified annual decimal rate (e.g., `0.045` for `+4.5%`).
-    pub const fn new(annual_rate: f64) -> Self {
-        Self { annual_rate }
+    /// Construct a trend model with validated annual decimal rate (e.g., `0.045` for `+4.5%`).
+    ///
+    /// Returns [`PricingError::InvalidParameter`] unless `annual_rate` is finite and `> -1.0`
+    /// (a rate `<= -1` makes `(1 + r)^t` zero, negative, or `NaN`), mirroring
+    /// [`TwoStepTrendModel::new`].
+    pub fn new(annual_rate: f64) -> Result<Self, PricingError> {
+        if !annual_rate.is_finite() || !(annual_rate > -1.0) {
+            return Err(PricingError::InvalidParameter(
+                "trend rate must be finite and strictly greater than -1.0",
+            ));
+        }
+        Ok(Self { annual_rate })
     }
 
     /// Multiplicative exponential trend factor for period `delta_years`:
